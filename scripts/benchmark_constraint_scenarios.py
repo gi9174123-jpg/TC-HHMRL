@@ -2,7 +2,9 @@ from __future__ import annotations
 
 import argparse
 import copy
+import itertools
 import json
+import math
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
@@ -17,10 +19,19 @@ import torch
 import yaml
 
 from tchhmrl.agents.dqn_upper import UpperDQN
+from tchhmrl.agents.ddpg_lower import LowerDDPG
 from tchhmrl.agents.sac_lower import LowerSAC
 from tchhmrl.buffers.replay_buffer import ReplayBuffer
 from tchhmrl.constraints.dual_layer import DualLayer
-from tchhmrl.envs.task_sampler import TaskSampler
+from tchhmrl.envs.task_contract import (
+    build_task_summary_v2,
+    filter_formally_comparable_records,
+    is_formally_comparable_record,
+    task_batch_hash,
+    task_defaults_from_cfg,
+    task_distribution_summary,
+)
+from tchhmrl.envs.task_sampler import TaskSampler, validate_site_bank
 from tchhmrl.envs.uw_slipt_env import MultiTxUwSliptEnv
 from tchhmrl.meta.meta_trainer import MetaTrainer
 from tchhmrl.safety.safety_layer import SafetyLayer
@@ -39,6 +50,10 @@ def apply_common_settings(
     use_curriculum: bool = False,
 ) -> Dict:
     cfg = copy.deepcopy(cfg)
+    cfg.setdefault("alignment", {})
+    cfg["alignment"].setdefault("alignment_version", "teacher_model_v1")
+    cfg["alignment"].setdefault("task_summary_version", "site_v2")
+    cfg["alignment"].setdefault("pre_alignment", False)
     cfg["experiment"]["seed"] = int(seed)
     cfg["experiment"]["log_dir"] = str(out_dir)
     cfg["experiment"]["run_name"] = run_name
@@ -58,9 +73,61 @@ def apply_common_settings(
     return cfg
 
 
+def infer_task_source(cfg: Dict) -> str:
+    site_bank = cfg.get("sampler", {}).get("site_bank", [])
+    return "site_bank" if site_bank else "global_fallback"
+
+
+def alignment_snapshot(cfg: Dict, *, pre_alignment: bool | None = None, task_source: str | None = None) -> Dict[str, object]:
+    alignment_cfg = cfg.get("alignment", {})
+    return {
+        "alignment_version": str(alignment_cfg.get("alignment_version", "teacher_model_v1")),
+        "task_summary_version": str(alignment_cfg.get("task_summary_version", "site_v2")),
+        "pre_alignment": bool(alignment_cfg.get("pre_alignment", False) if pre_alignment is None else pre_alignment),
+        "task_source": str(task_source or infer_task_source(cfg)),
+    }
+
+
+def sync_site_bank_with_cfg(cfg: Dict) -> None:
+    sampler_cfg = cfg.setdefault("sampler", {})
+    env_cfg = cfg.setdefault("env", {})
+    base_distances = np.asarray(env_cfg.get("distances", sampler_cfg.get("default_distances", [5.0, 6.0, 6.5])), dtype=float)
+    if base_distances.shape != (3,):
+        raise ValueError(f"env.distances must have shape (3,), got {base_distances.shape}")
+    sampler_cfg["default_distances"] = [float(x) for x in base_distances]
+    offsets = np.asarray(
+        [
+            [-0.35, -0.25, -0.20],
+            [0.00, 0.00, 0.00],
+            [0.35, 0.25, 0.20],
+        ],
+        dtype=float,
+    )
+    site_bank = []
+    for site_id, delta in enumerate(offsets.tolist()):
+        site_distances = np.maximum(base_distances + np.asarray(delta, dtype=float), 0.5)
+        site_bank.append(
+            {
+                "site_id": int(site_id),
+                "distances": [float(x) for x in site_distances],
+                "attenuation_c_range": [float(x) for x in sampler_cfg["attenuation_c_range"]],
+                "misalign_std_range": [float(x) for x in sampler_cfg["misalign_std_range"]],
+                "amb_temp_range": [float(x) for x in sampler_cfg["amb_temp_range"]],
+                "gamma_range": [float(x) for x in sampler_cfg["gamma_range"]],
+                "delta_range": [float(x) for x in sampler_cfg["delta_range"]],
+            }
+        )
+    sampler_cfg["site_bank"] = site_bank
+
+
+def fixed_task_bank_hash(tasks: List[object]) -> str:
+    return task_batch_hash(tasks)
+
+
 def inject_default_curriculum(cfg: Dict) -> None:
     """Inject a lightweight easy->moderate->target sampler curriculum."""
-    target = copy.deepcopy(cfg["sampler"])
+    range_keys = ["attenuation_c_range", "misalign_std_range", "amb_temp_range", "gamma_range", "delta_range"]
+    target = {k: copy.deepcopy(cfg["sampler"][k]) for k in range_keys if k in cfg["sampler"]}
     easy = {
         "attenuation_c_range": [0.10, 0.20],
         "misalign_std_range": [0.03, 0.08],
@@ -96,18 +163,21 @@ def apply_variant(cfg: Dict, variant: str) -> None:
     if variant == "hybrid":
         cfg["env"]["hybrid"]["tx_device"] = ["LED", "LD", "LD"]
         cfg["env"]["hybrid"]["tx_enabled"] = [1.0, 1.0, 1.0]
+        sync_site_bank_with_cfg(cfg)
         return
     if variant == "single_led":
         # True single-transmitter LED baseline: only one LED emitter is physically active.
         n_tx = int(cfg["env"]["n_tx"])
         cfg["env"]["hybrid"]["tx_device"] = ["LED"] * n_tx
         cfg["env"]["hybrid"]["tx_enabled"] = [1.0] + [0.0] * max(0, n_tx - 1)
+        sync_site_bank_with_cfg(cfg)
         return
     if variant == "single_ld":
         # True single-transmitter LD baseline: only one LD emitter is physically active.
         n_tx = int(cfg["env"]["n_tx"])
         cfg["env"]["hybrid"]["tx_device"] = ["LD"] * n_tx
         cfg["env"]["hybrid"]["tx_enabled"] = [1.0] + [0.0] * max(0, n_tx - 1)
+        sync_site_bank_with_cfg(cfg)
         return
     raise ValueError(f"Unknown variant: {variant}")
 
@@ -115,6 +185,7 @@ def apply_variant(cfg: Dict, variant: str) -> None:
 def apply_ablation(cfg: Dict, ablation: str) -> None:
     ablation = str(ablation)
     if ablation == "full":
+        sync_site_bank_with_cfg(cfg)
         return
     if ablation == "wo_meta":
         cfg.setdefault("context", {})["enabled"] = False
@@ -124,12 +195,14 @@ def apply_ablation(cfg: Dict, ablation: str) -> None:
         query_eps = int(cfg["meta"].get("query_episodes", 0))
         cfg["meta"]["support_episodes"] = support_eps + query_eps
         cfg["meta"]["query_episodes"] = 0
+        sync_site_bank_with_cfg(cfg)
         return
     if ablation == "wo_lagrangian":
         cfg.setdefault("meta", {})["dual_enabled"] = False
         n_duals = len(cfg["meta"].get("dual_names", ["qos"] + [f"temp_tx{i}" for i in range(int(cfg["env"]["n_tx"]))]))
         cfg["meta"]["dual_lr"] = 0.0
         cfg["meta"]["dual_lrs"] = [0.0] * n_duals
+        sync_site_bank_with_cfg(cfg)
         return
     if ablation == "hard_clip":
         cfg.setdefault("safety", {})["projection_mode"] = "hard_clip"
@@ -145,12 +218,46 @@ def apply_baseline_overrides(cfg: Dict, baseline: str) -> None:
         cfg.setdefault("meta", {})["explicit_inner_outer"] = False
         cfg["meta"]["query_updates_enabled"] = False
         return
+    if baseline == "shin2024_matched":
+        cfg.setdefault("context", {})["enabled"] = False
+        cfg.setdefault("agent", {})["z_dim"] = 0
+        cfg.setdefault("meta", {})["explicit_inner_outer"] = False
+        cfg["meta"]["query_updates_enabled"] = False
+        cfg["meta"]["dual_enabled"] = False
+        cfg["meta"]["dual_lr"] = 0.0
+        cfg["meta"]["dual_lrs"] = [0.0] * len(cfg["meta"].get("dual_names", []))
+        cfg.setdefault("upper_dqn", {})
+        cfg["upper_dqn"]["lr"] = 1.0e-4
+        cfg["upper_dqn"]["epsilon_start"] = 0.01
+        cfg["upper_dqn"]["epsilon_final"] = 0.01
+        cfg["upper_dqn"]["replay_size"] = 2000
+        cfg.setdefault("lower_ddpg", {})
+        cfg["lower_ddpg"].update(
+            {
+                "replay_size": int(1.0e6),
+                "batch_size": 64,
+                "actor_lr": 1.0e-4,
+                "critic_lr": 3.0e-4,
+                "gamma": 0.99,
+                "target_tau": 0.2,
+                "noise_std": 0.10,
+                "grad_clip": 5.0,
+            }
+        )
+        cfg["agent"]["batch_size"] = 64
+        return
+    if baseline == "dalal2018_safe":
+        cfg.setdefault("safety", {})["projection_mode"] = "dalal_safe"
+        return
     if baseline == "heuristic_safe":
         return
     raise ValueError(f"Unknown baseline override target: {baseline}")
 
 
 def apply_scenario(cfg: Dict, scenario: str) -> None:
+    def finish() -> None:
+        sync_site_bank_with_cfg(cfg)
+
     if scenario in {"easy_baseline", "baseline_easy"}:
         # Easy / baseline: mild channel, low thermal pressure, smooth dynamics.
         cfg["env"]["attenuation_c"] = 0.14
@@ -194,7 +301,7 @@ def apply_scenario(cfg: Dict, scenario: str) -> None:
         cfg["safety"]["current_max"] = [2.2, 2.2, 2.2]
         cfg["safety"]["bus_current_max"] = 5.0
         cfg["safety"]["mask_floor"] = 0.04
-        return
+        return finish()
 
     if scenario in {"moderate_practical", "thermal_moderate"}:
         # Moderate condition: still constrained, but meaningfully easier than the main practical-hard setup.
@@ -251,7 +358,7 @@ def apply_scenario(cfg: Dict, scenario: str) -> None:
         cfg["safety"]["current_max"] = [2.8, 2.8, 2.8]
         cfg["safety"]["bus_current_max"] = 5.8
         cfg["safety"]["mask_floor"] = 0.02
-        return
+        return finish()
 
     if scenario in {"practical_hard"}:
         # Main practical-hard (recommended primary setting):
@@ -309,7 +416,7 @@ def apply_scenario(cfg: Dict, scenario: str) -> None:
         cfg["safety"]["current_max"] = [3.0, 3.0, 3.0]
         cfg["safety"]["bus_current_max"] = 6.4
         cfg["safety"]["mask_floor"] = 0.02
-        return
+        return finish()
 
     if scenario in {"hard_balanced", "balanced_hard"}:
         # Hard-balanced: constraints should activate moderately without saturation.
@@ -366,7 +473,7 @@ def apply_scenario(cfg: Dict, scenario: str) -> None:
         cfg["safety"]["current_max"] = [3.1, 3.1, 3.1]
         cfg["safety"]["bus_current_max"] = 6.6
         cfg["safety"]["mask_floor"] = 0.02
-        return
+        return finish()
 
     if scenario in {"hard_stress", "thermal_tight", "ld_adverse_hard"}:
         # LD-adverse hard (recommended for appendix/extreme stress):
@@ -414,7 +521,7 @@ def apply_scenario(cfg: Dict, scenario: str) -> None:
         cfg["safety"]["bus_current_max"] = 6.8
         # Keep LD boost softly available instead of collapsing too close to zero.
         cfg["safety"]["mask_floor"] = 0.06
-        return
+        return finish()
 
     if scenario == "channel_harsh":
         cfg["env"]["attenuation_c"] = 0.32
@@ -449,7 +556,45 @@ def apply_scenario(cfg: Dict, scenario: str) -> None:
         cfg["safety"]["thermal_cutoff"] = 65.0
         cfg["safety"]["current_max"] = [2.8, 2.8, 2.8]
         cfg["safety"]["bus_current_max"] = 6.2
-        return
+        return finish()
+
+    if scenario == "thermal_rebalanced":
+        cfg["env"]["attenuation_c"] = 0.22
+        cfg["env"]["misalign_std"] = 0.08
+        cfg["env"]["distances"] = [4.6, 5.2, 5.8]
+        cfg["env"]["thermal_safe"] = 44.0
+        cfg["env"]["thermal_cutoff"] = 51.0
+        cfg["env"]["amb_temp"] = 41.5
+        cfg["env"]["gamma"] = 0.115
+        cfg["env"]["delta"] = 7.9
+        cfg["env"]["qos_min_rate"] = 0.008
+        cfg["env"]["se_weight"] = 1.08
+        cfg["env"]["eh_weight"] = 0.30
+        cfg["env"]["power_weight"] = 0.0012
+        cfg["env"]["cost_weight"] = 3.0
+        cfg["env"]["burst_prob"] = 0.01
+        cfg["env"]["burst_strength_range"] = [0.03, 0.08]
+        cfg["env"]["burst_decay"] = 0.90
+        cfg["env"]["obs_bias_rho"] = 0.40
+        cfg["env"]["obs_bias_step_std"] = 0.001
+        cfg["env"]["temporal_misalign_rho"] = 0.50
+        cfg["env"]["attenuation_drift_rho"] = 0.70
+        cfg["env"]["attenuation_drift_std"] = 0.010
+        cfg["env"]["hybrid"]["thermal_led_coeff"] = 1.25
+        cfg["env"]["hybrid"]["thermal_ld_coeff"] = 2.15
+
+        cfg["sampler"]["attenuation_c_range"] = [0.20, 0.26]
+        cfg["sampler"]["misalign_std_range"] = [0.06, 0.12]
+        cfg["sampler"]["amb_temp_range"] = [40.5, 42.5]
+        cfg["sampler"]["gamma_range"] = [0.10, 0.125]
+        cfg["sampler"]["delta_range"] = [7.2, 8.4]
+
+        cfg["safety"]["thermal_safe"] = 43.0
+        cfg["safety"]["thermal_cutoff"] = 50.0
+        cfg["safety"]["current_max"] = [3.5, 3.5, 3.5]
+        cfg["safety"]["bus_current_max"] = 7.6
+        cfg["safety"]["mask_floor"] = 0.06
+        return finish()
 
     raise ValueError(f"Unknown scenario: {scenario}")
 
@@ -480,6 +625,12 @@ def sampler_snapshot(cfg: Dict) -> Dict[str, List[float]]:
         if k in sampler:
             rng = sampler[k]
             out[k] = [float(rng[0]), float(rng[1])]
+    out["task_source"] = infer_task_source(cfg)
+    site_bank = sampler.get("site_bank", [])
+    if site_bank:
+        out["site_ids"] = [int(site["site_id"]) for site in site_bank]
+    out["strict_site_bank"] = bool(sampler.get("strict_site_bank", False))
+    out["balanced_sampling"] = bool(sampler.get("balanced_sampling", False))
     return out
 
 
@@ -487,6 +638,8 @@ def validate_training_config(cfg: Dict, scenario: str, *, strict_thermal: bool =
     meta_cfg = cfg.get("meta", {})
     safety_cfg = cfg.get("safety", {})
     env_cfg = cfg.get("env", {})
+    sampler_cfg = cfg.get("sampler", {})
+    alignment_cfg = alignment_snapshot(cfg)
     dual_enabled = bool(meta_cfg.get("dual_enabled", True))
 
     expected_dual_lrs = np.asarray([0.02, 0.05, 0.05, 0.05], dtype=np.float32)
@@ -496,6 +649,7 @@ def validate_training_config(cfg: Dict, scenario: str, *, strict_thermal: bool =
     env_cutoff = float(env_cfg.get("thermal_cutoff", float("nan")))
     safety_safe = float(safety_cfg.get("thermal_safe", float("nan")))
     safety_cutoff = float(safety_cfg.get("thermal_cutoff", float("nan")))
+    site_bank_issues = validate_site_bank(sampler_cfg.get("site_bank", []))
 
     checks = {
         "scenario": scenario,
@@ -514,12 +668,23 @@ def validate_training_config(cfg: Dict, scenario: str, *, strict_thermal: bool =
         "dual_lr_match": (not dual_enabled) or bool(np.isclose(actual_dual_lr, 0.05)),
         "safety_safe_earlier": bool(safety_safe < env_safe) if strict_thermal else bool(safety_safe <= env_safe),
         "safety_cutoff_earlier": bool(safety_cutoff < env_cutoff) if strict_thermal else bool(safety_cutoff <= env_cutoff),
+        "task_source": str(alignment_cfg["task_source"]),
+        "alignment_version": str(alignment_cfg["alignment_version"]),
+        "task_summary_version": str(alignment_cfg["task_summary_version"]),
+        "pre_alignment": bool(alignment_cfg["pre_alignment"]),
+        "site_bank_valid": len(site_bank_issues) == 0,
+        "site_bank_issues": site_bank_issues,
     }
     checks["all_passed"] = bool(
         checks["dual_lrs_match"]
         and checks["dual_lr_match"]
         and checks["safety_safe_earlier"]
         and checks["safety_cutoff_earlier"]
+        and checks["site_bank_valid"]
+        and checks["task_source"] == "site_bank"
+        and checks["alignment_version"] == "teacher_model_v1"
+        and checks["task_summary_version"] == "site_v2"
+        and (checks["pre_alignment"] is False)
     )
 
     if not checks["all_passed"]:
@@ -583,7 +748,11 @@ def checkpoint_score_from_metrics(metrics: Dict[str, float], score_cfg: Dict | N
 
 
 def sample_fixed_tasks(cfg: Dict, seed: int, n_tasks: int, seed_offset: int) -> list:
-    sampler = TaskSampler(copy.deepcopy(cfg["sampler"]), seed=int(seed) + int(seed_offset))
+    sampler = TaskSampler(
+        copy.deepcopy(cfg["sampler"]),
+        seed=int(seed) + int(seed_offset),
+        task_defaults=task_defaults_from_cfg(cfg),
+    )
     return sampler.sample(int(max(1, n_tasks)))
 
 
@@ -775,6 +944,14 @@ def collect_env_data(
                     "amb_temp": float(env.amb_temp),
                     "gamma": float(env.gamma),
                     "delta": float(env.delta),
+                    "site_id": int(getattr(env, "site_id", -1)),
+                    "task_source": str(getattr(env, "task_source", "global_fallback")),
+                    "alignment_version": str(getattr(env, "alignment_version", "teacher_model_v1")),
+                    "task_summary_version": str(getattr(env, "task_summary_version", "site_v2")),
+                    "pre_alignment": bool(getattr(env, "pre_alignment", False)),
+                    "distance_tx0": float(env.distances[0]),
+                    "distance_tx1": float(env.distances[1]),
+                    "distance_tx2": float(env.distances[2]),
                     "thermal_safe": float(env.thermal_safe),
                     "thermal_cutoff": float(env.thermal_cutoff),
                     "signal_ld_share": float(info["signal_ld_share"]),
@@ -783,8 +960,13 @@ def collect_env_data(
                     "signal_led": float(info["signal_led"]),
                     "signal_ld": float(info["signal_ld"]),
                     "snr": float(info["snr"]),
+                    "qos_rate": float(info["qos_rate"]),
+                    "eh_metric": float(info["eh_metric"]),
+                    "info_share": float(info["info_share"]),
+                    "eh_share": float(info["eh_share"]),
                     "se": float(info["se"]),
                     "eh": float(info["eh"]),
+                    "reward_id_term": float(info.get("reward_id_term", info.get("reward_se_term", info["se"]))),
                     "reward_se_term": float(info.get("reward_se_term", info["se"])),
                     "reward_eh_term": float(info.get("reward_eh_term", info["eh"])),
                     "reward_margin_term": float(info.get("reward_margin_term", 0.0)),
@@ -824,16 +1006,16 @@ def collect_env_data(
                         "reward_raw": float(reward),
                         "cost": float(info["cost"]),
                         "cost_vec": np.asarray(info.get("cost_vec", [float(info["cost"])]), dtype=np.float32),
-                        "task_params": np.asarray(
-                            [
-                                float(env.attenuation_c),
-                                float(env.misalign_std),
-                                float(env.amb_temp),
-                                float(env.gamma),
-                                float(env.delta),
-                                float(env.qos_min_rate),
-                            ],
-                            dtype=np.float32,
+                        "task_params": build_task_summary_v2(
+                            {
+                                "attenuation_c": env.attenuation_c,
+                                "misalign_std": env.misalign_std,
+                                "amb_temp_env": env.amb_temp,
+                                "gamma": env.gamma,
+                                "delta": env.delta,
+                                "qos_min_rate": env.qos_min_rate,
+                                "distances": env.distances,
+                            }
                         ),
                     }
                 )
@@ -1009,9 +1191,18 @@ class SacLagrangianBaseline:
         self.lower = LowerSAC(self.cfg, self.safety, self.device)
         self.replay = ReplayBuffer(int(self.cfg["buffer"]["replay_size"]))
         self.upper_replay = ReplayBuffer(int(self.cfg["buffer"]["replay_size"]))
-        self.task_sampler = TaskSampler(copy.deepcopy(self.cfg["sampler"]), seed=seed)
+        self.task_sampler = TaskSampler(
+            copy.deepcopy(self.cfg["sampler"]),
+            seed=seed,
+            task_defaults=task_defaults_from_cfg(cfg),
+        )
         self.dual = DualLayer.from_meta_cfg(self.cfg.get("meta", {}), n_tx=int(self.cfg["env"]["n_tx"]))
         self.dual_enabled = bool(self.cfg.get("meta", {}).get("dual_enabled", True))
+        alignment_cfg = self.cfg.get("alignment", {})
+        self.alignment_version = str(alignment_cfg.get("alignment_version", "teacher_model_v1"))
+        self.task_summary_version = str(alignment_cfg.get("task_summary_version", "site_v2"))
+        self.pre_alignment = bool(alignment_cfg.get("pre_alignment", False))
+        self.loaded_alignment_meta = self._alignment_meta()
 
         self.batch_size = int(self.cfg["agent"]["batch_size"])
         self.warmup_steps = int(self.cfg["agent"]["warmup_steps"])
@@ -1036,6 +1227,16 @@ class SacLagrangianBaseline:
         self.safety_mem = {"current_boost": 0, "dwell_count": self.cfg["safety"]["min_dwell_steps"]}
         self.upper_mem = {"upper_idx": 0, "hold_left": 0}
         self.upper_plan = None
+
+    def _alignment_meta(self, *, pre_alignment: bool | None = None) -> Dict[str, object]:
+        return {
+            "alignment_version": self.alignment_version,
+            "task_summary_version": self.task_summary_version,
+            "pre_alignment": bool(self.pre_alignment if pre_alignment is None else pre_alignment),
+        }
+
+    def is_formally_comparable(self) -> bool:
+        return is_formally_comparable_record(self.loaded_alignment_meta)
 
     def reset_episode_state(self) -> None:
         self.safety_mem = {
@@ -1211,11 +1412,14 @@ class SacLagrangianBaseline:
                 "temps": temps_before.astype(np.float32),
                 "next_temps": info["temps"].astype(np.float32),
                 "amb_temp": float(info["amb_temp"]),
+                "amb_temp_env": float(info["amb_temp"]),
                 "gamma_env": float(info["gamma"]),
                 "delta_env": float(info["delta"]),
                 "attenuation_c_env": float(env.attenuation_c),
                 "misalign_std_env": float(env.misalign_std),
                 "qos_min_rate_env": float(env.qos_min_rate),
+                "site_id_env": int(info.get("site_id", getattr(env, "site_id", -1))),
+                "distances_env": np.asarray(env.distances, dtype=np.float32).copy(),
                 "cost": cost,
                 "cost_vec": cost_vec.astype(np.float32),
             }
@@ -1371,6 +1575,7 @@ class SacLagrangianBaseline:
             "lower": self.lower.state_dict(),
             "dual": dual_state_safe,
             "global_step": int(self.global_step),
+            "alignment_meta": self._alignment_meta(pre_alignment=False),
         }
         torch.save(ckpt, ckpt_path)
 
@@ -1381,7 +1586,75 @@ class SacLagrangianBaseline:
         self.lower.load_state_dict(ckpt["lower"])
         if "dual" in ckpt:
             self.dual.load_state_dict(ckpt["dual"])
+        self.loaded_alignment_meta = dict(ckpt.get("alignment_meta", self._alignment_meta(pre_alignment=True)))
+        if "pre_alignment" not in self.loaded_alignment_meta:
+            self.loaded_alignment_meta["pre_alignment"] = True
         self.global_step = int(ckpt.get("global_step", 0))
+
+
+class Shin2024MatchedBaseline(SacLagrangianBaseline):
+    """Matched hierarchical DQN-DDPG baseline under the current benchmark semantics."""
+
+    def __init__(self, cfg: Dict):
+        self.cfg = copy.deepcopy(cfg)
+        self.cfg.setdefault("context", {})["enabled"] = False
+        self.cfg.setdefault("agent", {})["z_dim"] = 0
+        self.cfg.setdefault("meta", {})["explicit_inner_outer"] = False
+        self.cfg["meta"]["query_updates_enabled"] = False
+        self.cfg["meta"]["dual_enabled"] = False
+        seed = int(self.cfg["experiment"]["seed"])
+        set_seed(seed)
+
+        requested_device = str(self.cfg["experiment"].get("device", "auto"))
+        self.device = resolve_device(requested_device)
+        self.cfg.setdefault("experiment", {})
+        self.cfg["experiment"]["device_requested"] = requested_device
+        self.cfg["experiment"]["device_resolved"] = str(self.device)
+
+        self.safety = SafetyLayer(self.cfg)
+        self.upper = UpperDQN(self.cfg, self.device)
+        self.lower = LowerDDPG(self.cfg, self.safety, self.device)
+        upper_replay_size = int(self.cfg.get("upper_dqn", {}).get("replay_size", 2000))
+        lower_replay_size = int(self.cfg.get("lower_ddpg", {}).get("replay_size", 1.0e6))
+        self.replay = ReplayBuffer(lower_replay_size)
+        self.upper_replay = ReplayBuffer(upper_replay_size)
+        self.task_sampler = TaskSampler(
+            copy.deepcopy(self.cfg["sampler"]),
+            seed=seed,
+            task_defaults=task_defaults_from_cfg(cfg),
+        )
+        self.dual = DualLayer.from_meta_cfg(self.cfg.get("meta", {}), n_tx=int(self.cfg["env"]["n_tx"]))
+        self.dual_enabled = False
+        alignment_cfg = self.cfg.get("alignment", {})
+        self.alignment_version = str(alignment_cfg.get("alignment_version", "teacher_model_v1"))
+        self.task_summary_version = str(alignment_cfg.get("task_summary_version", "site_v2"))
+        self.pre_alignment = bool(alignment_cfg.get("pre_alignment", False))
+        self.loaded_alignment_meta = self._alignment_meta()
+
+        lower_batch = int(self.cfg.get("lower_ddpg", {}).get("batch_size", self.cfg["agent"]["batch_size"]))
+        self.batch_size = lower_batch
+        self.warmup_steps = int(self.cfg["agent"]["warmup_steps"])
+        self.lower_updates_per_step = int(self.cfg["agent"].get("lower_updates_per_step", 1))
+        self.upper_update_every = int(self.cfg["agent"].get("upper_update_every", 1))
+        self.upper_warmup_steps = int(
+            self.cfg["agent"].get(
+                "upper_warmup_steps",
+                max(lower_batch, self.warmup_steps // max(1, int(self.cfg["agent"].get("upper_hold_steps", 1)))),
+            )
+        )
+        self.upper_hold_steps = int(self.cfg["agent"].get("upper_hold_steps", 1))
+        self.z_dim = int(self.cfg["agent"]["z_dim"])
+
+        log_dir = self.cfg["experiment"]["log_dir"]
+        run_name = self.cfg["experiment"]["run_name"]
+        self.logger = Logger(log_dir=log_dir, run_name=run_name)
+        self.ckpt_dir = Path(log_dir) / run_name / "checkpoints"
+        self.ckpt_dir.mkdir(parents=True, exist_ok=True)
+
+        self.global_step = 0
+        self.safety_mem = {"current_boost": 0, "dwell_count": self.cfg["safety"]["min_dwell_steps"]}
+        self.upper_mem = {"upper_idx": 0, "hold_left": 0}
+        self.upper_plan = None
 
 def _run_heuristic_episode(trainer: MetaTrainer, env: MultiTxUwSliptEnv) -> Dict[str, float | np.ndarray]:
     obs, _ = env.reset()
@@ -1402,16 +1675,16 @@ def _run_heuristic_episode(trainer: MetaTrainer, env: MultiTxUwSliptEnv) -> Dict
                 "reward_raw": float(reward),
                 "cost": float(info["cost"]),
                 "cost_vec": np.asarray(info.get("cost_vec", [float(info["cost"])]), dtype=np.float32),
-                "task_params": np.asarray(
-                    [
-                        float(env.attenuation_c),
-                        float(env.misalign_std),
-                        float(env.amb_temp),
-                        float(env.gamma),
-                        float(env.delta),
-                        float(env.qos_min_rate),
-                    ],
-                    dtype=np.float32,
+                "task_params": build_task_summary_v2(
+                    {
+                        "attenuation_c": env.attenuation_c,
+                        "misalign_std": env.misalign_std,
+                        "amb_temp_env": env.amb_temp,
+                        "gamma": env.gamma,
+                        "delta": env.delta,
+                        "qos_min_rate": env.qos_min_rate,
+                        "distances": env.distances,
+                    }
                 ),
             }
         )
@@ -1454,7 +1727,7 @@ def evaluate_heuristic_on_tasks(
     }
 
 
-def evaluate_sac_lagrangian_on_tasks(
+def evaluate_plain_hierarchical_baseline_on_tasks(
     trainer: SacLagrangianBaseline,
     cfg: Dict,
     tasks,
@@ -1473,6 +1746,15 @@ def evaluate_sac_lagrangian_on_tasks(
         "violation_rate": float(np.mean([s.violations for s in stats])),
         "len": float(np.mean([s.length for s in stats])),
     }
+
+
+def evaluate_sac_lagrangian_on_tasks(
+    trainer: SacLagrangianBaseline,
+    cfg: Dict,
+    tasks,
+    episodes_per_task: int,
+) -> Dict[str, float]:
+    return evaluate_plain_hierarchical_baseline_on_tasks(trainer, cfg, tasks, episodes_per_task)
 
 
 def collect_env_data_heuristic(
@@ -1513,6 +1795,14 @@ def collect_env_data_heuristic(
                     "amb_temp": float(env.amb_temp),
                     "gamma": float(env.gamma),
                     "delta": float(env.delta),
+                    "site_id": int(getattr(env, "site_id", -1)),
+                    "task_source": str(getattr(env, "task_source", "global_fallback")),
+                    "alignment_version": str(getattr(env, "alignment_version", "teacher_model_v1")),
+                    "task_summary_version": str(getattr(env, "task_summary_version", "site_v2")),
+                    "pre_alignment": bool(getattr(env, "pre_alignment", False)),
+                    "distance_tx0": float(env.distances[0]),
+                    "distance_tx1": float(env.distances[1]),
+                    "distance_tx2": float(env.distances[2]),
                     "thermal_safe": float(env.thermal_safe),
                     "thermal_cutoff": float(env.thermal_cutoff),
                     "signal_ld_share": float(info["signal_ld_share"]),
@@ -1521,8 +1811,107 @@ def collect_env_data_heuristic(
                     "signal_led": float(info["signal_led"]),
                     "signal_ld": float(info["signal_ld"]),
                     "snr": float(info["snr"]),
+                    "qos_rate": float(info["qos_rate"]),
+                    "eh_metric": float(info["eh_metric"]),
+                    "info_share": float(info["info_share"]),
+                    "eh_share": float(info["eh_share"]),
                     "se": float(info["se"]),
                     "eh": float(info["eh"]),
+                    "reward_id_term": float(info.get("reward_id_term", info.get("reward_se_term", info["se"]))),
+                    "reward_se_term": float(info.get("reward_se_term", info["se"])),
+                    "reward_eh_term": float(info.get("reward_eh_term", info["eh"])),
+                    "reward_margin_term": float(info.get("reward_margin_term", 0.0)),
+                    "penalty_cost_term": float(info.get("penalty_cost_term", 0.0)),
+                    "penalty_power_term": float(info.get("penalty_power_term", 0.0)),
+                    "penalty_smooth_term": float(info.get("penalty_smooth_term", 0.0)),
+                    "penalty_switch_term": float(info.get("penalty_switch_term", 0.0)),
+                    "mode_switch": float(info.get("mode_switch", 0.0)),
+                    "boost_switch": float(info.get("boost_switch", 0.0)),
+                    "mode_exec": float(info.get("mode_exec", action.get("mode_exec", 0))),
+                    "boost_combo_exec": float(info.get("boost_combo_exec", action.get("boost_combo_exec", 0))),
+                    "upper_idx_exec": float(info.get("upper_idx_exec", action.get("upper_idx_exec", 0))),
+                    "cost": float(info["cost"]),
+                    "cost_qos": float(info.get("cost_qos", 0.0)),
+                    "cost_temp_anchor": float(info.get("cost_temp_anchor", 0.0)),
+                    "cost_temp_boost1": float(info.get("cost_temp_boost1", 0.0)),
+                    "cost_temp_boost2": float(info.get("cost_temp_boost2", 0.0)),
+                    "thermal_violation": float(info["thermal_violation"]),
+                    "temp_mean_before": float(np.mean(temps_before)),
+                    "temp_mean_after": float(np.mean(info["temps"])),
+                    "temp_max_after": float(np.max(info["temps"])),
+                    "current_total": current_total,
+                    "bus_current_max": bus_current_max,
+                    "bus_utilization": float(current_total / max(bus_current_max, 1.0e-6)),
+                }
+                for tx_idx, current_val in enumerate(currents_exec.tolist()):
+                    row[f"current_tx{tx_idx}"] = float(current_val)
+                rows.append(row)
+                obs = next_obs
+                step += 1
+    return pd.DataFrame(rows)
+
+
+def collect_env_data_plain_hierarchical_baseline(
+    trainer: SacLagrangianBaseline,
+    cfg: Dict,
+    scenario: str,
+    variant: str,
+    seed: int,
+    tasks,
+    episodes_per_task: int,
+) -> pd.DataFrame:
+    rows: List[Dict[str, float]] = []
+
+    for task_id, task in enumerate(tasks):
+        env = MultiTxUwSliptEnv(cfg, overrides=task.to_env_overrides())
+        for ep in range(episodes_per_task):
+            obs, _ = env.reset(seed=seed + task_id * 100 + ep)
+            trainer.reset_episode_state()
+            done = False
+            step = 0
+            while not done:
+                temps_before = env.temps.copy().astype(np.float32)
+                action, aux = trainer.act(obs, env, eval_mode=True)
+                next_obs, reward, terminated, truncated, info = env.step(action)
+                done = bool(terminated or truncated)
+                currents_exec = np.asarray(info.get("currents_exec", action["currents_exec"]), dtype=np.float32)
+                current_total = float(info.get("current_total", float(np.sum(currents_exec))))
+                bus_current_max = float(info.get("bus_current_max", env.bus_current_max))
+                row = {
+                    "scenario": scenario,
+                    "variant": variant,
+                    "seed": float(seed),
+                    "task_id": float(task_id),
+                    "episode": float(ep),
+                    "step": float(step),
+                    "attenuation_c": float(env.attenuation_c),
+                    "misalign_std": float(env.misalign_std),
+                    "amb_temp": float(env.amb_temp),
+                    "gamma": float(env.gamma),
+                    "delta": float(env.delta),
+                    "site_id": int(getattr(env, "site_id", -1)),
+                    "task_source": str(getattr(env, "task_source", "global_fallback")),
+                    "alignment_version": str(getattr(env, "alignment_version", "teacher_model_v1")),
+                    "task_summary_version": str(getattr(env, "task_summary_version", "site_v2")),
+                    "pre_alignment": bool(getattr(env, "pre_alignment", False)),
+                    "distance_tx0": float(env.distances[0]),
+                    "distance_tx1": float(env.distances[1]),
+                    "distance_tx2": float(env.distances[2]),
+                    "thermal_safe": float(env.thermal_safe),
+                    "thermal_cutoff": float(env.thermal_cutoff),
+                    "signal_ld_share": float(info["signal_ld_share"]),
+                    "led_tx_fraction": float(info["led_tx_fraction"]),
+                    "tx_enabled_fraction": float(info.get("tx_enabled_fraction", 1.0)),
+                    "signal_led": float(info["signal_led"]),
+                    "signal_ld": float(info["signal_ld"]),
+                    "snr": float(info["snr"]),
+                    "qos_rate": float(info["qos_rate"]),
+                    "eh_metric": float(info["eh_metric"]),
+                    "info_share": float(info["info_share"]),
+                    "eh_share": float(info["eh_share"]),
+                    "se": float(info["se"]),
+                    "eh": float(info["eh"]),
+                    "reward_id_term": float(info.get("reward_id_term", info.get("reward_se_term", info["se"]))),
                     "reward_se_term": float(info.get("reward_se_term", info["se"])),
                     "reward_eh_term": float(info.get("reward_eh_term", info["eh"])),
                     "reward_margin_term": float(info.get("reward_margin_term", 0.0)),
@@ -1565,76 +1954,15 @@ def collect_env_data_sac_lagrangian(
     tasks,
     episodes_per_task: int,
 ) -> pd.DataFrame:
-    rows: List[Dict[str, float]] = []
-
-    for task_id, task in enumerate(tasks):
-        env = MultiTxUwSliptEnv(cfg, overrides=task.to_env_overrides())
-        for ep in range(episodes_per_task):
-            obs, _ = env.reset(seed=seed + task_id * 100 + ep)
-            trainer.reset_episode_state()
-            done = False
-            step = 0
-            while not done:
-                temps_before = env.temps.copy().astype(np.float32)
-                action, aux = trainer.act(obs, env, eval_mode=True)
-                next_obs, reward, terminated, truncated, info = env.step(action)
-                done = bool(terminated or truncated)
-                currents_exec = np.asarray(info.get("currents_exec", action["currents_exec"]), dtype=np.float32)
-                current_total = float(info.get("current_total", float(np.sum(currents_exec))))
-                bus_current_max = float(info.get("bus_current_max", env.bus_current_max))
-                row = {
-                    "scenario": scenario,
-                    "variant": variant,
-                    "seed": float(seed),
-                    "task_id": float(task_id),
-                    "episode": float(ep),
-                    "step": float(step),
-                    "attenuation_c": float(env.attenuation_c),
-                    "misalign_std": float(env.misalign_std),
-                    "amb_temp": float(env.amb_temp),
-                    "gamma": float(env.gamma),
-                    "delta": float(env.delta),
-                    "thermal_safe": float(env.thermal_safe),
-                    "thermal_cutoff": float(env.thermal_cutoff),
-                    "signal_ld_share": float(info["signal_ld_share"]),
-                    "led_tx_fraction": float(info["led_tx_fraction"]),
-                    "tx_enabled_fraction": float(info.get("tx_enabled_fraction", 1.0)),
-                    "signal_led": float(info["signal_led"]),
-                    "signal_ld": float(info["signal_ld"]),
-                    "snr": float(info["snr"]),
-                    "se": float(info["se"]),
-                    "eh": float(info["eh"]),
-                    "reward_se_term": float(info.get("reward_se_term", info["se"])),
-                    "reward_eh_term": float(info.get("reward_eh_term", info["eh"])),
-                    "reward_margin_term": float(info.get("reward_margin_term", 0.0)),
-                    "penalty_cost_term": float(info.get("penalty_cost_term", 0.0)),
-                    "penalty_power_term": float(info.get("penalty_power_term", 0.0)),
-                    "penalty_smooth_term": float(info.get("penalty_smooth_term", 0.0)),
-                    "penalty_switch_term": float(info.get("penalty_switch_term", 0.0)),
-                    "mode_switch": float(info.get("mode_switch", 0.0)),
-                    "boost_switch": float(info.get("boost_switch", 0.0)),
-                    "mode_exec": float(info.get("mode_exec", action.get("mode_exec", 0))),
-                    "boost_combo_exec": float(info.get("boost_combo_exec", action.get("boost_combo_exec", 0))),
-                    "upper_idx_exec": float(info.get("upper_idx_exec", action.get("upper_idx_exec", 0))),
-                    "cost": float(info["cost"]),
-                    "cost_qos": float(info.get("cost_qos", 0.0)),
-                    "cost_temp_anchor": float(info.get("cost_temp_anchor", 0.0)),
-                    "cost_temp_boost1": float(info.get("cost_temp_boost1", 0.0)),
-                    "cost_temp_boost2": float(info.get("cost_temp_boost2", 0.0)),
-                    "thermal_violation": float(info["thermal_violation"]),
-                    "temp_mean_before": float(np.mean(temps_before)),
-                    "temp_mean_after": float(np.mean(info["temps"])),
-                    "temp_max_after": float(np.max(info["temps"])),
-                    "current_total": current_total,
-                    "bus_current_max": bus_current_max,
-                    "bus_utilization": float(current_total / max(bus_current_max, 1.0e-6)),
-                }
-                for tx_idx, current_val in enumerate(currents_exec.tolist()):
-                    row[f"current_tx{tx_idx}"] = float(current_val)
-                rows.append(row)
-                obs = next_obs
-                step += 1
-    return pd.DataFrame(rows)
+    return collect_env_data_plain_hierarchical_baseline(
+        trainer=trainer,
+        cfg=cfg,
+        scenario=scenario,
+        variant=variant,
+        seed=seed,
+        tasks=tasks,
+        episodes_per_task=episodes_per_task,
+    )
 
 
 def plot_scenario_convergence(train_df: pd.DataFrame, out_path: Path) -> None:
@@ -1928,6 +2256,249 @@ def build_current_trace_table(env_df: pd.DataFrame) -> pd.DataFrame:
     )
 
 
+
+STAT_METRIC_FIELDS = {
+    "reward": "eval_reward",
+    "se": "eval_se",
+    "eh": "eval_eh",
+    "cost": "eval_cost",
+    "violation_rate": "eval_violation_rate",
+    "temp_q90": "env_temp_max_q90",
+    "thermal_step_violation_fraction": "env_step_violation_fraction",
+}
+
+MAIN_BENCHMARK_SCENARIOS = ("moderate_practical", "hard_stress", "channel_harsh")
+STRUCTURAL_VARIANT_ORDER = ("hybrid", "single_led", "single_ld", "shin2024_matched")
+HARD_TARGETED_VARIANT_ORDER = (
+    "hybrid",
+    "hybrid_wo_meta",
+    "hybrid_wo_lagrangian",
+    "hybrid_hard_clip",
+    "heuristic_safe",
+    "sac_lagrangian",
+    "shin2024_matched",
+    "dalal2018_safe",
+)
+THERMAL_VARIANT_ORDER = (
+    "hybrid",
+    "hybrid_wo_lagrangian",
+    "hybrid_hard_clip",
+    "sac_lagrangian",
+    "shin2024_matched",
+    "dalal2018_safe",
+)
+
+
+def _paired_signflip_pvalue(diffs: np.ndarray) -> float | None:
+    diffs = np.asarray(diffs, dtype=np.float64).reshape(-1)
+    n = int(diffs.size)
+    if n <= 1:
+        return None
+    observed = abs(float(np.mean(diffs)))
+    if n <= 16:
+        total = 1 << n
+        ge = 0
+        for signs in itertools.product((-1.0, 1.0), repeat=n):
+            signed = diffs * np.asarray(signs, dtype=np.float64)
+            if abs(float(np.mean(signed))) + 1.0e-12 >= observed:
+                ge += 1
+        return float(ge / total)
+
+    rng = np.random.default_rng(0)
+    draws = 20000
+    sign_matrix = rng.choice(np.asarray([-1.0, 1.0], dtype=np.float64), size=(draws, n))
+    perm_means = np.abs((sign_matrix * diffs[None, :]).mean(axis=1))
+    return float((np.count_nonzero(perm_means + 1.0e-12 >= observed) + 1) / (draws + 1))
+
+
+def _paired_diff_stats(diffs: np.ndarray) -> Dict[str, float | int | None]:
+    diffs = np.asarray(diffs, dtype=np.float64).reshape(-1)
+    n_pairs = int(diffs.size)
+    if n_pairs == 0:
+        return {
+            "n_pairs": 0,
+            "mean_diff": float("nan"),
+            "std_diff": float("nan"),
+            "t_stat": float("nan"),
+            "effect_size_dz": float("nan"),
+            "p_value": None,
+        }
+    mean_diff = float(np.mean(diffs))
+    if n_pairs == 1:
+        return {
+            "n_pairs": 1,
+            "mean_diff": mean_diff,
+            "std_diff": float("nan"),
+            "t_stat": float("nan"),
+            "effect_size_dz": float("nan"),
+            "p_value": None,
+        }
+    std_diff = float(np.std(diffs, ddof=1))
+    if std_diff <= 1.0e-12:
+        t_stat = float("inf") if abs(mean_diff) > 1.0e-12 else 0.0
+        effect_size = float("inf") if abs(mean_diff) > 1.0e-12 else 0.0
+    else:
+        t_stat = float(mean_diff / (std_diff / math.sqrt(n_pairs)))
+        effect_size = float(mean_diff / std_diff)
+    return {
+        "n_pairs": n_pairs,
+        "mean_diff": mean_diff,
+        "std_diff": std_diff,
+        "t_stat": t_stat,
+        "effect_size_dz": effect_size,
+        "p_value": _paired_signflip_pvalue(diffs),
+    }
+
+
+def _apply_holm_correction(rows: List[Dict[str, object]]) -> None:
+    indexed = [(idx, float(row["p_value"])) for idx, row in enumerate(rows) if row.get("p_value") is not None]
+    if not indexed:
+        return
+    indexed.sort(key=lambda item: item[1])
+    m = len(indexed)
+    running = 0.0
+    for rank, (idx, pval) in enumerate(indexed):
+        adjusted = min(1.0, (m - rank) * pval)
+        running = max(running, adjusted)
+        rows[idx]["p_value_holm"] = float(running)
+    for row in rows:
+        row.setdefault("p_value_holm", None)
+
+
+def build_statistics_artifact(
+    run_rows: List[Dict],
+    *,
+    artifact_name: str,
+    scenarios: List[str],
+    variant_order: tuple[str, ...],
+    metrics: List[str],
+) -> Dict[str, object] | None:
+    filtered = [
+        dict(row)
+        for row in run_rows
+        if str(row.get("scenario")) in scenarios and str(row.get("variant")) in variant_order
+    ]
+    if not filtered:
+        return None
+
+    grouped_payload: Dict[str, Dict[str, Dict[str, float]]] = {}
+    pairwise_payload: Dict[str, List[Dict[str, object]]] = {}
+    csv_rows: List[Dict[str, object]] = []
+
+    for scenario in scenarios:
+        scenario_rows = [row for row in filtered if str(row.get("scenario")) == scenario]
+        if not scenario_rows:
+            continue
+        present_variants = [variant for variant in variant_order if any(str(row.get("variant")) == variant for row in scenario_rows)]
+        grouped_payload[scenario] = {}
+        pairwise_rows: List[Dict[str, object]] = []
+
+        for variant in present_variants:
+            variant_rows = [row for row in scenario_rows if str(row.get("variant")) == variant]
+            grouped_payload[scenario][variant] = {}
+            for metric in metrics:
+                field = STAT_METRIC_FIELDS[metric]
+                values = np.asarray([float(row[field]) for row in variant_rows if field in row], dtype=np.float64)
+                if values.size == 0:
+                    continue
+                grouped_payload[scenario][variant][metric] = {
+                    "n": int(values.size),
+                    "mean": float(values.mean()),
+                    "std": float(values.std(ddof=0)),
+                }
+                csv_rows.append(
+                    {
+                        "artifact": artifact_name,
+                        "row_type": "group",
+                        "scenario": scenario,
+                        "metric": metric,
+                        "variant": variant,
+                        "n": int(values.size),
+                        "mean": float(values.mean()),
+                        "std": float(values.std(ddof=0)),
+                    }
+                )
+
+        for metric in metrics:
+            field = STAT_METRIC_FIELDS[metric]
+            for left_idx in range(len(present_variants)):
+                for right_idx in range(left_idx + 1, len(present_variants)):
+                    left_variant = present_variants[left_idx]
+                    right_variant = present_variants[right_idx]
+                    left_map = {
+                        (int(row["seed"]), str(row.get("selection_task_batch_hash", ""))): float(row[field])
+                        for row in scenario_rows
+                        if str(row.get("variant")) == left_variant and field in row
+                    }
+                    right_map = {
+                        (int(row["seed"]), str(row.get("selection_task_batch_hash", ""))): float(row[field])
+                        for row in scenario_rows
+                        if str(row.get("variant")) == right_variant and field in row
+                    }
+                    common_keys = sorted(set(left_map.keys()) & set(right_map.keys()))
+                    diffs = np.asarray([left_map[key] - right_map[key] for key in common_keys], dtype=np.float64)
+                    stat = _paired_diff_stats(diffs)
+                    pairwise_rows.append(
+                        {
+                            "artifact": artifact_name,
+                            "scenario": scenario,
+                            "metric": metric,
+                            "left_variant": left_variant,
+                            "right_variant": right_variant,
+                            "pair_keys": [list(key) for key in common_keys],
+                            **stat,
+                        }
+                    )
+
+        _apply_holm_correction(pairwise_rows)
+        pairwise_payload[scenario] = pairwise_rows
+        for row in pairwise_rows:
+            csv_rows.append(
+                {
+                    "artifact": artifact_name,
+                    "row_type": "pairwise",
+                    "scenario": row["scenario"],
+                    "metric": row["metric"],
+                    "left_variant": row["left_variant"],
+                    "right_variant": row["right_variant"],
+                    "n_pairs": row["n_pairs"],
+                    "mean_diff": row["mean_diff"],
+                    "std_diff": row["std_diff"],
+                    "t_stat": row["t_stat"],
+                    "effect_size_dz": row["effect_size_dz"],
+                    "p_value": row["p_value"],
+                    "p_value_holm": row.get("p_value_holm"),
+                }
+            )
+
+    if not grouped_payload and not pairwise_payload:
+        return None
+    return {
+        "artifact": artifact_name,
+        "generated_at": datetime.now().isoformat(timespec="seconds"),
+        "test": "paired_t_with_signflip_pvalue",
+        "metrics": metrics,
+        "scenarios": grouped_payload,
+        "pairwise": pairwise_payload,
+        "csv_rows": csv_rows,
+    }
+
+
+def write_statistics_artifact(out_root: Path, artifact: Dict[str, object]) -> Dict[str, str]:
+    stem = str(artifact["artifact"])
+    json_path = out_root / f"{stem}.json"
+    csv_path = out_root / f"{stem}.csv"
+    with json_path.open("w", encoding="utf-8") as f:
+        json.dump({k: v for k, v in artifact.items() if k != "csv_rows"}, f, ensure_ascii=False, indent=2)
+
+    csv_rows = list(artifact.get("csv_rows", []))
+    if csv_rows:
+        pd.DataFrame(csv_rows).to_csv(csv_path, index=False)
+    else:
+        pd.DataFrame().to_csv(csv_path, index=False)
+    return {"json": str(json_path), "csv": str(csv_path)}
+
+
 def plot_current_allocation(current_df: pd.DataFrame, out_path: Path) -> None:
     variants = list(current_df["variant"].unique())
     current_cols = _current_columns(current_df)
@@ -1985,12 +2556,39 @@ def run_one_scenario(
     for variant in variants:
         for ablation in ablations:
             label = variant if ablation == "full" else f"{variant}_{ablation}"
-            exp_specs.append({"runner": "trainer", "variant": variant, "ablation": ablation, "label": label})
+            exp_specs.append(
+                {
+                    "runner": "trainer",
+                    "variant": variant,
+                    "ablation": ablation,
+                    "label": label,
+                    "baseline_override": "",
+                }
+            )
     for baseline in baselines:
-        if baseline not in {"heuristic_safe", "sac_lagrangian"}:
+        if baseline not in {"heuristic_safe", "sac_lagrangian", "shin2024_matched", "dalal2018_safe"}:
             raise ValueError(f"Unknown baseline: {baseline}")
-        runner = "heuristic" if baseline == "heuristic_safe" else "sac_lagrangian"
-        exp_specs.append({"runner": runner, "variant": "hybrid", "ablation": "full", "label": baseline})
+        if baseline == "heuristic_safe":
+            runner = "heuristic"
+            baseline_override = baseline
+        elif baseline == "sac_lagrangian":
+            runner = "sac_lagrangian"
+            baseline_override = baseline
+        elif baseline == "shin2024_matched":
+            runner = "shin2024_matched"
+            baseline_override = baseline
+        else:
+            runner = "trainer"
+            baseline_override = baseline
+        exp_specs.append(
+            {
+                "runner": runner,
+                "variant": "hybrid",
+                "ablation": "full",
+                "label": baseline,
+                "baseline_override": baseline_override,
+            }
+        )
 
     effective_shared_init = bool(shared_init and all(spec["runner"] == "trainer" and spec["ablation"] == "full" for spec in exp_specs))
     if shared_init and not effective_shared_init:
@@ -2007,9 +2605,15 @@ def run_one_scenario(
     apply_scenario(precheck_cfg, scenario)
     strict_thermal = scenario in {"moderate_practical", "thermal_moderate", "practical_hard"}
     precheck_result = validate_training_config(precheck_cfg, scenario, strict_thermal=strict_thermal)
+    precheck_result.update(alignment_snapshot(precheck_cfg))
+    precheck_result["task_distribution"] = task_distribution_summary(precheck_cfg)
     precheck_path = scenario_dir / "precheck.json"
     with precheck_path.open("w", encoding="utf-8") as f:
         json.dump(precheck_result, f, ensure_ascii=False, indent=2)
+    print(
+        f"[{scenario}] task_distribution="
+        f"{json.dumps(precheck_result['task_distribution'], ensure_ascii=False, sort_keys=True)}"
+    )
 
     train_all: List[pd.DataFrame] = []
     eval_rows: List[Dict[str, float]] = []
@@ -2064,6 +2668,7 @@ def run_one_scenario(
         ablation = str(spec["ablation"])
         label = str(spec["label"])
         runner = str(spec["runner"])
+        baseline_override = str(spec.get("baseline_override", ""))
         for seed in seeds:
             run_name = f"{scenario}_{label}_seed{seed}"
             cfg = apply_common_settings(
@@ -2078,8 +2683,8 @@ def run_one_scenario(
             apply_scenario(cfg, scenario)
             apply_variant(cfg, variant)
             apply_ablation(cfg, ablation)
-            if runner in {"heuristic", "sac_lagrangian"}:
-                apply_baseline_overrides(cfg, label)
+            if baseline_override:
+                apply_baseline_overrides(cfg, baseline_override)
             if use_curriculum:
                 inject_default_curriculum(cfg)
 
@@ -2090,6 +2695,8 @@ def run_one_scenario(
 
             if runner == "sac_lagrangian":
                 trainer = SacLagrangianBaseline(cfg)
+            elif runner == "shin2024_matched":
+                trainer = Shin2024MatchedBaseline(cfg)
             else:
                 trainer = MetaTrainer(cfg)
                 if effective_shared_init:
@@ -2103,6 +2710,7 @@ def run_one_scenario(
                 int(max(1, score_cfg.get("eval_tasks", eval_tasks))),
                 seed_offset=11_000,
             )
+            selection_task_hash = fixed_task_bank_hash(selection_tasks)
             selection_eps = int(max(1, score_cfg.get("eval_eps", 1)))
 
             if runner == "trainer":
@@ -2126,7 +2734,7 @@ def run_one_scenario(
                 )
                 if ckpt_pick.get("selected_path"):
                     trainer.agent.load(ckpt_pick["selected_path"])
-            elif runner == "sac_lagrangian":
+            elif runner in {"sac_lagrangian", "shin2024_matched"}:
                 train_csv = trainer.train(meta_iters=meta_iters)
 
                 run_df = pd.read_csv(train_csv)
@@ -2143,7 +2751,15 @@ def run_one_scenario(
                     run_df=run_df,
                     ckpt_dir=trainer.ckpt_dir,
                     score_cfg=score_cfg,
-                    evaluator=lambda path: (trainer.load(path), evaluate_sac_lagrangian_on_tasks(trainer=trainer, cfg=cfg, tasks=selection_tasks, episodes_per_task=selection_eps))[1],
+                    evaluator=lambda path: (
+                        trainer.load(path),
+                        evaluate_plain_hierarchical_baseline_on_tasks(
+                            trainer=trainer,
+                            cfg=cfg,
+                            tasks=selection_tasks,
+                            episodes_per_task=selection_eps,
+                        ),
+                    )[1],
                 )
                 if ckpt_pick.get("selected_path"):
                     trainer.load(ckpt_pick["selected_path"])
@@ -2153,6 +2769,8 @@ def run_one_scenario(
 
             eval_task_subset = sample_fixed_tasks(cfg, seed, eval_tasks, seed_offset=21_000)
             env_task_subset = sample_fixed_tasks(cfg, seed, env_tasks, seed_offset=31_000)
+            eval_task_hash = fixed_task_bank_hash(eval_task_subset)
+            env_task_hash = fixed_task_bank_hash(env_task_subset)
 
             if runner == "trainer":
                 ev = evaluate_on_tasks(
@@ -2170,14 +2788,14 @@ def run_one_scenario(
                     tasks=env_task_subset,
                     episodes_per_task=env_eps,
                 )
-            elif runner == "sac_lagrangian":
-                ev = evaluate_sac_lagrangian_on_tasks(
+            elif runner in {"sac_lagrangian", "shin2024_matched"}:
+                ev = evaluate_plain_hierarchical_baseline_on_tasks(
                     trainer=trainer,
                     cfg=cfg,
                     tasks=eval_task_subset,
                     episodes_per_task=eval_eps,
                 )
-                env_df = collect_env_data_sac_lagrangian(
+                env_df = collect_env_data_plain_hierarchical_baseline(
                     trainer=trainer,
                     cfg=cfg,
                     scenario=scenario,
@@ -2213,6 +2831,7 @@ def run_one_scenario(
                     "base_variant": variant,
                     "ablation": ablation,
                     "runner": runner,
+                    "baseline_override": baseline_override,
                     "seed": int(seed),
                     "run_name": run_name,
                     "resolved_config": str(resolved_cfg_path),
@@ -2235,7 +2854,17 @@ def run_one_scenario(
                     "shared_init": bool(effective_shared_init),
                     "shared_init_pretrain_iters": int(pre_iters) if effective_shared_init else 0,
                     "shared_init_ckpt": str(shared_init_paths[int(seed)]) if effective_shared_init else "",
+                    "shared_init_ckpt_pre_alignment": (
+                        bool(getattr(trainer.agent, "loaded_alignment_meta", {}).get("pre_alignment", True))
+                        if effective_shared_init and runner == "trainer"
+                        else None
+                    ),
                     "sampler_ranges": sampler_snapshot(cfg),
+                    "selection_task_batch_hash": selection_task_hash,
+                    "eval_task_batch_hash": eval_task_hash,
+                    "env_task_batch_hash": env_task_hash,
+                    "formally_comparable": bool(is_formally_comparable_record(alignment_snapshot(cfg))),
+                    **alignment_snapshot(cfg),
                     "eval_reward": float(ev["reward"]),
                     "eval_se": float(ev["se"]),
                     "eval_eh": float(ev["eh"]),
@@ -2352,6 +2981,15 @@ def run_one_scenario(
                 "tx_enabled": [1.0, 1.0, 1.0],
                 "description": "Literature-style SAC-Lagrangian baseline on the fixed heterogeneous hybrid structure, without context latent z or inner/outer meta adaptation",
             }
+        elif runner == "shin2024_matched":
+            variant_definitions[label] = {
+                "runner": "shin2024_matched",
+                "base_variant": variant,
+                "ablation": ablation,
+                "tx_device": ["LED", "LD", "LD"],
+                "tx_enabled": [1.0, 1.0, 1.0],
+                "description": "Matched Shin 2024-style hierarchical DQN-DDPG baseline on the fixed heterogeneous hybrid structure, without context latent z, meta adaptation, or shared dual updates",
+            }
         elif variant == "hybrid":
             variant_definitions[label] = {
                 "runner": "trainer",
@@ -2359,6 +2997,9 @@ def run_one_scenario(
                 "ablation": ablation,
                 "tx_device": ["LED", "LD", "LD"],
                 "tx_enabled": [1.0, 1.0, 1.0],
+                "description": "Full hierarchical method on the fixed heterogeneous hybrid structure"
+                if label != "dalal2018_safe"
+                else "Full hierarchical method with Dalal 2018-style local action correction replacing the default smooth predictive derating path",
             }
         elif variant == "single_led":
             variant_definitions[label] = {
@@ -2379,6 +3020,8 @@ def run_one_scenario(
 
     summary = {
         "scenario": scenario,
+        "alignment": alignment_snapshot(precheck_cfg),
+        "task_distribution": task_distribution_summary(precheck_cfg),
         "variant_definitions": variant_definitions,
         "eval_summary": evaluate_summary(eval_df),
         "precheck": precheck_result,
@@ -2411,6 +3054,15 @@ def run_one_scenario(
             "env_temp_max_q90": float(env_df["temp_max_after"].quantile(0.9)),
         },
         "constraint_activation_by_variant": activation_by_variant,
+        "task_batch_hashes": (
+            {
+                "selection": sorted({str(row["selection_task_batch_hash"]) for row in run_summaries}),
+                "eval": sorted({str(row["eval_task_batch_hash"]) for row in run_summaries}),
+                "env": sorted({str(row["env_task_batch_hash"]) for row in run_summaries}),
+            }
+            if run_summaries
+            else {}
+        ),
         "metric_notes": {
             "primary_constraint_metrics": [
                 "eval_summary.*.cost_mean",
@@ -2505,7 +3157,7 @@ def run_benchmark(
         p = out_root / s / "run_summary.json"
         if p.exists():
             with p.open("r", encoding="utf-8") as f:
-                all_run_summaries.extend(json.load(f))
+                all_run_summaries.extend(filter_formally_comparable_records(json.load(f), strict=True))
     run_summary_path = out_root / "run_summary.json"
     with run_summary_path.open("w", encoding="utf-8") as f:
         json.dump(all_run_summaries, f, ensure_ascii=False, indent=2)
@@ -2514,8 +3166,40 @@ def run_benchmark(
     if requested_metric_rows:
         pd.concat(requested_metric_rows, ignore_index=True).to_csv(requested_metrics_path, index=False)
 
+    stats_artifacts: Dict[str, Dict[str, str]] = {}
+    for artifact in filter(
+        None,
+        [
+            build_statistics_artifact(
+                all_run_summaries,
+                artifact_name="stats_main_benchmark",
+                scenarios=list(MAIN_BENCHMARK_SCENARIOS),
+                variant_order=STRUCTURAL_VARIANT_ORDER,
+                metrics=["reward", "se", "eh", "cost", "violation_rate"],
+            ),
+            build_statistics_artifact(
+                all_run_summaries,
+                artifact_name="stats_hard_stress_targeted",
+                scenarios=["hard_stress"],
+                variant_order=HARD_TARGETED_VARIANT_ORDER,
+                metrics=["reward", "se", "eh", "cost", "violation_rate"],
+            ),
+            build_statistics_artifact(
+                all_run_summaries,
+                artifact_name="stats_thermal_rebalanced",
+                scenarios=["thermal_rebalanced"],
+                variant_order=THERMAL_VARIANT_ORDER,
+                metrics=["reward", "cost", "violation_rate", "temp_q90", "thermal_step_violation_fraction"],
+            ),
+        ],
+    ):
+        stats_artifacts[str(artifact["artifact"])] = write_statistics_artifact(out_root, artifact)
+
     report = {
         "cfg_path": cfg_path,
+        "alignment": alignment_snapshot(base_cfg),
+        "task_distribution_scope": "base_config_snapshot",
+        "task_distribution": task_distribution_summary(base_cfg),
         "meta_iters": meta_iters,
         "fast_mode": bool(fast_mode),
         "use_curriculum": bool(use_curriculum),
@@ -2530,6 +3214,7 @@ def run_benchmark(
         "run_summary_json": str(run_summary_path),
         "requested_metrics_csv": str(requested_metrics_path),
         "scenario_summaries": scenario_summaries,
+        "stats_artifacts": stats_artifacts,
     }
 
     report_path = out_root / "report.json"
@@ -2563,6 +3248,7 @@ def parse_args() -> argparse.Namespace:
             "ld_adverse_hard",
             "thermal_tight",
             "channel_harsh",
+            "thermal_rebalanced",
         ],
     )
     parser.add_argument("--meta-iters", type=int, default=45)
@@ -2609,7 +3295,7 @@ def parse_args() -> argparse.Namespace:
         type=str,
         nargs="*",
         default=[],
-        choices=["heuristic_safe", "sac_lagrangian"],
+        choices=["heuristic_safe", "sac_lagrangian", "shin2024_matched", "dalal2018_safe"],
         help="Optional heuristic/learning baselines to evaluate.",
     )
     parser.add_argument("--eval-tasks", type=int, default=8)

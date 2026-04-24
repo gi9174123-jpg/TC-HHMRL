@@ -71,3 +71,13 @@ class GaussianTanhPolicy(nn.Module):
     def deterministic(self, obs: torch.Tensor, z: torch.Tensor):
         mu, _ = self.forward(obs, z)
         return torch.tanh(mu)
+
+
+class DeterministicTanhPolicy(nn.Module):
+    def __init__(self, obs_dim: int, z_dim: int, act_dim: int, hidden_dim: int = 128):
+        super().__init__()
+        self.policy = MLP(obs_dim + z_dim, [hidden_dim, hidden_dim], act_dim)
+
+    def forward(self, obs: torch.Tensor, z: torch.Tensor) -> torch.Tensor:
+        x = torch.cat([obs, z], dim=-1)
+        return torch.tanh(self.policy(x))

@@ -30,7 +30,7 @@ class SafetyLayer:
         env_cfg = cfg.get("env", {})
         hybrid_cfg = env_cfg.get("hybrid", {})
         self.projection_mode = str(safety_cfg.get("projection_mode", "smooth")).lower()
-        if self.projection_mode not in {"smooth", "hard_clip"}:
+        if self.projection_mode not in {"smooth", "hard_clip", "dalal_safe"}:
             raise ValueError(f"unsupported safety.projection_mode={self.projection_mode}")
         self.min_dwell_steps = int(safety_cfg["min_dwell_steps"])
         self.soft_alpha = float(safety_cfg["soft_alpha"])
@@ -55,6 +55,8 @@ class SafetyLayer:
         thermal_led_coeff = float(hybrid_cfg.get("thermal_led_coeff", 1.00))
         thermal_ld_coeff = float(hybrid_cfg.get("thermal_ld_coeff", 1.25))
         self.tx_thermal_coeff = tx_is_led * thermal_led_coeff + tx_is_ld * thermal_ld_coeff
+        self._dalal_eps = 1.0e-6
+        self._dalal_iters = 4
 
     @staticmethod
     def decode_upper(upper_raw: int | np.ndarray) -> Tuple[int, int]:
@@ -180,7 +182,7 @@ class SafetyLayer:
         currents = _sigmoid_np(lower_raw[:3]) * self.current_max
 
         mask = self._boost_mask(exec_boost)
-        if self.projection_mode == "smooth":
+        if self.projection_mode in {"smooth", "dalal_safe"}:
             mask = self.mask_floor + (1.0 - self.mask_floor) * mask
         mask = self.tx_enabled * mask
         currents *= mask.astype(np.float32)
@@ -188,6 +190,14 @@ class SafetyLayer:
         total = float(np.sum(currents))
         if self.projection_mode == "smooth":
             currents *= self._smooth_bus_scale_np(total)
+        elif self.projection_mode == "dalal_safe":
+            currents = self._dalal_correct_currents_np(
+                currents=currents,
+                temps=np.asarray(temps, dtype=np.float32),
+                amb_temp=float(amb_temp),
+                gamma=float(gamma),
+                delta=float(delta),
+            )
         else:
             currents *= self._hard_bus_scale_np(total)
 
@@ -202,9 +212,12 @@ class SafetyLayer:
             soft_scale = _sigmoid_np(self.soft_alpha * (self.thermal_safe - T_pred))
             cutoff_scale = _sigmoid_np(self.cutoff_alpha * (self.thermal_cutoff - T_pred))
             thermal_scale = (soft_scale * cutoff_scale).astype(np.float32)
+        elif self.projection_mode == "dalal_safe":
+            thermal_scale = np.clip(currents / np.maximum(self.current_max, 1.0e-6), 0.0, 1.0).astype(np.float32)
         else:
             thermal_scale = (T_pred <= self.thermal_safe).astype(np.float32)
-        currents *= thermal_scale
+        if self.projection_mode != "dalal_safe":
+            currents *= thermal_scale
 
         return (
             {
@@ -246,7 +259,7 @@ class SafetyLayer:
         )
         boost_combo = torch.clamp(boost_combo, 0, table.shape[0] - 1)
         mask = table.index_select(0, boost_combo)
-        if self.projection_mode == "smooth":
+        if self.projection_mode in {"smooth", "dalal_safe"}:
             mask = self.mask_floor + (1.0 - self.mask_floor) * mask
         tx_enabled = torch.as_tensor(self.tx_enabled, dtype=lower_raw.dtype, device=device).view(1, -1)
         mask = tx_enabled * mask
@@ -255,6 +268,14 @@ class SafetyLayer:
         total = currents.sum(dim=1, keepdim=True)
         if self.projection_mode == "smooth":
             currents = currents * self._smooth_bus_scale_torch(total)
+        elif self.projection_mode == "dalal_safe":
+            currents = self._dalal_correct_currents_torch(
+                currents=currents,
+                temps=temps if temps.dim() > 1 else temps.unsqueeze(0),
+                amb_temp=amb_temp if amb_temp.dim() > 1 else amb_temp.unsqueeze(1),
+                gamma=gamma if gamma.dim() > 1 else gamma.unsqueeze(1),
+                delta=delta if delta.dim() > 1 else delta.unsqueeze(1),
+            )
         else:
             currents = currents * self._hard_bus_scale_torch(total)
 
@@ -281,9 +302,16 @@ class SafetyLayer:
             soft_scale = torch.sigmoid(self.soft_alpha * (self.thermal_safe - T_pred))
             cutoff_scale = torch.sigmoid(self.cutoff_alpha * (self.thermal_cutoff - T_pred))
             thermal_scale = soft_scale * cutoff_scale
+        elif self.projection_mode == "dalal_safe":
+            thermal_scale = torch.clamp(
+                currents / torch.clamp(current_max, min=1.0e-6),
+                min=0.0,
+                max=1.0,
+            )
         else:
             thermal_scale = (T_pred <= self.thermal_safe).to(lower_raw.dtype)
-        currents = currents * thermal_scale
+        if self.projection_mode != "dalal_safe":
+            currents = currents * thermal_scale
 
         return {
             "boost_combo_exec": boost_combo,
@@ -295,3 +323,58 @@ class SafetyLayer:
             "t_pred": T_pred,
             "thermal_scale": thermal_scale,
         }
+
+    def _dalal_correct_currents_np(
+        self,
+        *,
+        currents: np.ndarray,
+        temps: np.ndarray,
+        amb_temp: float,
+        gamma: float,
+        delta: float,
+    ) -> np.ndarray:
+        currents = np.clip(np.asarray(currents, dtype=np.float32), 0.0, self.current_max)
+        for _ in range(self._dalal_iters):
+            total = float(np.sum(currents))
+            g_bus = total - self.bus_current_max
+            if g_bus > 0.0:
+                grad_bus = np.ones_like(currents, dtype=np.float32)
+                step = float(g_bus / (np.dot(grad_bus, grad_bus) + self._dalal_eps))
+                currents = np.clip(currents - step * grad_bus, 0.0, self.current_max)
+
+            t_pred = (1.0 - gamma) * temps + gamma * amb_temp + delta * self.tx_thermal_coeff * (currents**2)
+            for idx in range(currents.shape[0]):
+                g_temp = float(t_pred[idx] - self.thermal_safe)
+                if g_temp <= 0.0:
+                    continue
+                grad_i = float(2.0 * delta * self.tx_thermal_coeff[idx] * currents[idx])
+                step = float(g_temp / (grad_i * grad_i + self._dalal_eps))
+                currents[idx] = float(np.clip(currents[idx] - step * grad_i, 0.0, self.current_max[idx]))
+        return currents.astype(np.float32)
+
+    def _dalal_correct_currents_torch(
+        self,
+        *,
+        currents: torch.Tensor,
+        temps: torch.Tensor,
+        amb_temp: torch.Tensor,
+        gamma: torch.Tensor,
+        delta: torch.Tensor,
+    ) -> torch.Tensor:
+        current_max = torch.as_tensor(self.current_max, dtype=currents.dtype, device=currents.device).view(1, -1)
+        thermal_coeff = torch.as_tensor(self.tx_thermal_coeff, dtype=currents.dtype, device=currents.device).view(1, -1)
+        currents = torch.clamp(currents, min=0.0, max=current_max)
+        eps = torch.as_tensor(self._dalal_eps, dtype=currents.dtype, device=currents.device)
+        for _ in range(self._dalal_iters):
+            total = currents.sum(dim=1, keepdim=True)
+            g_bus = torch.clamp(total - self.bus_current_max, min=0.0)
+            grad_bus = torch.ones_like(currents)
+            step_bus = g_bus / (grad_bus.square().sum(dim=1, keepdim=True) + eps)
+            currents = torch.clamp(currents - step_bus * grad_bus, min=0.0, max=current_max)
+
+            t_pred = (1.0 - gamma) * temps + gamma * amb_temp + delta * thermal_coeff * (currents**2)
+            g_temp = torch.clamp(t_pred - self.thermal_safe, min=0.0)
+            grad_temp = 2.0 * delta * thermal_coeff * currents
+            step_temp = g_temp / (grad_temp.square() + eps)
+            currents = torch.clamp(currents - step_temp * grad_temp, min=0.0, max=current_max)
+        return currents

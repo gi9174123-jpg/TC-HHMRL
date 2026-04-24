@@ -11,6 +11,7 @@ import torch
 from tchhmrl.agents.hierarchical_agent import HierarchicalAgent
 from tchhmrl.constraints.dual_layer import DualLayer
 from tchhmrl.envs.task_sampler import TaskSampler
+from tchhmrl.envs.task_contract import build_task_summary_v2, task_defaults_from_cfg
 from tchhmrl.envs.uw_slipt_env import MultiTxUwSliptEnv
 from tchhmrl.utils.config import resolve_device
 from tchhmrl.utils.logger import Logger
@@ -46,7 +47,11 @@ class MetaTrainer:
         self.cfg["experiment"]["device_resolved"] = str(self.device)
         self.agent = HierarchicalAgent(cfg, self.device)
         self.base_sampler_cfg = copy.deepcopy(cfg["sampler"])
-        self.task_sampler = TaskSampler(copy.deepcopy(self.base_sampler_cfg), seed=seed)
+        self.task_sampler = TaskSampler(
+            copy.deepcopy(self.base_sampler_cfg),
+            seed=seed,
+            task_defaults=task_defaults_from_cfg(cfg),
+        )
 
         curriculum_cfg = cfg.get("meta", {}).get("curriculum", {})
         self.curriculum_enabled = bool(curriculum_cfg.get("enabled", False))
@@ -107,6 +112,8 @@ class MetaTrainer:
                 picked = phase
                 break
 
+        if bool(self.base_sampler_cfg.get("strict_site_bank", False)) and "site_bank" in picked["sampler"]:
+            raise ValueError("strict_site_bank=true does not allow curriculum phases to override site_bank")
         merged = copy.deepcopy(self.base_sampler_cfg)
         merged.update(copy.deepcopy(picked["sampler"]))
         return str(picked["name"]), merged
@@ -175,11 +182,14 @@ class MetaTrainer:
                 "temps": temps_before.astype(np.float32),
                 "next_temps": info["temps"].astype(np.float32),
                 "amb_temp": float(info["amb_temp"]),
+                "amb_temp_env": float(info["amb_temp"]),
                 "gamma_env": float(info["gamma"]),
                 "delta_env": float(info["delta"]),
                 "attenuation_c_env": float(env.attenuation_c),
                 "misalign_std_env": float(env.misalign_std),
                 "qos_min_rate_env": float(env.qos_min_rate),
+                "site_id_env": int(info.get("site_id", getattr(env, "site_id", -1))),
+                "distances_env": np.asarray(env.distances, dtype=np.float32).copy(),
                 "cost": cost,
                 "cost_vec": cost_vec.astype(np.float32),
             }
@@ -262,14 +272,7 @@ class MetaTrainer:
                         "cost": lower_transition["cost"],
                         "cost_vec": lower_transition["cost_vec"],
                         "task_params": np.asarray(
-                            [
-                                float(lower_transition["attenuation_c_env"]),
-                                float(lower_transition["misalign_std_env"]),
-                                float(lower_transition["amb_temp"]),
-                                float(lower_transition["gamma_env"]),
-                                float(lower_transition["delta_env"]),
-                                float(lower_transition["qos_min_rate_env"]),
-                            ],
+                            build_task_summary_v2(lower_transition),
                             dtype=np.float32,
                         ),
                     }

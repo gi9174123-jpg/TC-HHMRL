@@ -6,6 +6,8 @@ import gymnasium as gym
 import numpy as np
 from gymnasium import spaces
 
+from tchhmrl.envs.task_contract import TaskSpec
+
 
 class MultiTxUwSliptEnv(gym.Env):
     """Multi-transmitter underwater SLIPT simulation with fixed heterogeneous devices.
@@ -22,6 +24,12 @@ class MultiTxUwSliptEnv(gym.Env):
         env_cfg = dict(cfg["env"])
         if overrides:
             env_cfg.update(overrides)
+        alignment_cfg = dict(cfg.get("alignment", {}))
+        self.alignment_version = str(alignment_cfg.get("alignment_version", "teacher_model_v1"))
+        self.task_summary_version = str(alignment_cfg.get("task_summary_version", "site_v2"))
+        self.pre_alignment = bool(alignment_cfg.get("pre_alignment", False))
+        self.default_alignment_version = str(self.alignment_version)
+        self.default_task_summary_version = str(self.task_summary_version)
 
         self.n_tx = int(env_cfg["n_tx"])
         self.episode_len = int(env_cfg["episode_len"])
@@ -31,6 +39,7 @@ class MultiTxUwSliptEnv(gym.Env):
         self.attenuation_c = float(env_cfg["attenuation_c"])
         self.d0 = float(env_cfg["d0"])
         self.distances = np.asarray(env_cfg["distances"], dtype=np.float32)
+        self.default_distances = self.distances.copy()
         self.misalign_std = float(env_cfg["misalign_std"])
         self.temporal_misalign_rho = float(env_cfg.get("temporal_misalign_rho", 0.0))
         self.attenuation_drift_rho = float(env_cfg.get("attenuation_drift_rho", 0.0))
@@ -130,6 +139,10 @@ class MultiTxUwSliptEnv(gym.Env):
         )
 
         self.rng = np.random.default_rng(0)
+        self.site_id = int(env_cfg.get("site_id", -1))
+        self.default_site_id = int(self.site_id)
+        self.task_source = str(env_cfg.get("task_source", "global_fallback"))
+        self.default_task_source = str(self.task_source)
         self.t = 0
         self.temps = np.full(self.n_tx, self.temp_init, dtype=np.float32)
         self.misalign = np.zeros(self.n_tx, dtype=np.float32)
@@ -251,9 +264,33 @@ class MultiTxUwSliptEnv(gym.Env):
         if seed is not None:
             self.rng = np.random.default_rng(seed)
         if options:
-            for key in ["attenuation_c", "misalign_std", "amb_temp", "gamma", "delta"]:
+            for key in ["attenuation_c", "misalign_std", "amb_temp", "gamma", "delta", "qos_min_rate"]:
                 if key in options:
                     setattr(self, key, float(options[key]))
+            if "distances" in options:
+                distances = np.asarray(options["distances"], dtype=np.float32)
+                if distances.shape != (self.n_tx,):
+                    raise ValueError(f"distances must have shape ({self.n_tx},), got {distances.shape}")
+                self.distances = distances
+            else:
+                self.distances = self.default_distances.copy()
+            if "site_id" in options:
+                self.site_id = int(options["site_id"])
+            else:
+                self.site_id = -1
+            self.task_source = str(options.get("task_source", "global_fallback"))
+            if "alignment_version" in options:
+                self.alignment_version = str(options["alignment_version"])
+            if "task_summary_version" in options:
+                self.task_summary_version = str(options["task_summary_version"])
+        else:
+            self.distances = self.default_distances.copy()
+            self.site_id = int(getattr(self, "default_site_id", -1))
+            self.task_source = str(getattr(self, "default_task_source", "global_fallback"))
+            self.alignment_version = str(getattr(self, "default_alignment_version", self.alignment_version))
+            self.task_summary_version = str(
+                getattr(self, "default_task_summary_version", self.task_summary_version)
+            )
 
         self.t = 0
         self.temps = np.full(self.n_tx, self.temp_init, dtype=np.float32)
@@ -272,13 +309,57 @@ class MultiTxUwSliptEnv(gym.Env):
         return self._obs(), {"task": self._task_dict()}
 
     def _task_dict(self) -> Dict[str, float]:
+        spec = TaskSpec(
+            site_id=int(getattr(self, "site_id", -1)),
+            task_source=str(getattr(self, "task_source", "global_fallback")),
+            distances=tuple(float(x) for x in self.distances[:3]),
+            attenuation_c=float(self.attenuation_c),
+            misalign_std=float(self.misalign_std),
+            amb_temp=float(self.amb_temp),
+            gamma=float(self.gamma),
+            delta=float(self.delta),
+            qos_min_rate=float(self.qos_min_rate),
+            alignment_version=self.alignment_version,
+            task_summary_version=self.task_summary_version,
+        )
+        return spec.to_task_dict(pre_alignment=self.pre_alignment)
+
+    def debug_hy_snapshot(
+        self,
+        *,
+        currents_exec: np.ndarray,
+        rho_exec: float,
+        tau_exec: float,
+        mode_exec: int = 2,
+    ) -> Dict[str, float]:
+        currents = np.asarray(currents_exec, dtype=np.float32).copy()
+        rho = float(rho_exec)
+        tau = float(tau_exec)
+        tx_signal = self._compute_tx_signal(currents)
+        signal_led = float(np.sum(tx_signal * self.tx_is_led))
+        signal_ld = float(np.sum(tx_signal * self.tx_is_ld))
+        se_tx_weight = self._tx_vector(self.se_led_weight, self.se_ld_weight)
+        eh_tx_weight = self._tx_vector(self.eh_led_weight, self.eh_ld_weight)
+        info_signal = float(np.sum(tx_signal * se_tx_weight))
+        eh_input = float(np.sum(tx_signal * eh_tx_weight))
+        noise_power = (
+            self.noise_floor
+            + self.noise_led_coeff * abs(signal_led)
+            + self.noise_ld_coeff * abs(signal_ld)
+        )
+        info_share = tau * (1.0 - rho)
+        eh_share = 1.0 - info_share
+        snr = max(info_signal / max(noise_power, 1.0e-6), 1.0e-6)
+        qos_rate = float(self._mode_gain(mode_exec, self.mode_se_gain) * info_share * np.log2(1.0 + snr))
+        eh_metric = float(self._mode_gain(mode_exec, self.mode_eh_gain) * eh_share * eh_input)
         return {
-            "attenuation_c": float(self.attenuation_c),
-            "misalign_std": float(self.misalign_std),
-            "amb_temp": float(self.amb_temp),
-            "gamma": float(self.gamma),
-            "delta": float(self.delta),
-            "qos_min_rate": float(self.qos_min_rate),
+            "info_share": float(info_share),
+            "eh_share": float(eh_share),
+            "qos_rate": float(qos_rate),
+            "eh_metric": float(eh_metric),
+            "reward_id_term": float(self.se_weight * qos_rate),
+            "reward_eh_term": float(self.eh_weight * eh_metric),
+            "total_reward_no_penalty": float(self.se_weight * qos_rate + self.eh_weight * eh_metric),
         }
 
     def step(self, action: Dict):
@@ -326,7 +407,7 @@ class MultiTxUwSliptEnv(gym.Env):
         # Mode semantics:
         # mode=0: PS  -> info=(1-rho), EH=rho
         # mode=1: TS  -> info=tau, EH=(1-tau)
-        # mode=2: HY  -> info=tau*(1-rho), EH=rho
+        # mode=2: HY  -> info=tau*(1-rho), EH=1-tau*(1-rho)
         if mode == 0:
             info_share = 1.0 - rho
             eh_share = rho
@@ -335,14 +416,16 @@ class MultiTxUwSliptEnv(gym.Env):
             eh_share = 1.0 - tau
         else:
             info_share = tau * (1.0 - rho)
-            eh_share = rho
+            eh_share = 1.0 - info_share
 
         info_share = float(np.clip(info_share, 0.0, 1.0))
         eh_share = float(np.clip(eh_share, 0.0, 1.0))
+        if mode == 2:
+            assert abs((info_share + eh_share) - 1.0) < 1.0e-6
 
         qos_rate = float(mode_se * info_share * np.log2(1.0 + snr))
         eh_metric = float(mode_eh * eh_share * eh_input)
-        se_term = self.se_weight * qos_rate
+        id_term = self.se_weight * qos_rate
         eh_term = self.eh_weight * eh_metric
 
         thermal_coeff = self._tx_vector(self.thermal_led_coeff, self.thermal_ld_coeff)
@@ -367,7 +450,7 @@ class MultiTxUwSliptEnv(gym.Env):
         cost_penalty = self.cost_weight * cost
         power_penalty_term = self.power_weight * power_penalty
         reward = float(
-            se_term + eh_term + margin_reward - cost_penalty - power_penalty_term - smooth_penalty - switch_penalty
+            id_term + eh_term + margin_reward - cost_penalty - power_penalty_term - smooth_penalty - switch_penalty
         )
 
         if boost_combo == self.prev_boost:
@@ -389,12 +472,13 @@ class MultiTxUwSliptEnv(gym.Env):
         obs = self._obs()
 
         info = {
-            "se": float(se_term),
+            "se": float(id_term),
             "eh": float(eh_term),
             "qos_rate": float(qos_rate),
             "eh_metric": float(eh_metric),
-            "reward_se_term": float(se_term),
+            "reward_se_term": float(id_term),
             "reward_eh_term": float(eh_term),
+            "reward_id_term": float(id_term),
             "penalty_cost_term": float(cost_penalty),
             "penalty_power_term": float(power_penalty_term),
             "penalty_smooth_term": float(smooth_penalty),
@@ -436,5 +520,14 @@ class MultiTxUwSliptEnv(gym.Env):
             "attenuation_eff": float(self.attenuation_eff),
             "burst_mean": float(np.mean(self.burst_state)),
             "amb_temp": float(self.amb_temp),
+            "amb_temp_env": float(self.amb_temp),
+            "site_id": int(getattr(self, "site_id", -1)),
+            "task_source": str(getattr(self, "task_source", "global_fallback")),
+            "distance_tx0": float(self.distances[0]) if self.n_tx > 0 else 0.0,
+            "distance_tx1": float(self.distances[1]) if self.n_tx > 1 else 0.0,
+            "distance_tx2": float(self.distances[2]) if self.n_tx > 2 else 0.0,
+            "alignment_version": self.alignment_version,
+            "task_summary_version": self.task_summary_version,
+            "pre_alignment": bool(self.pre_alignment),
         }
         return obs, reward, terminated, truncated, info

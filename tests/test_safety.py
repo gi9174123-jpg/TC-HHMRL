@@ -139,6 +139,27 @@ def test_safety_hard_clip_zeroes_currents_above_thermal_safe():
     assert float(np.sum(out_hot["currents_exec"])) == 0.0
 
 
+def test_safety_dalal_correction_respects_bus_and_thermal_safe():
+    cfg = load_cfg("configs/default.yaml")
+    cfg = copy.deepcopy(cfg)
+    cfg["safety"]["projection_mode"] = "dalal_safe"
+    safety = SafetyLayer(cfg)
+    lower_raw = np.array([6.0, 6.0, 6.0, 0.0, 0.0], dtype=np.float32)
+    temps = np.array([44.0, 44.0, 44.0], dtype=np.float32)
+
+    out, _ = safety.project_np(
+        upper_raw=11,
+        lower_raw=lower_raw,
+        temps=temps,
+        amb_temp=26.0,
+        gamma=0.04,
+        delta=2.4,
+        mem={"current_boost": 3, "dwell_count": 3},
+    )
+    assert float(np.sum(out["currents_exec"])) <= cfg["safety"]["bus_current_max"] + 1e-4
+    assert float(np.max(out["t_pred"])) <= cfg["safety"]["thermal_safe"] + 1e-3
+
+
 def test_safety_raw_to_exec_map_matches_preview():
     cfg = load_cfg("configs/default.yaml")
     safety = SafetyLayer(cfg)

@@ -36,11 +36,22 @@ def test_benchmark_writes_resolved_config_and_run_summary(tmp_path: Path):
     rows = json.loads(run_summary_json.read_text(encoding="utf-8"))
     # 3 variants x 1 seed
     assert len(rows) == 3
+    assert len({row["selection_task_batch_hash"] for row in rows}) == 1
+    assert len({row["eval_task_batch_hash"] for row in rows}) == 1
+    assert len({row["env_task_batch_hash"] for row in rows}) == 1
     for row in rows:
         assert "scenario" in row and row["scenario"] == "easy_baseline"
         assert "variant" in row
         assert "seed" in row
         assert "sampler_ranges" in row
+        assert row["alignment_version"] == "teacher_model_v1"
+        assert row["task_summary_version"] == "site_v2"
+        assert row["pre_alignment"] is False
+        assert row["task_source"] == "site_bank"
+        assert row["formally_comparable"] is True
+        assert row["selection_task_batch_hash"]
+        assert row["eval_task_batch_hash"]
+        assert row["env_task_batch_hash"]
         assert "shared_init" in row and bool(row["shared_init"]) is True
         assert "shared_init_pretrain_iters" in row
         assert int(row["shared_init_pretrain_iters"]) >= 0
@@ -53,9 +64,22 @@ def test_benchmark_writes_resolved_config_and_run_summary(tmp_path: Path):
         resolved_cfg = yaml.safe_load(resolved.read_text(encoding="utf-8"))
         assert "env" in resolved_cfg and "safety" in resolved_cfg
         assert "hybrid" in resolved_cfg["env"]
+        assert "alignment" in resolved_cfg
+        assert resolved_cfg["alignment"]["alignment_version"] == "teacher_model_v1"
+        assert resolved_cfg["alignment"]["task_summary_version"] == "site_v2"
+        assert "site_bank" in resolved_cfg["sampler"]
 
     precheck = json.loads(precheck_json.read_text(encoding="utf-8"))
     assert precheck["all_passed"] is True
+    assert precheck["alignment_version"] == "teacher_model_v1"
+    assert precheck["task_summary_version"] == "site_v2"
+    assert precheck["task_source"] == "site_bank"
+    assert precheck["task_distribution"]["task_source"] == "site_bank"
+
+    report = json.loads(report_path.read_text(encoding="utf-8"))
+    assert report["task_distribution_scope"] == "base_config_snapshot"
+    stats = report.get("stats_artifacts", {})
+    assert stats == {}
 
 
 def test_benchmark_supports_ablations_and_learning_baseline(tmp_path: Path):
@@ -90,6 +114,9 @@ def test_benchmark_supports_ablations_and_learning_baseline(tmp_path: Path):
     assert stability_csv.exists()
 
     rows = json.loads(run_summary_json.read_text(encoding="utf-8"))
+    assert len({row["selection_task_batch_hash"] for row in rows}) == 1
+    assert len({row["eval_task_batch_hash"] for row in rows}) == 1
+    assert len({row["env_task_batch_hash"] for row in rows}) == 1
     labels = {row["variant"] for row in rows}
     assert labels == {
         "hybrid",
@@ -102,7 +129,60 @@ def test_benchmark_supports_ablations_and_learning_baseline(tmp_path: Path):
     saclag_rows = [row for row in rows if row["variant"] == "sac_lagrangian"]
     assert len(saclag_rows) == 1
     assert saclag_rows[0]["runner"] == "sac_lagrangian"
+    assert saclag_rows[0]["formally_comparable"] is True
     saclag_cfg = yaml.safe_load(Path(saclag_rows[0]["resolved_config"]).read_text(encoding="utf-8"))
     assert int(saclag_cfg["agent"]["z_dim"]) == 0
     assert bool(saclag_cfg["context"]["enabled"]) is False
     assert bool(saclag_cfg["meta"]["explicit_inner_outer"]) is False
+
+    report = json.loads(report_path.read_text(encoding="utf-8"))
+    stats = report.get("stats_artifacts", {})
+    assert "stats_hard_stress_targeted" in stats
+    assert Path(stats["stats_hard_stress_targeted"]["json"]).exists()
+    assert Path(stats["stats_hard_stress_targeted"]["csv"]).exists()
+
+
+def test_benchmark_supports_shin2024_and_dalal_baselines(tmp_path: Path):
+    out_dir = tmp_path / "bench_phase2"
+    report_path = run_benchmark(
+        cfg_path="configs/default.yaml",
+        out_dir=str(out_dir),
+        scenarios=["thermal_rebalanced"],
+        meta_iters=1,
+        fast_mode=True,
+        seeds=[101],
+        eval_tasks=1,
+        eval_eps=1,
+        env_tasks=1,
+        env_eps=1,
+        use_curriculum=False,
+        shared_init=False,
+        variants=["hybrid"],
+        ablations=["full"],
+        baselines=["shin2024_matched", "dalal2018_safe"],
+    )
+    assert report_path.exists()
+
+    rows = json.loads((out_dir / "thermal_rebalanced" / "run_summary.json").read_text(encoding="utf-8"))
+    labels = {row["variant"] for row in rows}
+    assert labels == {"hybrid", "shin2024_matched", "dalal2018_safe"}
+
+    shin_rows = [row for row in rows if row["variant"] == "shin2024_matched"]
+    dalal_rows = [row for row in rows if row["variant"] == "dalal2018_safe"]
+    assert len(shin_rows) == 1
+    assert len(dalal_rows) == 1
+    assert shin_rows[0]["runner"] == "shin2024_matched"
+    assert dalal_rows[0]["runner"] == "trainer"
+
+    shin_cfg = yaml.safe_load(Path(shin_rows[0]["resolved_config"]).read_text(encoding="utf-8"))
+    dalal_cfg = yaml.safe_load(Path(dalal_rows[0]["resolved_config"]).read_text(encoding="utf-8"))
+    assert int(shin_cfg["agent"]["z_dim"]) == 0
+    assert bool(shin_cfg["context"]["enabled"]) is False
+    assert shin_cfg["safety"]["projection_mode"] == "smooth"
+    assert dalal_cfg["safety"]["projection_mode"] == "dalal_safe"
+
+    report = json.loads(report_path.read_text(encoding="utf-8"))
+    stats = report.get("stats_artifacts", {})
+    assert "stats_thermal_rebalanced" in stats
+    assert Path(stats["stats_thermal_rebalanced"]["json"]).exists()
+    assert Path(stats["stats_thermal_rebalanced"]["csv"]).exists()

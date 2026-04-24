@@ -4,6 +4,11 @@ experiment:
   log_dir: logs
   run_name: meta_run
 
+alignment:
+  alignment_version: teacher_model_v1
+  task_summary_version: site_v2
+  pre_alignment: false
+
 env:
   episode_len: 80
   n_tx: 3
@@ -95,6 +100,16 @@ lower_sac:
   alpha: 0.10
   grad_clip: 5.0
 
+lower_ddpg:
+  replay_size: 1000000
+  batch_size: 64
+  actor_lr: 1.0e-4
+  critic_lr: 3.0e-4
+  gamma: 0.99
+  target_tau: 0.2
+  noise_std: 0.10
+  grad_clip: 5.0
+
 meta:
   n_tasks_per_iter: 6
   meta_iters: 80
@@ -141,3 +156,28 @@ sampler:
   amb_temp_range: [30.0, 35.0]
   gamma_range: [0.05, 0.09]
   delta_range: [4.4, 6.4]
+  balanced_sampling: true
+  strict_site_bank: true
+  default_distances: [5.0, 6.0, 6.5]
+  site_bank:
+    - site_id: 0
+      distances: [4.8, 5.8, 6.3]
+      attenuation_c_range: [0.18, 0.26]
+      misalign_std_range: [0.07, 0.12]
+      amb_temp_range: [30.0, 34.0]
+      gamma_range: [0.05, 0.08]
+      delta_range: [4.4, 5.8]
+    - site_id: 1
+      distances: [5.0, 6.0, 6.5]
+      attenuation_c_range: [0.20, 0.28]
+      misalign_std_range: [0.08, 0.13]
+      amb_temp_range: [31.0, 35.0]
+      gamma_range: [0.06, 0.09]
+      delta_range: [4.8, 6.2]
+    - site_id: 2
+      distances: [5.3, 6.3, 6.9]
+      attenuation_c_range: [0.22, 0.30]
+      misalign_std_range: [0.09, 0.14]
+      amb_temp_range: [32.0, 35.0]
+      gamma_range: [0.06, 0.09]
+      delta_range: [5.0, 6.4]

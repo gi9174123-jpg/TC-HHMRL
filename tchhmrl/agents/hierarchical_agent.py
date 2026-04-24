@@ -13,6 +13,7 @@ from tchhmrl.agents.dqn_upper import UpperDQN
 from tchhmrl.agents.sac_lower import LowerSAC
 from tchhmrl.buffers.replay_buffer import EpisodeBuffer, ReplayBuffer
 from tchhmrl.models.context_encoder import ContextEncoder
+from tchhmrl.envs.task_contract import build_task_summary_v2, is_formally_comparable_record
 from tchhmrl.safety.safety_layer import SafetyLayer
 
 
@@ -32,8 +33,13 @@ class HierarchicalAgent:
         self.z_dim = int(cfg["agent"]["z_dim"])
         self.context_enabled = bool(cfg.get("context", {}).get("enabled", True))
         self.context_cost_dim = len(cfg.get("meta", {}).get("dual_names", ["qos"] + [f"temp_tx{i}" for i in range(int(cfg["env"]["n_tx"]))]))
-        self.context_task_dim = 6
+        self.context_task_dim = 9
         self.context_upper_dim = int(cfg["agent"].get("lower_upper_ctx_dim", 7))
+        alignment_cfg = cfg.get("alignment", {})
+        self.alignment_version = str(alignment_cfg.get("alignment_version", "teacher_model_v1"))
+        self.task_summary_version = str(alignment_cfg.get("task_summary_version", "site_v2"))
+        self.pre_alignment = bool(alignment_cfg.get("pre_alignment", False))
+        self.loaded_alignment_meta = self._alignment_meta()
 
         ctx_cfg = cfg["context"]
         expected_context_input_dim = (
@@ -120,17 +126,17 @@ class HierarchicalAgent:
         ).astype(np.float32)
 
     def _task_params_from_transition(self, tr: Dict) -> np.ndarray:
-        return np.asarray(
-            [
-                float(tr.get("attenuation_c_env", 0.0)),
-                float(tr.get("misalign_std_env", 0.0)),
-                float(tr.get("amb_temp", 0.0)),
-                float(tr.get("gamma_env", 0.0)),
-                float(tr.get("delta_env", 0.0)),
-                float(tr.get("qos_min_rate_env", 0.0)),
-            ],
-            dtype=np.float32,
-        )
+        return build_task_summary_v2(tr)
+
+    def _alignment_meta(self, *, pre_alignment: bool | None = None) -> Dict[str, object]:
+        return {
+            "alignment_version": self.alignment_version,
+            "task_summary_version": self.task_summary_version,
+            "pre_alignment": bool(self.pre_alignment if pre_alignment is None else pre_alignment),
+        }
+
+    def is_formally_comparable(self) -> bool:
+        return is_formally_comparable_record(self.loaded_alignment_meta)
 
     @staticmethod
     def _mean_metrics(metrics_list: list[Dict[str, float]]) -> Dict[str, float]:
@@ -510,6 +516,7 @@ class HierarchicalAgent:
             "context_predictor": self.context_predictor.state_dict(),
             "context_optim": self.context_optim.state_dict(),
             "global_step": self.global_step,
+            "alignment_meta": self._alignment_meta(pre_alignment=False),
         }
         torch.save(ckpt, ckpt_path)
 
@@ -530,4 +537,12 @@ class HierarchicalAgent:
             except ValueError:
                 # Allow loading older checkpoints saved before predictor params were added.
                 pass
+        self.loaded_alignment_meta = dict(
+            ckpt.get(
+                "alignment_meta",
+                self._alignment_meta(pre_alignment=True),
+            )
+        )
+        if "pre_alignment" not in self.loaded_alignment_meta:
+            self.loaded_alignment_meta["pre_alignment"] = True
         self.global_step = int(ckpt.get("global_step", 0))

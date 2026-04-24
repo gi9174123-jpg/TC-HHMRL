@@ -2,7 +2,14 @@ from __future__ import annotations
 
 import copy
 
-from scripts.benchmark_constraint_scenarios import apply_ablation, apply_scenario, apply_variant, validate_training_config
+from scripts.benchmark_constraint_scenarios import (
+    apply_ablation,
+    apply_baseline_overrides,
+    apply_scenario,
+    apply_variant,
+    inject_default_curriculum,
+    validate_training_config,
+)
 from tchhmrl.utils.config import load_cfg
 
 
@@ -42,6 +49,20 @@ def test_hard_balanced_scenario_override_exists():
     assert float(cfg["env"]["misalign_std"]) == 0.12
     assert float(cfg["safety"]["thermal_safe"]) == 48.0
     assert float(cfg["safety"]["thermal_cutoff"]) == 58.0
+
+
+def test_thermal_rebalanced_scenario_override_exists():
+    cfg = load_cfg("configs/default.yaml")
+    cfg = copy.deepcopy(cfg)
+    apply_scenario(cfg, "thermal_rebalanced")
+
+    assert float(cfg["env"]["attenuation_c"]) == 0.22
+    assert float(cfg["env"]["qos_min_rate"]) == 0.008
+    assert float(cfg["safety"]["thermal_safe"]) == 43.0
+    assert float(cfg["safety"]["bus_current_max"]) == 7.6
+    assert cfg["sampler"]["site_bank"][1]["distances"] == [4.6, 5.2, 5.8]
+    assert cfg["sampler"]["site_bank"][0]["amb_temp_range"] == [40.5, 42.5]
+    assert cfg["sampler"]["site_bank"][2]["delta_range"] == [7.2, 8.4]
 
 
 def test_variant_fairness_only_changes_device_mapping():
@@ -85,6 +106,19 @@ def test_requested_training_precheck_passes_for_main_two_scenarios():
         assert checks["all_passed"] is True
 
 
+def test_curriculum_does_not_override_strict_site_bank():
+    cfg = load_cfg("configs/default.yaml")
+    cfg = copy.deepcopy(cfg)
+    apply_scenario(cfg, "thermal_rebalanced")
+    inject_default_curriculum(cfg)
+
+    phases = cfg["meta"]["curriculum"]["phases"]
+    assert phases
+    for phase in phases:
+        assert "site_bank" not in phase["sampler"]
+        assert "strict_site_bank" not in phase["sampler"]
+
+
 def test_ablation_wo_meta_disables_meta_adaptation_and_context():
     cfg = load_cfg("configs/default.yaml")
     cfg = copy.deepcopy(cfg)
@@ -116,3 +150,27 @@ def test_ablation_hard_clip_switches_safety_projection_mode():
     apply_ablation(cfg, "hard_clip")
 
     assert cfg["safety"]["projection_mode"] == "hard_clip"
+
+
+def test_baseline_shin2024_disables_meta_and_sets_ddpg_hparams():
+    cfg = load_cfg("configs/default.yaml")
+    cfg = copy.deepcopy(cfg)
+    apply_baseline_overrides(cfg, "shin2024_matched")
+
+    assert cfg["context"]["enabled"] is False
+    assert int(cfg["agent"]["z_dim"]) == 0
+    assert cfg["meta"]["explicit_inner_outer"] is False
+    assert cfg["meta"]["dual_enabled"] is False
+    assert float(cfg["upper_dqn"]["epsilon_start"]) == 0.01
+    assert float(cfg["upper_dqn"]["epsilon_final"]) == 0.01
+    assert int(cfg["upper_dqn"]["replay_size"]) == 2000
+    assert int(cfg["lower_ddpg"]["replay_size"]) == 1000000
+    assert int(cfg["lower_ddpg"]["batch_size"]) == 64
+
+
+def test_baseline_dalal_switches_projection_mode():
+    cfg = load_cfg("configs/default.yaml")
+    cfg = copy.deepcopy(cfg)
+    apply_baseline_overrides(cfg, "dalal2018_safe")
+
+    assert cfg["safety"]["projection_mode"] == "dalal_safe"
