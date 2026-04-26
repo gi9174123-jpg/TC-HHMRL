@@ -21,6 +21,16 @@ class LowerDDPG:
         self.obs_dim = int(agent_cfg["obs_dim"])
         self.z_dim = int(agent_cfg["z_dim"])
         self.act_dim = int(agent_cfg["act_lower_dim"])
+        self.action_contract = str(ddpg_cfg.get("action_contract", "full_lower_action"))
+        if self.action_contract == "rho_tau_fixed_current":
+            self.learned_act_dim = 2
+        else:
+            self.learned_act_dim = int(ddpg_cfg.get("learned_action_dim", self.act_dim))
+        self.fixed_current_fraction = float(ddpg_cfg.get("fixed_current_fraction", 0.5))
+        self.fixed_current_fraction = float(np.clip(self.fixed_current_fraction, 1.0e-4, 1.0 - 1.0e-4))
+        self._fixed_current_logit = float(
+            np.log(self.fixed_current_fraction / (1.0 - self.fixed_current_fraction))
+        )
         self.upper_ctx_dim = int(agent_cfg.get("lower_upper_ctx_dim", 7))
         self.obs_aug_dim = self.obs_dim + self.upper_ctx_dim
         hidden = int(agent_cfg["hidden_dim"])
@@ -30,8 +40,8 @@ class LowerDDPG:
         self.grad_clip = float(ddpg_cfg.get("grad_clip", 5.0))
         self.noise_std = float(ddpg_cfg.get("noise_std", 0.10))
 
-        self.actor = DeterministicTanhPolicy(self.obs_aug_dim, self.z_dim, self.act_dim, hidden).to(device)
-        self.actor_tgt = DeterministicTanhPolicy(self.obs_aug_dim, self.z_dim, self.act_dim, hidden).to(device)
+        self.actor = DeterministicTanhPolicy(self.obs_aug_dim, self.z_dim, self.learned_act_dim, hidden).to(device)
+        self.actor_tgt = DeterministicTanhPolicy(self.obs_aug_dim, self.z_dim, self.learned_act_dim, hidden).to(device)
         self.critic = ContinuousQNetwork(self.obs_aug_dim, self.z_dim, self.act_dim, hidden).to(device)
         self.critic_tgt = ContinuousQNetwork(self.obs_aug_dim, self.z_dim, self.act_dim, hidden).to(device)
 
@@ -41,6 +51,28 @@ class LowerDDPG:
         self.actor_optim = torch.optim.Adam(self.actor.parameters(), lr=float(ddpg_cfg["actor_lr"]))
         self.critic_optim = torch.optim.Adam(self.critic.parameters(), lr=float(ddpg_cfg["critic_lr"]))
         self.update_steps = 0
+
+    def _expand_learned_raw_torch(self, learned_raw: torch.Tensor) -> torch.Tensor:
+        if self.action_contract != "rho_tau_fixed_current":
+            return learned_raw
+        fixed = torch.full(
+            (learned_raw.shape[0], 3),
+            self._fixed_current_logit,
+            dtype=learned_raw.dtype,
+            device=learned_raw.device,
+        )
+        if learned_raw.shape[1] != 2:
+            raise ValueError(f"rho_tau_fixed_current expects 2 learned action dims, got {learned_raw.shape[1]}")
+        return torch.cat([fixed, learned_raw], dim=1)
+
+    def _expand_learned_raw_np(self, learned_raw: np.ndarray) -> np.ndarray:
+        learned_raw = np.asarray(learned_raw, dtype=np.float32).reshape(-1)
+        if self.action_contract != "rho_tau_fixed_current":
+            return learned_raw.astype(np.float32)
+        if learned_raw.size != 2:
+            raise ValueError(f"rho_tau_fixed_current expects 2 learned action dims, got {learned_raw.size}")
+        fixed = np.full((3,), self._fixed_current_logit, dtype=np.float32)
+        return np.concatenate([fixed, learned_raw.astype(np.float32)], axis=0)
 
     @staticmethod
     def _upper_ctx_np(upper_idx: float | int) -> np.ndarray:
@@ -75,7 +107,7 @@ class LowerDDPG:
             if not eval_mode and self.noise_std > 0.0:
                 raw = raw + self.noise_std * torch.randn_like(raw)
             raw = torch.clamp(raw, -1.0, 1.0)
-        return raw.squeeze(0).cpu().numpy().astype(np.float32)
+        return self._expand_learned_raw_np(raw.squeeze(0).cpu().numpy())
 
     def _soft_update(self, src: torch.nn.Module, dst: torch.nn.Module) -> None:
         for p, p_tgt in zip(src.parameters(), dst.parameters()):
@@ -127,7 +159,7 @@ class LowerDDPG:
         delta_env = torch.tensor(batch["delta_env"], dtype=torch.float32, device=self.device)
 
         with torch.no_grad():
-            raw_next = self.actor_tgt(next_obs_aug, z_next)
+            raw_next = self._expand_learned_raw_torch(self.actor_tgt(next_obs_aug, z_next))
             safe_next = self.safety.project_torch(raw_next, boost_next, mode_next, next_temps, amb, gamma_env, delta_env)
             a_next = torch.cat(
                 [safe_next["currents_exec"], safe_next["rho_exec"], safe_next["tau_exec"]],
@@ -143,7 +175,7 @@ class LowerDDPG:
         torch.nn.utils.clip_grad_norm_(self.critic.parameters(), self.grad_clip)
         self.critic_optim.step()
 
-        raw_pi = self.actor(obs_aug, z)
+        raw_pi = self._expand_learned_raw_torch(self.actor(obs_aug, z))
         safe_pi = self.safety.project_torch(raw_pi, boost, mode, temps, amb, gamma_env, delta_env)
         a_pi = torch.cat([safe_pi["currents_exec"], safe_pi["rho_exec"], safe_pi["tau_exec"]], dim=1)
         actor_loss = -self.critic(obs_aug, z, a_pi).mean()

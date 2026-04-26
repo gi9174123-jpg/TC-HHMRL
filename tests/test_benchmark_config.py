@@ -2,14 +2,20 @@ from __future__ import annotations
 
 import copy
 
+import numpy as np
+
 from scripts.benchmark_constraint_scenarios import (
+    Shin2024MatchedBaseline,
+    apply_common_settings,
     apply_ablation,
     apply_baseline_overrides,
     apply_scenario,
     apply_variant,
     inject_default_curriculum,
+    sample_fixed_tasks,
     validate_training_config,
 )
+from tchhmrl.envs.uw_slipt_env import MultiTxUwSliptEnv
 from tchhmrl.utils.config import load_cfg
 
 
@@ -166,6 +172,52 @@ def test_baseline_shin2024_disables_meta_and_sets_ddpg_hparams():
     assert int(cfg["upper_dqn"]["replay_size"]) == 2000
     assert int(cfg["lower_ddpg"]["replay_size"]) == 1000000
     assert int(cfg["lower_ddpg"]["batch_size"]) == 64
+    assert cfg["lower_ddpg"]["action_contract"] == "rho_tau_fixed_current"
+    assert int(cfg["lower_ddpg"]["learned_action_dim"]) == 2
+    assert float(cfg["lower_ddpg"]["fixed_current_fraction"]) == 0.5
+    assert cfg["baseline_metadata"]["baseline_family"] == "shin2024_matched"
+    assert cfg["baseline_metadata"]["exact_reproduction"] is False
+    assert cfg["baseline_metadata"]["safety_protocol"] == "common_smooth_projection"
+    assert cfg["baseline_metadata"]["fixed_mode_name"] == "HY"
+
+
+def test_shin2024_matched_action_contract_forces_hy_and_fixed_currents(tmp_path):
+    cfg = load_cfg("configs/default.yaml")
+    cfg = apply_common_settings(
+        copy.deepcopy(cfg),
+        meta_iters=1,
+        out_dir=tmp_path,
+        run_name="shin_contract",
+        seed=101,
+        fast_mode=True,
+        use_curriculum=False,
+    )
+    cfg["agent"]["hidden_dim"] = 32
+    cfg["env"]["episode_len"] = 4
+    apply_scenario(cfg, "thermal_rebalanced")
+    apply_variant(cfg, "hybrid")
+    apply_ablation(cfg, "full")
+    apply_baseline_overrides(cfg, "shin2024_matched")
+
+    trainer = Shin2024MatchedBaseline(cfg)
+    assert trainer.lower.action_contract == "rho_tau_fixed_current"
+    assert trainer.lower.learned_act_dim == 2
+    assert trainer.lower.act_dim == 5
+    assert trainer.dual_enabled is False
+
+    task = sample_fixed_tasks(cfg, seed=101, n_tasks=1, seed_offset=21_000)[0]
+    env = MultiTxUwSliptEnv(cfg, overrides=task.to_env_overrides())
+    obs, _ = env.reset(seed=101)
+    action, aux = trainer.act(obs, env, eval_mode=True)
+
+    assert int(action["mode_exec"]) == 2
+    assert int(action["upper_idx_exec"]) % 3 == 2
+    assert np.asarray(aux["act_raw"]).shape == (5,)
+    assert np.allclose(np.asarray(aux["act_raw"])[:3], 0.0, atol=1.0e-7)
+
+    _, _, _, _, info = env.step(action)
+    assert int(info["mode_exec"]) == 2
+    assert int(info["upper_idx_exec"]) % 3 == 2
 
 
 def test_baseline_dalal_switches_projection_mode():

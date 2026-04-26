@@ -27,6 +27,7 @@ from tchhmrl.envs.task_contract import (
     build_task_summary_v2,
     filter_formally_comparable_records,
     is_formally_comparable_record,
+    ordered_task_batch_hash,
     task_batch_hash,
     task_defaults_from_cfg,
     task_distribution_summary,
@@ -122,6 +123,10 @@ def sync_site_bank_with_cfg(cfg: Dict) -> None:
 
 def fixed_task_bank_hash(tasks: List[object]) -> str:
     return task_batch_hash(tasks)
+
+
+def ordered_fixed_task_bank_hash(tasks: List[object]) -> str:
+    return ordered_task_batch_hash(tasks)
 
 
 def inject_default_curriculum(cfg: Dict) -> None:
@@ -234,6 +239,9 @@ def apply_baseline_overrides(cfg: Dict, baseline: str) -> None:
         cfg.setdefault("lower_ddpg", {})
         cfg["lower_ddpg"].update(
             {
+                "action_contract": "rho_tau_fixed_current",
+                "learned_action_dim": 2,
+                "fixed_current_fraction": 0.5,
                 "replay_size": int(1.0e6),
                 "batch_size": 64,
                 "actor_lr": 1.0e-4,
@@ -244,6 +252,16 @@ def apply_baseline_overrides(cfg: Dict, baseline: str) -> None:
                 "grad_clip": 5.0,
             }
         )
+        cfg["baseline_metadata"] = {
+            "baseline_family": "shin2024_matched",
+            "exact_reproduction": False,
+            "safety_protocol": "common_smooth_projection",
+            "lower_learned_action_dim": 2,
+            "fixed_mode_exec": 2,
+            "fixed_mode_name": "HY",
+            "fixed_current_template": "sigmoid_logit_fraction",
+            "fixed_current_fraction": 0.5,
+        }
         cfg["agent"]["batch_size"] = 64
         return
     if baseline == "dalal2018_safe":
@@ -1656,6 +1674,109 @@ class Shin2024MatchedBaseline(SacLagrangianBaseline):
         self.upper_mem = {"upper_idx": 0, "hold_left": 0}
         self.upper_plan = None
 
+    @staticmethod
+    def _force_hy_index(raw_idx: int) -> int:
+        raw_idx = int(np.clip(raw_idx, 0, 11))
+        return int((raw_idx // 3) * 3 + 2)
+
+    def _hy_exec_map(self) -> np.ndarray:
+        exec_map = np.zeros(int(self.cfg["agent"]["n_upper_actions"]), dtype=np.int64)
+        for raw_idx in range(exec_map.shape[0]):
+            hy_idx = self._force_hy_index(raw_idx)
+            boost_exec, _ = self.safety.preview_exec(hy_idx, mem=self.safety_mem)
+            exec_map[raw_idx] = self.safety.encode_exec(boost_exec, 2)
+        return exec_map
+
+    def act(self, obs: np.ndarray, env: MultiTxUwSliptEnv, eval_mode: bool = False) -> tuple[Dict, Dict]:
+        z = self._empty_latent()
+        macro_new = self.upper_mem["hold_left"] <= 0
+        exec_map = self._hy_exec_map()
+        if macro_new:
+            if self.upper_plan is not None:
+                upper_idx_raw = int(self.upper_plan)
+                self.upper_plan = None
+            else:
+                upper_idx_raw = self.upper.select_action(
+                    obs.astype(np.float32),
+                    z,
+                    t=self.global_step,
+                    eval_mode=eval_mode,
+                    exec_map=exec_map,
+                )
+            upper_idx_raw = self._force_hy_index(upper_idx_raw)
+            self.upper_mem["upper_idx"] = int(upper_idx_raw)
+            self.upper_mem["hold_left"] = max(1, self.upper_hold_steps)
+        else:
+            upper_idx_raw = self._force_hy_index(int(self.upper_mem["upper_idx"]))
+        self.upper_mem["hold_left"] = max(0, int(self.upper_mem["hold_left"]) - 1)
+
+        temps_before = env.temps.copy().astype(np.float32)
+        boost_preview, _ = self.safety.preview_exec(upper_idx_raw, self.safety_mem)
+        upper_idx_exec = self.safety.encode_exec(boost_preview, 2)
+        lower_raw = self.lower.select_action(obs, z, upper_idx=upper_idx_exec, eval_mode=eval_mode)
+
+        safe, self.safety_mem = self.safety.project_np(
+            upper_idx_raw,
+            lower_raw,
+            temps=temps_before,
+            amb_temp=env.amb_temp,
+            gamma=env.gamma,
+            delta=env.delta,
+            mem=self.safety_mem,
+        )
+        if int(safe["mode_exec"]) != 2:
+            raise RuntimeError("shin2024_matched contract violated: executed mode must be HY")
+        action = {
+            "upper_idx": int(upper_idx_raw),
+            "upper_idx_exec": int(safe["upper_idx_exec"]),
+            "boost_combo_exec": int(safe["boost_combo_exec"]),
+            "mode_exec": int(safe["mode_exec"]),
+            "currents_exec": safe["currents_exec"],
+            "rho_exec": np.asarray([safe["rho_exec"]], dtype=np.float32),
+            "tau_exec": np.asarray([safe["tau_exec"]], dtype=np.float32),
+        }
+        aux = {
+            "z": z,
+            "upper_idx_raw": int(upper_idx_raw),
+            "upper_idx_exec": int(safe["upper_idx_exec"]),
+            "boost_combo_exec": int(safe["boost_combo_exec"]),
+            "mode_exec": int(safe["mode_exec"]),
+            "act_raw": lower_raw.astype(np.float32),
+            "act_exec": np.concatenate(
+                [safe["currents_exec"], np.asarray([safe["rho_exec"], safe["tau_exec"]], dtype=np.float32)]
+            ).astype(np.float32),
+            "macro_new": bool(macro_new),
+            "hold_left": int(self.upper_mem["hold_left"]),
+        }
+        return action, aux
+
+    def preview_next_macro(self, next_obs: np.ndarray, eval_mode: bool = False, commit_plan: bool = False) -> Dict[str, float]:
+        next_exec_map = self._hy_exec_map()
+        macro_new_next = self.upper_mem["hold_left"] <= 0
+        if macro_new_next:
+            upper_idx_next_raw = int(
+                self.upper.select_action(
+                    next_obs.astype(np.float32),
+                    self._empty_latent(),
+                    t=self.global_step + 1,
+                    eval_mode=eval_mode,
+                    exec_map=next_exec_map,
+                )
+            )
+            upper_idx_next_raw = self._force_hy_index(upper_idx_next_raw)
+            if commit_plan:
+                self.upper_plan = upper_idx_next_raw
+        else:
+            upper_idx_next_raw = self._force_hy_index(int(self.upper_mem["upper_idx"]))
+        boost_next, _ = self.safety.preview_exec(upper_idx_next_raw, self.safety_mem)
+        return {
+            "upper_idx_raw_next": float(upper_idx_next_raw),
+            "upper_idx_exec_next": float(self.safety.encode_exec(boost_next, 2)),
+            "boost_combo_exec_next": float(boost_next),
+            "mode_exec_next": 2.0,
+            "next_exec_map": next_exec_map.astype(np.float32),
+        }
+
 def _run_heuristic_episode(trainer: MetaTrainer, env: MultiTxUwSliptEnv) -> Dict[str, float | np.ndarray]:
     obs, _ = env.reset()
     trainer.agent.reset_episode_state()
@@ -2288,6 +2409,14 @@ THERMAL_VARIANT_ORDER = (
     "dalal2018_safe",
 )
 
+PAIRING_KEY_FIELDS = ("scenario", "seed", "eval_task_batch_hash", "ordered_eval_task_batch_hash")
+
+
+def _stats_pairing_key(row: Dict[str, object], scenario: str) -> tuple[str, int, str, str]:
+    eval_hash = str(row.get("eval_task_batch_hash", ""))
+    ordered_eval_hash = str(row.get("ordered_eval_task_batch_hash", eval_hash))
+    return (str(row.get("scenario", scenario)), int(row["seed"]), eval_hash, ordered_eval_hash)
+
 
 def _paired_signflip_pvalue(diffs: np.ndarray) -> float | None:
     diffs = np.asarray(diffs, dtype=np.float64).reshape(-1)
@@ -2317,6 +2446,8 @@ def _paired_diff_stats(diffs: np.ndarray) -> Dict[str, float | int | None]:
     if n_pairs == 0:
         return {
             "n_pairs": 0,
+            "insufficient_pairs": True,
+            "p_value_trusted": False,
             "mean_diff": float("nan"),
             "std_diff": float("nan"),
             "t_stat": float("nan"),
@@ -2327,6 +2458,8 @@ def _paired_diff_stats(diffs: np.ndarray) -> Dict[str, float | int | None]:
     if n_pairs == 1:
         return {
             "n_pairs": 1,
+            "insufficient_pairs": True,
+            "p_value_trusted": False,
             "mean_diff": mean_diff,
             "std_diff": float("nan"),
             "t_stat": float("nan"),
@@ -2340,13 +2473,16 @@ def _paired_diff_stats(diffs: np.ndarray) -> Dict[str, float | int | None]:
     else:
         t_stat = float(mean_diff / (std_diff / math.sqrt(n_pairs)))
         effect_size = float(mean_diff / std_diff)
+    p_value = _paired_signflip_pvalue(diffs)
     return {
         "n_pairs": n_pairs,
+        "insufficient_pairs": False,
+        "p_value_trusted": p_value is not None,
         "mean_diff": mean_diff,
         "std_diff": std_diff,
         "t_stat": t_stat,
         "effect_size_dz": effect_size,
-        "p_value": _paired_signflip_pvalue(diffs),
+        "p_value": p_value,
     }
 
 
@@ -2426,12 +2562,12 @@ def build_statistics_artifact(
                     left_variant = present_variants[left_idx]
                     right_variant = present_variants[right_idx]
                     left_map = {
-                        (int(row["seed"]), str(row.get("selection_task_batch_hash", ""))): float(row[field])
+                        _stats_pairing_key(row, scenario): float(row[field])
                         for row in scenario_rows
                         if str(row.get("variant")) == left_variant and field in row
                     }
                     right_map = {
-                        (int(row["seed"]), str(row.get("selection_task_batch_hash", ""))): float(row[field])
+                        _stats_pairing_key(row, scenario): float(row[field])
                         for row in scenario_rows
                         if str(row.get("variant")) == right_variant and field in row
                     }
@@ -2445,6 +2581,7 @@ def build_statistics_artifact(
                             "metric": metric,
                             "left_variant": left_variant,
                             "right_variant": right_variant,
+                            "pairing_key_fields": list(PAIRING_KEY_FIELDS),
                             "pair_keys": [list(key) for key in common_keys],
                             **stat,
                         }
@@ -2462,6 +2599,8 @@ def build_statistics_artifact(
                     "left_variant": row["left_variant"],
                     "right_variant": row["right_variant"],
                     "n_pairs": row["n_pairs"],
+                    "insufficient_pairs": row["insufficient_pairs"],
+                    "p_value_trusted": row["p_value_trusted"],
                     "mean_diff": row["mean_diff"],
                     "std_diff": row["std_diff"],
                     "t_stat": row["t_stat"],
@@ -2477,6 +2616,7 @@ def build_statistics_artifact(
         "artifact": artifact_name,
         "generated_at": datetime.now().isoformat(timespec="seconds"),
         "test": "paired_t_with_signflip_pvalue",
+        "pairing_key_fields": list(PAIRING_KEY_FIELDS),
         "metrics": metrics,
         "scenarios": grouped_payload,
         "pairwise": pairwise_payload,
@@ -2711,6 +2851,7 @@ def run_one_scenario(
                 seed_offset=11_000,
             )
             selection_task_hash = fixed_task_bank_hash(selection_tasks)
+            ordered_selection_task_hash = ordered_fixed_task_bank_hash(selection_tasks)
             selection_eps = int(max(1, score_cfg.get("eval_eps", 1)))
 
             if runner == "trainer":
@@ -2771,6 +2912,8 @@ def run_one_scenario(
             env_task_subset = sample_fixed_tasks(cfg, seed, env_tasks, seed_offset=31_000)
             eval_task_hash = fixed_task_bank_hash(eval_task_subset)
             env_task_hash = fixed_task_bank_hash(env_task_subset)
+            ordered_eval_task_hash = ordered_fixed_task_bank_hash(eval_task_subset)
+            ordered_env_task_hash = ordered_fixed_task_bank_hash(env_task_subset)
 
             if runner == "trainer":
                 ev = evaluate_on_tasks(
@@ -2823,6 +2966,7 @@ def run_one_scenario(
             ev.update({"scenario": scenario, "variant": label, "seed": float(seed)})
             eval_rows.append(ev)
             env_all.append(env_df)
+            baseline_meta = dict(cfg.get("baseline_metadata", {}))
 
             run_summaries.append(
                 {
@@ -2863,6 +3007,17 @@ def run_one_scenario(
                     "selection_task_batch_hash": selection_task_hash,
                     "eval_task_batch_hash": eval_task_hash,
                     "env_task_batch_hash": env_task_hash,
+                    "ordered_selection_task_batch_hash": ordered_selection_task_hash,
+                    "ordered_eval_task_batch_hash": ordered_eval_task_hash,
+                    "ordered_env_task_batch_hash": ordered_env_task_hash,
+                    "baseline_family": str(baseline_meta.get("baseline_family", baseline_override or "")),
+                    "exact_reproduction": baseline_meta.get("exact_reproduction"),
+                    "safety_protocol": str(baseline_meta.get("safety_protocol", "")),
+                    "lower_learned_action_dim": baseline_meta.get("lower_learned_action_dim"),
+                    "fixed_mode_exec": baseline_meta.get("fixed_mode_exec"),
+                    "fixed_mode_name": str(baseline_meta.get("fixed_mode_name", "")),
+                    "fixed_current_template": str(baseline_meta.get("fixed_current_template", "")),
+                    "fixed_current_fraction": baseline_meta.get("fixed_current_fraction"),
                     "formally_comparable": bool(is_formally_comparable_record(alignment_snapshot(cfg))),
                     **alignment_snapshot(cfg),
                     "eval_reward": float(ev["reward"]),
@@ -2988,7 +3143,15 @@ def run_one_scenario(
                 "ablation": ablation,
                 "tx_device": ["LED", "LD", "LD"],
                 "tx_enabled": [1.0, 1.0, 1.0],
-                "description": "Matched Shin 2024-style hierarchical DQN-DDPG baseline on the fixed heterogeneous hybrid structure, without context latent z, meta adaptation, or shared dual updates",
+                "baseline_family": "shin2024_matched",
+                "exact_reproduction": False,
+                "safety_protocol": "common_smooth_projection",
+                "lower_learned_action_dim": 2,
+                "fixed_mode_exec": 2,
+                "fixed_mode_name": "HY",
+                "fixed_current_template": "sigmoid_logit_fraction",
+                "fixed_current_fraction": 0.5,
+                "description": "Matched Shin 2024-style hierarchical DQN-DDPG baseline under the common benchmark safety protocol: upper DQN selects HY-mode macro boost, lower DDPG learns only rho/tau, and currents come from a fixed feasible template.",
             }
         elif variant == "hybrid":
             variant_definitions[label] = {
@@ -3059,6 +3222,11 @@ def run_one_scenario(
                 "selection": sorted({str(row["selection_task_batch_hash"]) for row in run_summaries}),
                 "eval": sorted({str(row["eval_task_batch_hash"]) for row in run_summaries}),
                 "env": sorted({str(row["env_task_batch_hash"]) for row in run_summaries}),
+                "ordered_selection": sorted(
+                    {str(row["ordered_selection_task_batch_hash"]) for row in run_summaries}
+                ),
+                "ordered_eval": sorted({str(row["ordered_eval_task_batch_hash"]) for row in run_summaries}),
+                "ordered_env": sorted({str(row["ordered_env_task_batch_hash"]) for row in run_summaries}),
             }
             if run_summaries
             else {}

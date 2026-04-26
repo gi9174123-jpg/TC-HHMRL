@@ -10,6 +10,7 @@ from tchhmrl.envs.task_contract import (
     build_task_summary_v2,
     filter_formally_comparable_records,
     is_formally_comparable_record,
+    ordered_task_batch_hash,
     task_batch_hash,
     task_defaults_from_cfg,
 )
@@ -188,6 +189,9 @@ def test_task_batch_hash_and_formal_consumer_filter():
 
     assert hash_a == hash_b
     assert hash_a != hash_c
+    assert task_batch_hash(list(reversed(tasks_a))) == hash_a
+    assert ordered_task_batch_hash(tasks_a) == ordered_task_batch_hash(tasks_b)
+    assert ordered_task_batch_hash(list(reversed(tasks_a))) != ordered_task_batch_hash(tasks_a)
 
     good = {
         "alignment_version": "teacher_model_v1",

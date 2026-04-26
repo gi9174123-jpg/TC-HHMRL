@@ -181,6 +181,12 @@ def task_batch_hash(tasks: Sequence[TaskSpec | Mapping[str, Any]]) -> str:
     return hashlib.sha256(blob.encode("utf-8")).hexdigest()
 
 
+def ordered_task_batch_hash(tasks: Sequence[TaskSpec | Mapping[str, Any]]) -> str:
+    payload = [stable_task_payload(task) for task in tasks]
+    blob = json.dumps(payload, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+    return hashlib.sha256(blob.encode("utf-8")).hexdigest()
+
+
 def is_formally_comparable_record(record: Mapping[str, Any]) -> bool:
     return (
         record.get("alignment_version") == DEFAULT_ALIGNMENT_VERSION
