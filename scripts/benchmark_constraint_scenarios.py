@@ -223,6 +223,24 @@ def apply_baseline_overrides(cfg: Dict, baseline: str) -> None:
         cfg.setdefault("meta", {})["explicit_inner_outer"] = False
         cfg["meta"]["query_updates_enabled"] = False
         return
+    if baseline == "sac_dalal_safe":
+        cfg.setdefault("context", {})["enabled"] = False
+        cfg.setdefault("agent", {})["z_dim"] = 0
+        cfg.setdefault("meta", {})["explicit_inner_outer"] = False
+        cfg["meta"]["query_updates_enabled"] = False
+        cfg["meta"]["dual_enabled"] = False
+        cfg["meta"]["dual_lr"] = 0.0
+        n_duals = len(cfg["meta"].get("dual_names", ["qos"] + [f"temp_tx{i}" for i in range(int(cfg["env"]["n_tx"]))]))
+        cfg["meta"]["dual_lrs"] = [0.0] * n_duals
+        cfg.setdefault("safety", {})["projection_mode"] = "dalal_safe"
+        cfg["baseline_metadata"] = {
+            "baseline_family": "sac_dalal_safe",
+            "exact_reproduction": False,
+            "external_baseline": True,
+            "safety_protocol": "dalal_style_projection",
+            "comparison_role": "external_safety_layer_baseline",
+        }
+        return
     if baseline == "shin2024_matched":
         cfg.setdefault("context", {})["enabled"] = False
         cfg.setdefault("agent", {})["z_dim"] = 0
@@ -2398,6 +2416,7 @@ HARD_TARGETED_VARIANT_ORDER = (
     "heuristic_safe",
     "sac_lagrangian",
     "shin2024_matched",
+    "sac_dalal_safe",
     "dalal2018_safe",
 )
 THERMAL_VARIANT_ORDER = (
@@ -2406,6 +2425,7 @@ THERMAL_VARIANT_ORDER = (
     "hybrid_hard_clip",
     "sac_lagrangian",
     "shin2024_matched",
+    "sac_dalal_safe",
     "dalal2018_safe",
 )
 
@@ -2685,6 +2705,7 @@ def run_one_scenario(
     variants: List[str] | None = None,
     ablations: List[str] | None = None,
     baselines: List[str] | None = None,
+    include_variants: bool = True,
 ) -> Dict:
     scenario_dir = out_root / scenario
     scenario_dir.mkdir(parents=True, exist_ok=True)
@@ -2693,25 +2714,34 @@ def run_one_scenario(
     ablations = list(ablations or ["full"])
     baselines = list(baselines or [])
     exp_specs: List[Dict[str, str]] = []
-    for variant in variants:
-        for ablation in ablations:
-            label = variant if ablation == "full" else f"{variant}_{ablation}"
-            exp_specs.append(
-                {
-                    "runner": "trainer",
-                    "variant": variant,
-                    "ablation": ablation,
-                    "label": label,
-                    "baseline_override": "",
-                }
-            )
+    if include_variants:
+        for variant in variants:
+            for ablation in ablations:
+                label = variant if ablation == "full" else f"{variant}_{ablation}"
+                exp_specs.append(
+                    {
+                        "runner": "trainer",
+                        "variant": variant,
+                        "ablation": ablation,
+                        "label": label,
+                        "baseline_override": "",
+                    }
+                )
+    elif not baselines:
+        raise ValueError("include_variants=False requires at least one baseline.")
     for baseline in baselines:
-        if baseline not in {"heuristic_safe", "sac_lagrangian", "shin2024_matched", "dalal2018_safe"}:
+        if baseline not in {
+            "heuristic_safe",
+            "sac_lagrangian",
+            "sac_dalal_safe",
+            "shin2024_matched",
+            "dalal2018_safe",
+        }:
             raise ValueError(f"Unknown baseline: {baseline}")
         if baseline == "heuristic_safe":
             runner = "heuristic"
             baseline_override = baseline
-        elif baseline == "sac_lagrangian":
+        elif baseline in {"sac_lagrangian", "sac_dalal_safe"}:
             runner = "sac_lagrangian"
             baseline_override = baseline
         elif baseline == "shin2024_matched":
@@ -3012,7 +3042,9 @@ def run_one_scenario(
                     "ordered_env_task_batch_hash": ordered_env_task_hash,
                     "baseline_family": str(baseline_meta.get("baseline_family", baseline_override or "")),
                     "exact_reproduction": baseline_meta.get("exact_reproduction"),
+                    "external_baseline": baseline_meta.get("external_baseline"),
                     "safety_protocol": str(baseline_meta.get("safety_protocol", "")),
+                    "comparison_role": str(baseline_meta.get("comparison_role", "")),
                     "lower_learned_action_dim": baseline_meta.get("lower_learned_action_dim"),
                     "fixed_mode_exec": baseline_meta.get("fixed_mode_exec"),
                     "fixed_mode_name": str(baseline_meta.get("fixed_mode_name", "")),
@@ -3128,13 +3160,23 @@ def run_one_scenario(
                 "description": "Rule-based safe heuristic baseline on the hybrid transmitter structure",
             }
         elif runner == "sac_lagrangian":
+            is_sac_dalal = label == "sac_dalal_safe"
             variant_definitions[label] = {
                 "runner": "sac_lagrangian",
                 "base_variant": variant,
                 "ablation": ablation,
                 "tx_device": ["LED", "LD", "LD"],
                 "tx_enabled": [1.0, 1.0, 1.0],
-                "description": "Literature-style SAC-Lagrangian baseline on the fixed heterogeneous hybrid structure, without context latent z or inner/outer meta adaptation",
+                "baseline_family": "sac_dalal_safe" if is_sac_dalal else "sac_lagrangian",
+                "exact_reproduction": False if is_sac_dalal else None,
+                "external_baseline": True if is_sac_dalal else None,
+                "safety_protocol": "dalal_style_projection" if is_sac_dalal else "common_smooth_projection",
+                "comparison_role": "external_safety_layer_baseline" if is_sac_dalal else "learning_baseline",
+                "description": (
+                    "SAC-style external safety-layer baseline with context/meta/dual disabled and Dalal-style action correction."
+                    if is_sac_dalal
+                    else "Literature-style SAC-Lagrangian baseline on the fixed heterogeneous hybrid structure, without context latent z or inner/outer meta adaptation"
+                ),
             }
         elif runner == "shin2024_matched":
             variant_definitions[label] = {
@@ -3181,6 +3223,15 @@ def run_one_scenario(
                 "tx_enabled": [1.0, 0.0, 0.0],
             }
 
+    train_query_cost_mean = (
+        float(train_df["query_cost"].mean()) if "query_cost" in train_df.columns and not train_df.empty else None
+    )
+    train_query_violation_mean = (
+        float(train_df["query_violation_rate"].mean())
+        if "query_violation_rate" in train_df.columns and not train_df.empty
+        else None
+    )
+
     summary = {
         "scenario": scenario,
         "alignment": alignment_snapshot(precheck_cfg),
@@ -3209,8 +3260,8 @@ def run_one_scenario(
             .to_dict(orient="index")
         ),
         "constraint_activation": {
-            "train_query_cost_mean": float(train_df["query_cost"].mean()),
-            "train_query_violation_mean": float(train_df["query_violation_rate"].mean()),
+            "train_query_cost_mean": train_query_cost_mean,
+            "train_query_violation_mean": train_query_violation_mean,
             "env_cost_mean": float(env_df["cost"].mean()),
             "env_step_violation_fraction": float(env_step_violation.mean()),
             "env_episode_violation_fraction": float(env_ep_violation["episode_violation"].mean()),
@@ -3289,6 +3340,7 @@ def run_benchmark(
     ablations: List[str] | None = None,
     baselines: List[str] | None = None,
     device: str | None = None,
+    include_variants: bool = True,
 ) -> Path:
     base_cfg = apply_cli_overrides(load_cfg(cfg_path), device=device)
     out_root = Path(out_dir)
@@ -3314,6 +3366,7 @@ def run_benchmark(
             variants=variants,
             ablations=ablations,
             baselines=baselines,
+            include_variants=include_variants,
         )
         scenario_summaries.append(summary)
         requested_metrics_csv = out_root / scenario / "requested_metrics.csv"
@@ -3376,6 +3429,8 @@ def run_benchmark(
         "variants": list(variants or ["hybrid", "single_led", "single_ld"]),
         "ablations": list(ablations or ["full"]),
         "baselines": list(baselines or []),
+        "include_variants": bool(include_variants),
+        "baselines_only": bool(not include_variants),
         "generated_at": datetime.now().isoformat(timespec="seconds"),
         "seeds": seeds,
         "scenarios": scenarios,
@@ -3463,8 +3518,13 @@ def parse_args() -> argparse.Namespace:
         type=str,
         nargs="*",
         default=[],
-        choices=["heuristic_safe", "sac_lagrangian", "shin2024_matched", "dalal2018_safe"],
+        choices=["heuristic_safe", "sac_lagrangian", "sac_dalal_safe", "shin2024_matched", "dalal2018_safe"],
         help="Optional heuristic/learning baselines to evaluate.",
+    )
+    parser.add_argument(
+        "--baselines-only",
+        action="store_true",
+        help="Run only the requested baselines and skip variant/ablation experiments.",
     )
     parser.add_argument("--eval-tasks", type=int, default=8)
     parser.add_argument("--eval-eps", type=int, default=2)
@@ -3493,6 +3553,7 @@ def main() -> None:
         ablations=args.ablations,
         baselines=args.baselines,
         device=args.device,
+        include_variants=(not args.baselines_only),
     )
 
 

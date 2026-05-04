@@ -363,18 +363,18 @@ class SafetyLayer:
     ) -> torch.Tensor:
         current_max = torch.as_tensor(self.current_max, dtype=currents.dtype, device=currents.device).view(1, -1)
         thermal_coeff = torch.as_tensor(self.tx_thermal_coeff, dtype=currents.dtype, device=currents.device).view(1, -1)
-        currents = torch.clamp(currents, min=0.0, max=current_max)
+        currents = torch.minimum(torch.clamp(currents, min=0.0), current_max)
         eps = torch.as_tensor(self._dalal_eps, dtype=currents.dtype, device=currents.device)
         for _ in range(self._dalal_iters):
             total = currents.sum(dim=1, keepdim=True)
             g_bus = torch.clamp(total - self.bus_current_max, min=0.0)
             grad_bus = torch.ones_like(currents)
             step_bus = g_bus / (grad_bus.square().sum(dim=1, keepdim=True) + eps)
-            currents = torch.clamp(currents - step_bus * grad_bus, min=0.0, max=current_max)
+            currents = torch.minimum(torch.clamp(currents - step_bus * grad_bus, min=0.0), current_max)
 
             t_pred = (1.0 - gamma) * temps + gamma * amb_temp + delta * thermal_coeff * (currents**2)
             g_temp = torch.clamp(t_pred - self.thermal_safe, min=0.0)
             grad_temp = 2.0 * delta * thermal_coeff * currents
             step_temp = g_temp / (grad_temp.square() + eps)
-            currents = torch.clamp(currents - step_temp * grad_temp, min=0.0, max=current_max)
+            currents = torch.minimum(torch.clamp(currents - step_temp * grad_temp, min=0.0), current_max)
         return currents

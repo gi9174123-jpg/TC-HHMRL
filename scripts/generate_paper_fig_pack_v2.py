@@ -40,6 +40,7 @@ COLORS = {
     'heuristic_safe': '#8c564b',
     'sac_lagrangian': '#9467bd',
     'shin2024_matched': '#17becf',
+    'sac_dalal_safe': '#bcbd22',
     'dalal2018_safe': '#bcbd22',
 }
 
@@ -53,6 +54,7 @@ LABELS = {
     'heuristic_safe': 'Heuristic Safe',
     'sac_lagrangian': 'SAC-Lagrangian',
     'shin2024_matched': 'Shin 2024',
+    'sac_dalal_safe': 'SAC + Dalal Safe',
     'dalal2018_safe': 'Dalal 2018',
 }
 
@@ -288,7 +290,7 @@ with open(OUT / 'Fig3_main_benchmark_overall.csv', 'w', newline='') as f:
 
 # Fig. 4
 hard_stats = grouped_stats_from_run_summary(ROOT / 'logs' / 'hard_stress_full_ablation_baseline_v2' / 'run_summary.json')
-methods_fig4_pref = ['hybrid', 'hybrid_wo_meta', 'hybrid_wo_lagrangian', 'hybrid_hard_clip', 'heuristic_safe', 'sac_lagrangian', 'shin2024_matched', 'dalal2018_safe']
+methods_fig4_pref = ['hybrid', 'hybrid_wo_meta', 'hybrid_wo_lagrangian', 'hybrid_hard_clip', 'heuristic_safe', 'sac_lagrangian', 'shin2024_matched', 'sac_dalal_safe']
 methods_fig4 = [m for m in methods_fig4_pref if ('hard_stress', m) in hard_stats]
 if not methods_fig4:
     raise RuntimeError('No formally comparable methods available for Fig. 4')

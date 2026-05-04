@@ -226,3 +226,23 @@ def test_baseline_dalal_switches_projection_mode():
     apply_baseline_overrides(cfg, "dalal2018_safe")
 
     assert cfg["safety"]["projection_mode"] == "dalal_safe"
+
+
+def test_baseline_sac_dalal_safe_disables_meta_dual_and_sets_metadata():
+    cfg = load_cfg("configs/default.yaml")
+    cfg = copy.deepcopy(cfg)
+    apply_baseline_overrides(cfg, "sac_dalal_safe")
+
+    assert cfg["context"]["enabled"] is False
+    assert int(cfg["agent"]["z_dim"]) == 0
+    assert cfg["meta"]["explicit_inner_outer"] is False
+    assert cfg["meta"]["query_updates_enabled"] is False
+    assert cfg["meta"]["dual_enabled"] is False
+    assert float(cfg["meta"]["dual_lr"]) == 0.0
+    assert cfg["meta"]["dual_lrs"] == [0.0, 0.0, 0.0, 0.0]
+    assert cfg["safety"]["projection_mode"] == "dalal_safe"
+    assert cfg["baseline_metadata"]["baseline_family"] == "sac_dalal_safe"
+    assert cfg["baseline_metadata"]["exact_reproduction"] is False
+    assert cfg["baseline_metadata"]["external_baseline"] is True
+    assert cfg["baseline_metadata"]["safety_protocol"] == "dalal_style_projection"
+    assert cfg["baseline_metadata"]["comparison_role"] == "external_safety_layer_baseline"

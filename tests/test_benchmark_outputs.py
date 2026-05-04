@@ -188,35 +188,50 @@ def test_benchmark_supports_shin2024_and_dalal_baselines(tmp_path: Path):
         shared_init=False,
         variants=["hybrid"],
         ablations=["full"],
-        baselines=["shin2024_matched", "dalal2018_safe"],
+        baselines=["shin2024_matched", "dalal2018_safe", "sac_dalal_safe"],
     )
     assert report_path.exists()
 
     rows = json.loads((out_dir / "thermal_rebalanced" / "run_summary.json").read_text(encoding="utf-8"))
     labels = {row["variant"] for row in rows}
-    assert labels == {"hybrid", "shin2024_matched", "dalal2018_safe"}
+    assert labels == {"hybrid", "shin2024_matched", "dalal2018_safe", "sac_dalal_safe"}
 
     shin_rows = [row for row in rows if row["variant"] == "shin2024_matched"]
     dalal_rows = [row for row in rows if row["variant"] == "dalal2018_safe"]
+    sac_dalal_rows = [row for row in rows if row["variant"] == "sac_dalal_safe"]
     assert len(shin_rows) == 1
     assert len(dalal_rows) == 1
+    assert len(sac_dalal_rows) == 1
     assert shin_rows[0]["runner"] == "shin2024_matched"
     assert dalal_rows[0]["runner"] == "trainer"
+    assert sac_dalal_rows[0]["runner"] == "sac_lagrangian"
     assert shin_rows[0]["baseline_family"] == "shin2024_matched"
     assert shin_rows[0]["exact_reproduction"] is False
     assert shin_rows[0]["safety_protocol"] == "common_smooth_projection"
     assert shin_rows[0]["lower_learned_action_dim"] == 2
     assert shin_rows[0]["fixed_mode_exec"] == 2
     assert shin_rows[0]["fixed_current_template"] == "sigmoid_logit_fraction"
+    assert sac_dalal_rows[0]["baseline_family"] == "sac_dalal_safe"
+    assert sac_dalal_rows[0]["exact_reproduction"] is False
+    assert sac_dalal_rows[0]["external_baseline"] is True
+    assert sac_dalal_rows[0]["safety_protocol"] == "dalal_style_projection"
+    assert sac_dalal_rows[0]["comparison_role"] == "external_safety_layer_baseline"
 
     shin_cfg = yaml.safe_load(Path(shin_rows[0]["resolved_config"]).read_text(encoding="utf-8"))
     dalal_cfg = yaml.safe_load(Path(dalal_rows[0]["resolved_config"]).read_text(encoding="utf-8"))
+    sac_dalal_cfg = yaml.safe_load(Path(sac_dalal_rows[0]["resolved_config"]).read_text(encoding="utf-8"))
     assert int(shin_cfg["agent"]["z_dim"]) == 0
     assert bool(shin_cfg["context"]["enabled"]) is False
     assert shin_cfg["safety"]["projection_mode"] == "smooth"
     assert shin_cfg["lower_ddpg"]["action_contract"] == "rho_tau_fixed_current"
     assert int(shin_cfg["lower_ddpg"]["learned_action_dim"]) == 2
     assert dalal_cfg["safety"]["projection_mode"] == "dalal_safe"
+    assert int(sac_dalal_cfg["agent"]["z_dim"]) == 0
+    assert bool(sac_dalal_cfg["context"]["enabled"]) is False
+    assert bool(sac_dalal_cfg["meta"]["explicit_inner_outer"]) is False
+    assert bool(sac_dalal_cfg["meta"]["query_updates_enabled"]) is False
+    assert bool(sac_dalal_cfg["meta"]["dual_enabled"]) is False
+    assert sac_dalal_cfg["safety"]["projection_mode"] == "dalal_safe"
 
     env_df = pd.read_csv(out_dir / "thermal_rebalanced" / "env.csv")
     shin_env = env_df[env_df["variant"] == "shin2024_matched"]
@@ -280,3 +295,34 @@ def test_statistics_contract_trusts_pvalue_only_with_two_or_more_pairs():
         ["hard_stress", 101, "same-task-set", "same-task-order"],
         ["hard_stress", 202, "same-task-set", "same-task-order"],
     ]
+
+
+def test_benchmark_can_run_baselines_only(tmp_path: Path):
+    out_dir = tmp_path / "bench_baselines_only"
+    report_path = run_benchmark(
+        cfg_path="configs/default.yaml",
+        out_dir=str(out_dir),
+        scenarios=["easy_baseline"],
+        meta_iters=1,
+        fast_mode=True,
+        seeds=[101],
+        eval_tasks=1,
+        eval_eps=1,
+        env_tasks=1,
+        env_eps=1,
+        use_curriculum=False,
+        shared_init=False,
+        variants=["hybrid"],
+        ablations=["full"],
+        baselines=["heuristic_safe"],
+        include_variants=False,
+    )
+    assert report_path.exists()
+
+    rows = json.loads((out_dir / "easy_baseline" / "run_summary.json").read_text(encoding="utf-8"))
+    assert len(rows) == 1
+    assert rows[0]["variant"] == "heuristic_safe"
+
+    report = json.loads(report_path.read_text(encoding="utf-8"))
+    assert report["include_variants"] is False
+    assert report["baselines_only"] is True
