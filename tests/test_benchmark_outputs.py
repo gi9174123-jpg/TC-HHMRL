@@ -48,7 +48,7 @@ def test_benchmark_writes_resolved_config_and_run_summary(tmp_path: Path):
         assert "variant" in row
         assert "seed" in row
         assert "sampler_ranges" in row
-        assert row["alignment_version"] == "teacher_model_v1"
+        assert row["alignment_version"] == "system_model_v1"
         assert row["task_summary_version"] == "site_v2"
         assert row["pre_alignment"] is False
         assert row["task_source"] == "site_bank"
@@ -72,13 +72,13 @@ def test_benchmark_writes_resolved_config_and_run_summary(tmp_path: Path):
         assert "env" in resolved_cfg and "safety" in resolved_cfg
         assert "hybrid" in resolved_cfg["env"]
         assert "alignment" in resolved_cfg
-        assert resolved_cfg["alignment"]["alignment_version"] == "teacher_model_v1"
+        assert resolved_cfg["alignment"]["alignment_version"] == "system_model_v1"
         assert resolved_cfg["alignment"]["task_summary_version"] == "site_v2"
         assert "site_bank" in resolved_cfg["sampler"]
 
     precheck = json.loads(precheck_json.read_text(encoding="utf-8"))
     assert precheck["all_passed"] is True
-    assert precheck["alignment_version"] == "teacher_model_v1"
+    assert precheck["alignment_version"] == "system_model_v1"
     assert precheck["task_summary_version"] == "site_v2"
     assert precheck["task_source"] == "site_bank"
     assert precheck["task_distribution"]["task_source"] == "site_bank"

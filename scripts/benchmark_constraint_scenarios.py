@@ -52,7 +52,7 @@ def apply_common_settings(
 ) -> Dict:
     cfg = copy.deepcopy(cfg)
     cfg.setdefault("alignment", {})
-    cfg["alignment"].setdefault("alignment_version", "teacher_model_v1")
+    cfg["alignment"].setdefault("alignment_version", "system_model_v1")
     cfg["alignment"].setdefault("task_summary_version", "site_v2")
     cfg["alignment"].setdefault("pre_alignment", False)
     cfg["experiment"]["seed"] = int(seed)
@@ -82,7 +82,7 @@ def infer_task_source(cfg: Dict) -> str:
 def alignment_snapshot(cfg: Dict, *, pre_alignment: bool | None = None, task_source: str | None = None) -> Dict[str, object]:
     alignment_cfg = cfg.get("alignment", {})
     return {
-        "alignment_version": str(alignment_cfg.get("alignment_version", "teacher_model_v1")),
+        "alignment_version": str(alignment_cfg.get("alignment_version", "system_model_v1")),
         "task_summary_version": str(alignment_cfg.get("task_summary_version", "site_v2")),
         "pre_alignment": bool(alignment_cfg.get("pre_alignment", False) if pre_alignment is None else pre_alignment),
         "task_source": str(task_source or infer_task_source(cfg)),
@@ -700,7 +700,7 @@ def validate_training_config(cfg: Dict, scenario: str, *, strict_thermal: bool =
         and checks["safety_cutoff_earlier"]
         and checks["site_bank_valid"]
         and checks["task_source"] == "site_bank"
-        and checks["alignment_version"] == "teacher_model_v1"
+        and checks["alignment_version"] == "system_model_v1"
         and checks["task_summary_version"] == "site_v2"
         and (checks["pre_alignment"] is False)
     )
@@ -964,7 +964,7 @@ def collect_env_data(
                     "delta": float(env.delta),
                     "site_id": int(getattr(env, "site_id", -1)),
                     "task_source": str(getattr(env, "task_source", "global_fallback")),
-                    "alignment_version": str(getattr(env, "alignment_version", "teacher_model_v1")),
+                    "alignment_version": str(getattr(env, "alignment_version", "system_model_v1")),
                     "task_summary_version": str(getattr(env, "task_summary_version", "site_v2")),
                     "pre_alignment": bool(getattr(env, "pre_alignment", False)),
                     "distance_tx0": float(env.distances[0]),
@@ -1217,7 +1217,7 @@ class SacLagrangianBaseline:
         self.dual = DualLayer.from_meta_cfg(self.cfg.get("meta", {}), n_tx=int(self.cfg["env"]["n_tx"]))
         self.dual_enabled = bool(self.cfg.get("meta", {}).get("dual_enabled", True))
         alignment_cfg = self.cfg.get("alignment", {})
-        self.alignment_version = str(alignment_cfg.get("alignment_version", "teacher_model_v1"))
+        self.alignment_version = str(alignment_cfg.get("alignment_version", "system_model_v1"))
         self.task_summary_version = str(alignment_cfg.get("task_summary_version", "site_v2"))
         self.pre_alignment = bool(alignment_cfg.get("pre_alignment", False))
         self.loaded_alignment_meta = self._alignment_meta()
@@ -1644,7 +1644,7 @@ class Shin2024MatchedBaseline(SacLagrangianBaseline):
         self.dual = DualLayer.from_meta_cfg(self.cfg.get("meta", {}), n_tx=int(self.cfg["env"]["n_tx"]))
         self.dual_enabled = False
         alignment_cfg = self.cfg.get("alignment", {})
-        self.alignment_version = str(alignment_cfg.get("alignment_version", "teacher_model_v1"))
+        self.alignment_version = str(alignment_cfg.get("alignment_version", "system_model_v1"))
         self.task_summary_version = str(alignment_cfg.get("task_summary_version", "site_v2"))
         self.pre_alignment = bool(alignment_cfg.get("pre_alignment", False))
         self.loaded_alignment_meta = self._alignment_meta()
@@ -1918,7 +1918,7 @@ def collect_env_data_heuristic(
                     "delta": float(env.delta),
                     "site_id": int(getattr(env, "site_id", -1)),
                     "task_source": str(getattr(env, "task_source", "global_fallback")),
-                    "alignment_version": str(getattr(env, "alignment_version", "teacher_model_v1")),
+                    "alignment_version": str(getattr(env, "alignment_version", "system_model_v1")),
                     "task_summary_version": str(getattr(env, "task_summary_version", "site_v2")),
                     "pre_alignment": bool(getattr(env, "pre_alignment", False)),
                     "distance_tx0": float(env.distances[0]),
@@ -2012,7 +2012,7 @@ def collect_env_data_plain_hierarchical_baseline(
                     "delta": float(env.delta),
                     "site_id": int(getattr(env, "site_id", -1)),
                     "task_source": str(getattr(env, "task_source", "global_fallback")),
-                    "alignment_version": str(getattr(env, "alignment_version", "teacher_model_v1")),
+                    "alignment_version": str(getattr(env, "alignment_version", "system_model_v1")),
                     "task_summary_version": str(getattr(env, "task_summary_version", "site_v2")),
                     "pre_alignment": bool(getattr(env, "pre_alignment", False)),
                     "distance_tx0": float(env.distances[0]),

@@ -5,7 +5,7 @@ experiment:
   run_name: meta_run
 
 alignment:
-  alignment_version: teacher_model_v1
+  alignment_version: system_model_v1
   task_summary_version: site_v2
   pre_alignment: false
 

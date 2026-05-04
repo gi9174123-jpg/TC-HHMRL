@@ -36,7 +36,7 @@ class HierarchicalAgent:
         self.context_task_dim = 9
         self.context_upper_dim = int(cfg["agent"].get("lower_upper_ctx_dim", 7))
         alignment_cfg = cfg.get("alignment", {})
-        self.alignment_version = str(alignment_cfg.get("alignment_version", "teacher_model_v1"))
+        self.alignment_version = str(alignment_cfg.get("alignment_version", "system_model_v1"))
         self.task_summary_version = str(alignment_cfg.get("task_summary_version", "site_v2"))
         self.pre_alignment = bool(alignment_cfg.get("pre_alignment", False))
         self.loaded_alignment_meta = self._alignment_meta()

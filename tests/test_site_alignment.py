@@ -60,7 +60,7 @@ def test_task_sampler_site_bank_env_reset_metadata():
     assert np.allclose(env.distances, np.asarray(task.distances, dtype=np.float32))
     assert task_info["site_id"] == task.site_id
     assert task_info["task_source"] == "site_bank"
-    assert task_info["alignment_version"] == "teacher_model_v1"
+    assert task_info["alignment_version"] == "system_model_v1"
     assert task_info["task_summary_version"] == "site_v2"
     assert task_info["pre_alignment"] is False
     assert task_info["qos_min_rate"] == task.qos_min_rate
@@ -194,7 +194,7 @@ def test_task_batch_hash_and_formal_consumer_filter():
     assert ordered_task_batch_hash(list(reversed(tasks_a))) != ordered_task_batch_hash(tasks_a)
 
     good = {
-        "alignment_version": "teacher_model_v1",
+        "alignment_version": "system_model_v1",
         "task_summary_version": "site_v2",
         "pre_alignment": False,
     }

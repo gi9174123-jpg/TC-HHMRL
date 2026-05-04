@@ -8,7 +8,7 @@ from typing import Any, Iterable, Mapping, Sequence, Tuple
 import numpy as np
 
 
-DEFAULT_ALIGNMENT_VERSION = "teacher_model_v1"
+DEFAULT_ALIGNMENT_VERSION = "system_model_v1"
 DEFAULT_TASK_SUMMARY_VERSION = "site_v2"
 
 TASK_SPEC_FIELDS = (

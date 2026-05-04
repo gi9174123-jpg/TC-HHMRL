@@ -54,7 +54,7 @@ This audit records the state of the repository after phase-1 alignment to the te
 
 ### 4. Version guard metadata: aligned
 New runs now emit:
-- `alignment_version = "teacher_model_v1"`
+- `alignment_version = "system_model_v1"`
 - `task_summary_version = "site_v2"`
 - `pre_alignment = false`
 - `task_source = "site_bank" | "global_fallback"`
