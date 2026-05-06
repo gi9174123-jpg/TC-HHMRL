@@ -158,6 +158,19 @@ def test_ablation_hard_clip_switches_safety_projection_mode():
     assert cfg["safety"]["projection_mode"] == "hard_clip"
 
 
+def test_ablation_smooth_relaxed_sets_pilot_metadata():
+    cfg = load_cfg("configs/default.yaml")
+    cfg = copy.deepcopy(cfg)
+    apply_ablation(cfg, "smooth_relaxed")
+
+    assert cfg["safety"]["projection_mode"] == "smooth_relaxed"
+    assert float(cfg["safety"]["smooth_relaxed_margin_c"]) == 1.0
+    assert cfg["pilot_metadata"]["projection_variant"] == "smooth_relaxed"
+    assert cfg["pilot_metadata"]["pilot_only"] is True
+    assert cfg["pilot_metadata"]["formal_ranking_exclude"] is True
+    assert cfg["pilot_metadata"]["comparison_role"] == "projection_sensitivity"
+
+
 def test_baseline_shin2024_disables_meta_and_sets_ddpg_hparams():
     cfg = load_cfg("configs/default.yaml")
     cfg = copy.deepcopy(cfg)

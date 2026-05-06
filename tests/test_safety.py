@@ -3,6 +3,7 @@ from __future__ import annotations
 import copy
 
 import numpy as np
+import torch
 
 from tchhmrl.safety.safety_layer import SafetyLayer
 from tchhmrl.utils.config import load_cfg
@@ -158,6 +159,98 @@ def test_safety_dalal_correction_respects_bus_and_thermal_safe():
     )
     assert float(np.sum(out["currents_exec"])) <= cfg["safety"]["bus_current_max"] + 1e-4
     assert float(np.max(out["t_pred"])) <= cfg["safety"]["thermal_safe"] + 1e-3
+
+
+def test_safety_smooth_relaxed_keeps_smooth_unchanged_and_relaxes_cool_margin():
+    cfg_smooth = copy.deepcopy(load_cfg("configs/default.yaml"))
+    cfg_relaxed = copy.deepcopy(load_cfg("configs/default.yaml"))
+    cfg_relaxed["safety"]["projection_mode"] = "smooth_relaxed"
+    cfg_relaxed["safety"]["smooth_relaxed_margin_c"] = 1.0
+
+    lower_raw = np.array([0.4, 0.4, 0.4, 0.0, 0.0], dtype=np.float32)
+    temps = np.array([28.0, 28.0, 28.0], dtype=np.float32)
+    kwargs = {
+        "upper_raw": 11,
+        "lower_raw": lower_raw,
+        "temps": temps,
+        "amb_temp": 30.0,
+        "gamma": 0.04,
+        "delta": 1.2,
+        "mem": {"current_boost": 3, "dwell_count": 3},
+    }
+
+    smooth_out, _ = SafetyLayer(cfg_smooth).project_np(**kwargs)
+    relaxed_out, _ = SafetyLayer(cfg_relaxed).project_np(**kwargs)
+
+    assert float(np.min(relaxed_out["thermal_margin"])) >= 1.0
+    assert np.allclose(relaxed_out["thermal_soft_scale"], 1.0, atol=1e-6)
+    assert float(np.sum(relaxed_out["currents_exec"])) > float(np.sum(smooth_out["currents_exec"]))
+    assert np.all(relaxed_out["thermal_scale"] >= smooth_out["thermal_scale"] - 1e-6)
+
+
+def test_safety_smooth_relaxed_matches_smooth_above_safe_boundary():
+    cfg_smooth = copy.deepcopy(load_cfg("configs/default.yaml"))
+    cfg_relaxed = copy.deepcopy(load_cfg("configs/default.yaml"))
+    cfg_relaxed["safety"]["projection_mode"] = "smooth_relaxed"
+    cfg_relaxed["safety"]["smooth_relaxed_margin_c"] = 1.0
+
+    lower_raw = np.array([2.0, 2.0, 2.0, 0.0, 0.0], dtype=np.float32)
+    temps = np.array([60.0, 60.0, 60.0], dtype=np.float32)
+    kwargs = {
+        "upper_raw": 11,
+        "lower_raw": lower_raw,
+        "temps": temps,
+        "amb_temp": 30.0,
+        "gamma": 0.04,
+        "delta": 1.2,
+        "mem": {"current_boost": 3, "dwell_count": 3},
+    }
+
+    smooth_out, _ = SafetyLayer(cfg_smooth).project_np(**kwargs)
+    relaxed_out, _ = SafetyLayer(cfg_relaxed).project_np(**kwargs)
+
+    assert float(np.max(relaxed_out["thermal_margin"])) <= 0.0
+    assert np.allclose(relaxed_out["thermal_soft_scale"], smooth_out["thermal_soft_scale"], atol=1e-6)
+    assert np.allclose(relaxed_out["thermal_scale"], smooth_out["thermal_scale"], atol=1e-6)
+
+
+def test_safety_smooth_relaxed_numpy_torch_consistency():
+    cfg = copy.deepcopy(load_cfg("configs/default.yaml"))
+    cfg["safety"]["projection_mode"] = "smooth_relaxed"
+    cfg["safety"]["smooth_relaxed_margin_c"] = 1.0
+    safety = SafetyLayer(cfg)
+
+    lower_raw_np = np.array([0.8, 0.4, -0.1, 0.2, -0.2], dtype=np.float32)
+    temps_np = np.array([35.0, 36.0, 34.0], dtype=np.float32)
+    np_out, _ = safety.project_np(
+        upper_raw=11,
+        lower_raw=lower_raw_np,
+        temps=temps_np,
+        amb_temp=32.0,
+        gamma=0.06,
+        delta=2.0,
+        mem={"current_boost": 3, "dwell_count": 3},
+    )
+    torch_out = safety.project_torch(
+        lower_raw=torch.tensor(lower_raw_np).unsqueeze(0),
+        boost_combo=torch.tensor([3]),
+        mode=torch.tensor([2]),
+        temps=torch.tensor(temps_np).unsqueeze(0),
+        amb_temp=torch.tensor([32.0]),
+        gamma=torch.tensor([0.06]),
+        delta=torch.tensor([2.0]),
+    )
+
+    assert np.allclose(
+        np_out["currents_exec"],
+        torch_out["currents_exec"].detach().cpu().numpy().reshape(-1),
+        atol=1e-5,
+    )
+    assert np.allclose(
+        np_out["thermal_scale"],
+        torch_out["thermal_scale"].detach().cpu().numpy().reshape(-1),
+        atol=1e-5,
+    )
 
 
 def test_safety_raw_to_exec_map_matches_preview():

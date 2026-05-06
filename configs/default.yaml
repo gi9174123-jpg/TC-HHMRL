@@ -63,6 +63,7 @@ safety:
   projection_mode: smooth
   min_dwell_steps: 2
   soft_alpha: 0.22
+  smooth_relaxed_margin_c: 1.0
   cutoff_alpha: 0.30
   projection_beta: 10.0
   mask_floor: 0.02

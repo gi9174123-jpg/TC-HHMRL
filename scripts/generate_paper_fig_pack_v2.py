@@ -13,7 +13,7 @@ import pandas as pd
 import numpy as np
 from matplotlib.ticker import ScalarFormatter
 from mpl_toolkits.axes_grid1.inset_locator import inset_axes
-from tchhmrl.envs.task_contract import filter_formally_comparable_records
+from tchhmrl.envs.task_contract import filter_formal_ranking_records, filter_formally_comparable_records
 
 ROOT = Path('/Users/lja/Desktop/TC-HHMRL /TC-HHMRL')
 OUT = ROOT / 'logs' / 'paper_fig_pack_v2'
@@ -64,7 +64,10 @@ SCENARIO_LABELS = ['Moderate\nPractical', 'Hard\nStress', 'Channel\nHarsh']
 
 def grouped_stats_from_run_summary(path: Path):
     with path.open('r', encoding='utf-8') as f:
-        data = filter_formally_comparable_records(json.load(f), strict=True)
+        data = filter_formal_ranking_records(
+            filter_formally_comparable_records(json.load(f), strict=True),
+            strict=False,
+        )
     grouped = defaultdict(lambda: defaultdict(list))
     for row in data:
         key = (row['scenario'], row['variant'])
@@ -93,7 +96,10 @@ def grouped_stats_from_run_summary(path: Path):
 
 def load_formal_run_summary(path: Path):
     with path.open('r', encoding='utf-8') as f:
-        return filter_formally_comparable_records(json.load(f), strict=True)
+        return filter_formal_ranking_records(
+            filter_formally_comparable_records(json.load(f), strict=True),
+            strict=False,
+        )
 
 
 def pick_first_existing(candidates):

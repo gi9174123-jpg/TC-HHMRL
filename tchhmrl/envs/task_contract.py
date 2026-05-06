@@ -195,6 +195,14 @@ def is_formally_comparable_record(record: Mapping[str, Any]) -> bool:
     )
 
 
+def is_formal_ranking_record(record: Mapping[str, Any]) -> bool:
+    return (
+        is_formally_comparable_record(record)
+        and bool(record.get("pilot_only", False)) is False
+        and bool(record.get("formal_ranking_exclude", False)) is False
+    )
+
+
 def filter_formally_comparable_records(
     records: Iterable[Mapping[str, Any]],
     *,
@@ -209,6 +217,23 @@ def filter_formally_comparable_records(
             bad += 1
     if strict and bad:
         raise ValueError(f"Found {bad} non-comparable pre-alignment records")
+    return kept
+
+
+def filter_formal_ranking_records(
+    records: Iterable[Mapping[str, Any]],
+    *,
+    strict: bool = False,
+) -> list[dict[str, Any]]:
+    kept: list[dict[str, Any]] = []
+    bad = 0
+    for record in records:
+        if is_formal_ranking_record(record):
+            kept.append(dict(record))
+        else:
+            bad += 1
+    if strict and bad:
+        raise ValueError(f"Found {bad} records excluded from formal ranking")
     return kept
 
 

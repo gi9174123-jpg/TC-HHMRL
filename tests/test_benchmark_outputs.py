@@ -105,7 +105,7 @@ def test_benchmark_supports_ablations_and_learning_baseline(tmp_path: Path):
         use_curriculum=False,
         shared_init=False,
         variants=["hybrid"],
-        ablations=["full", "wo_meta", "wo_lagrangian"],
+        ablations=["full", "wo_meta", "wo_lagrangian", "smooth_relaxed"],
         baselines=["heuristic_safe", "sac_lagrangian"],
     )
     assert report_path.exists()
@@ -130,9 +130,16 @@ def test_benchmark_supports_ablations_and_learning_baseline(tmp_path: Path):
         "hybrid",
         "hybrid_wo_meta",
         "hybrid_wo_lagrangian",
+        "hybrid_smooth_relaxed",
         "heuristic_safe",
         "sac_lagrangian",
     }
+    smooth_relaxed_rows = [row for row in rows if row["variant"] == "hybrid_smooth_relaxed"]
+    assert len(smooth_relaxed_rows) == 1
+    assert smooth_relaxed_rows[0]["projection_variant"] == "smooth_relaxed"
+    assert smooth_relaxed_rows[0]["pilot_only"] is True
+    assert smooth_relaxed_rows[0]["formal_ranking_exclude"] is True
+    assert smooth_relaxed_rows[0]["formal_ranking_comparable"] is False
 
     saclag_rows = [row for row in rows if row["variant"] == "sac_lagrangian"]
     assert len(saclag_rows) == 1
@@ -156,6 +163,11 @@ def test_benchmark_supports_ablations_and_learning_baseline(tmp_path: Path):
         "ordered_eval_task_batch_hash",
     ]
     pairs = stats_payload["pairwise"]["hard_stress"]
+    assert "hybrid_smooth_relaxed" not in stats_payload["scenarios"]["hard_stress"]
+    assert all(
+        row["left_variant"] != "hybrid_smooth_relaxed" and row["right_variant"] != "hybrid_smooth_relaxed"
+        for row in pairs
+    )
     reward_pair = next(
         row
         for row in pairs
@@ -169,6 +181,23 @@ def test_benchmark_supports_ablations_and_learning_baseline(tmp_path: Path):
     assert reward_pair["p_value_trusted"] is False
     assert reward_pair["p_value"] is None
     assert reward_pair["pair_keys"][0][0] == "hard_stress"
+
+    env_df = pd.read_csv(scenario_dir / "env.csv")
+    for col in [
+        "raw_current_total",
+        "masked_current_total",
+        "bus_projected_current_total",
+        "projected_current_total",
+        "projection_compression_ratio",
+        "thermal_scale_tx0",
+        "thermal_scale_tx1",
+        "thermal_scale_tx2",
+        "thermal_soft_scale_tx0",
+        "thermal_cutoff_scale_tx0",
+        "t_pred_tx0",
+        "thermal_margin_min",
+    ]:
+        assert col in env_df.columns
 
 
 def test_benchmark_supports_shin2024_and_dalal_baselines(tmp_path: Path):
@@ -269,6 +298,9 @@ def test_statistics_contract_trusts_pvalue_only_with_two_or_more_pairs():
                     "eval_eh": reward,
                     "eval_cost": 0.1,
                     "eval_violation_rate": 0.0,
+                    "alignment_version": "system_model_v1",
+                    "task_summary_version": "site_v2",
+                    "pre_alignment": False,
                 }
             )
 
@@ -295,6 +327,44 @@ def test_statistics_contract_trusts_pvalue_only_with_two_or_more_pairs():
         ["hard_stress", 101, "same-task-set", "same-task-order"],
         ["hard_stress", 202, "same-task-set", "same-task-order"],
     ]
+
+
+def test_statistics_excludes_pilot_sensitivity_rows_even_if_ordered():
+    rows = []
+    for variant in ["hybrid", "hybrid_smooth_relaxed", "sac_lagrangian"]:
+        rows.append(
+            {
+                "scenario": "hard_stress",
+                "variant": variant,
+                "seed": 101,
+                "eval_task_batch_hash": "same-task-set",
+                "ordered_eval_task_batch_hash": "same-task-order",
+                "eval_reward": 1.0,
+                "eval_se": 1.0,
+                "eval_eh": 1.0,
+                "eval_cost": 0.1,
+                "eval_violation_rate": 0.0,
+                "alignment_version": "system_model_v1",
+                "task_summary_version": "site_v2",
+                "pre_alignment": False,
+                "pilot_only": variant == "hybrid_smooth_relaxed",
+                "formal_ranking_exclude": variant == "hybrid_smooth_relaxed",
+            }
+        )
+
+    artifact = build_statistics_artifact(
+        rows,
+        artifact_name="stats_contract",
+        scenarios=["hard_stress"],
+        variant_order=("hybrid", "hybrid_smooth_relaxed", "sac_lagrangian"),
+        metrics=["reward"],
+    )
+    assert artifact is not None
+    assert set(artifact["scenarios"]["hard_stress"]) == {"hybrid", "sac_lagrangian"}
+    assert all(
+        row["left_variant"] != "hybrid_smooth_relaxed" and row["right_variant"] != "hybrid_smooth_relaxed"
+        for row in artifact["pairwise"]["hard_stress"]
+    )
 
 
 def test_benchmark_can_run_baselines_only(tmp_path: Path):

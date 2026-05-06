@@ -25,6 +25,7 @@ from tchhmrl.buffers.replay_buffer import ReplayBuffer
 from tchhmrl.constraints.dual_layer import DualLayer
 from tchhmrl.envs.task_contract import (
     build_task_summary_v2,
+    filter_formal_ranking_records,
     filter_formally_comparable_records,
     is_formally_comparable_record,
     ordered_task_batch_hash,
@@ -211,6 +212,20 @@ def apply_ablation(cfg: Dict, ablation: str) -> None:
         return
     if ablation == "hard_clip":
         cfg.setdefault("safety", {})["projection_mode"] = "hard_clip"
+        return
+    if ablation == "smooth_relaxed":
+        cfg.setdefault("safety", {})["projection_mode"] = "smooth_relaxed"
+        cfg.setdefault("safety", {})["smooth_relaxed_margin_c"] = float(
+            cfg.get("safety", {}).get("smooth_relaxed_margin_c", 1.0)
+        )
+        cfg["pilot_metadata"] = {
+            "projection_variant": "smooth_relaxed",
+            "pilot_only": True,
+            "formal_ranking_exclude": True,
+            "comparison_role": "projection_sensitivity",
+            "smooth_relaxed_margin_c": float(cfg["safety"]["smooth_relaxed_margin_c"]),
+        }
+        sync_site_bank_with_cfg(cfg)
         return
     raise ValueError(f"Unknown ablation: {ablation}")
 
@@ -929,6 +944,61 @@ def select_checkpoint(
     }
 
 
+def _safe_projection_aux(safe: Dict) -> Dict[str, object]:
+    return {
+        "t_pred": safe.get("t_pred"),
+        "thermal_scale": safe.get("thermal_scale"),
+        "thermal_soft_scale": safe.get("thermal_soft_scale"),
+        "thermal_cutoff_scale": safe.get("thermal_cutoff_scale"),
+        "thermal_margin_min": safe.get("thermal_margin_min"),
+        "raw_current_total": safe.get("raw_current_total"),
+        "masked_current_total": safe.get("masked_current_total"),
+        "bus_projected_current_total": safe.get("bus_projected_current_total"),
+        "projected_current_total": safe.get("projected_current_total"),
+        "projection_compression_ratio": safe.get("projection_compression_ratio"),
+    }
+
+
+def _projection_scalar(aux: Dict, key: str, default: float = float("nan")) -> float:
+    val = aux.get(key, default)
+    if val is None:
+        return float(default)
+    arr = np.asarray(val, dtype=np.float32).reshape(-1)
+    if arr.size == 0:
+        return float(default)
+    return float(arr[0])
+
+
+def _projection_vector(aux: Dict, key: str, n: int = 3) -> np.ndarray:
+    val = aux.get(key)
+    if val is None:
+        return np.full((n,), np.nan, dtype=np.float32)
+    arr = np.asarray(val, dtype=np.float32).reshape(-1)
+    if arr.size < n:
+        arr = np.pad(arr, (0, n - arr.size), constant_values=np.nan)
+    return arr[:n].astype(np.float32)
+
+
+def _add_projection_diagnostics(row: Dict, aux: Dict, currents_exec: np.ndarray) -> None:
+    projected_default = float(np.sum(np.asarray(currents_exec, dtype=np.float32)))
+    row["raw_current_total"] = _projection_scalar(aux, "raw_current_total")
+    row["masked_current_total"] = _projection_scalar(aux, "masked_current_total")
+    row["bus_projected_current_total"] = _projection_scalar(aux, "bus_projected_current_total")
+    row["projected_current_total"] = _projection_scalar(aux, "projected_current_total", projected_default)
+    row["projection_compression_ratio"] = _projection_scalar(aux, "projection_compression_ratio")
+    row["thermal_margin_min"] = _projection_scalar(aux, "thermal_margin_min")
+
+    for prefix, key in [
+        ("thermal_scale", "thermal_scale"),
+        ("thermal_soft_scale", "thermal_soft_scale"),
+        ("thermal_cutoff_scale", "thermal_cutoff_scale"),
+        ("t_pred", "t_pred"),
+    ]:
+        arr = _projection_vector(aux, key)
+        for tx_idx, val in enumerate(arr.tolist()):
+            row[f"{prefix}_tx{tx_idx}"] = float(val)
+
+
 def collect_env_data(
     trainer: MetaTrainer,
     cfg: Dict,
@@ -1030,6 +1100,7 @@ def collect_env_data(
                 }
                 for tx_idx, current_val in enumerate(currents_exec.tolist()):
                     row[f"current_tx{tx_idx}"] = float(current_val)
+                _add_projection_diagnostics(row, aux, currents_exec)
 
                 trainer.agent.episode.add(
                     {
@@ -1201,6 +1272,7 @@ def heuristic_safe_action(env: MultiTxUwSliptEnv, trainer: MetaTrainer) -> tuple
             [safe["currents_exec"], np.asarray([safe["rho_exec"], safe["tau_exec"]], dtype=np.float32)]
         ).astype(np.float32)
     }
+    aux.update(_safe_projection_aux(safe))
     return action, aux
 
 
@@ -1350,6 +1422,7 @@ class SacLagrangianBaseline:
             "macro_new": bool(macro_new),
             "hold_left": int(self.upper_mem["hold_left"]),
         }
+        aux.update(_safe_projection_aux(safe))
         return action, aux
 
     def preview_next_macro(self, next_obs: np.ndarray, eval_mode: bool = False, commit_plan: bool = False) -> Dict[str, float]:
@@ -1766,6 +1839,7 @@ class Shin2024MatchedBaseline(SacLagrangianBaseline):
             "macro_new": bool(macro_new),
             "hold_left": int(self.upper_mem["hold_left"]),
         }
+        aux.update(_safe_projection_aux(safe))
         return action, aux
 
     def preview_next_macro(self, next_obs: np.ndarray, eval_mode: bool = False, commit_plan: bool = False) -> Dict[str, float]:
@@ -1984,6 +2058,7 @@ def collect_env_data_heuristic(
                 }
                 for tx_idx, current_val in enumerate(currents_exec.tolist()):
                     row[f"current_tx{tx_idx}"] = float(current_val)
+                _add_projection_diagnostics(row, aux, currents_exec)
                 rows.append(row)
                 obs = next_obs
                 step += 1
@@ -2078,6 +2153,7 @@ def collect_env_data_plain_hierarchical_baseline(
                 }
                 for tx_idx, current_val in enumerate(currents_exec.tolist()):
                     row[f"current_tx{tx_idx}"] = float(current_val)
+                _add_projection_diagnostics(row, aux, currents_exec)
                 rows.append(row)
                 obs = next_obs
                 step += 1
@@ -2529,9 +2605,10 @@ def build_statistics_artifact(
     variant_order: tuple[str, ...],
     metrics: List[str],
 ) -> Dict[str, object] | None:
+    formal_rows = filter_formal_ranking_records(run_rows, strict=False)
     filtered = [
         dict(row)
-        for row in run_rows
+        for row in formal_rows
         if str(row.get("scenario")) in scenarios and str(row.get("variant")) in variant_order
     ]
     if not filtered:
@@ -2997,6 +3074,10 @@ def run_one_scenario(
             eval_rows.append(ev)
             env_all.append(env_df)
             baseline_meta = dict(cfg.get("baseline_metadata", {}))
+            pilot_meta = dict(cfg.get("pilot_metadata", {}))
+            pilot_only = bool(pilot_meta.get("pilot_only", False))
+            formal_ranking_exclude = bool(pilot_meta.get("formal_ranking_exclude", False))
+            formally_comparable = bool(is_formally_comparable_record(alignment_snapshot(cfg)))
 
             run_summaries.append(
                 {
@@ -3044,13 +3125,20 @@ def run_one_scenario(
                     "exact_reproduction": baseline_meta.get("exact_reproduction"),
                     "external_baseline": baseline_meta.get("external_baseline"),
                     "safety_protocol": str(baseline_meta.get("safety_protocol", "")),
-                    "comparison_role": str(baseline_meta.get("comparison_role", "")),
+                    "comparison_role": str(pilot_meta.get("comparison_role", baseline_meta.get("comparison_role", ""))),
                     "lower_learned_action_dim": baseline_meta.get("lower_learned_action_dim"),
                     "fixed_mode_exec": baseline_meta.get("fixed_mode_exec"),
                     "fixed_mode_name": str(baseline_meta.get("fixed_mode_name", "")),
                     "fixed_current_template": str(baseline_meta.get("fixed_current_template", "")),
                     "fixed_current_fraction": baseline_meta.get("fixed_current_fraction"),
-                    "formally_comparable": bool(is_formally_comparable_record(alignment_snapshot(cfg))),
+                    "projection_variant": str(pilot_meta.get("projection_variant", "")),
+                    "pilot_only": pilot_only,
+                    "formal_ranking_exclude": formal_ranking_exclude,
+                    "smooth_relaxed_margin_c": pilot_meta.get("smooth_relaxed_margin_c"),
+                    "formally_comparable": formally_comparable,
+                    "formal_ranking_comparable": bool(
+                        formally_comparable and not pilot_only and not formal_ranking_exclude
+                    ),
                     **alignment_snapshot(cfg),
                     "eval_reward": float(ev["reward"]),
                     "eval_se": float(ev["se"]),
@@ -3196,15 +3284,24 @@ def run_one_scenario(
                 "description": "Matched Shin 2024-style hierarchical DQN-DDPG baseline under the common benchmark safety protocol: upper DQN selects HY-mode macro boost, lower DDPG learns only rho/tau, and currents come from a fixed feasible template.",
             }
         elif variant == "hybrid":
+            is_smooth_relaxed = ablation == "smooth_relaxed"
             variant_definitions[label] = {
                 "runner": "trainer",
                 "base_variant": variant,
                 "ablation": ablation,
                 "tx_device": ["LED", "LD", "LD"],
                 "tx_enabled": [1.0, 1.0, 1.0],
-                "description": "Full hierarchical method on the fixed heterogeneous hybrid structure"
-                if label != "dalal2018_safe"
-                else "Full hierarchical method with Dalal 2018-style local action correction replacing the default smooth predictive derating path",
+                "projection_variant": "smooth_relaxed" if is_smooth_relaxed else "",
+                "pilot_only": True if is_smooth_relaxed else None,
+                "formal_ranking_exclude": True if is_smooth_relaxed else None,
+                "comparison_role": "projection_sensitivity" if is_smooth_relaxed else "",
+                "description": (
+                    "Pilot-only projection sensitivity: full Hybrid with relaxed smooth thermal derating."
+                    if is_smooth_relaxed
+                    else "Full hierarchical method on the fixed heterogeneous hybrid structure"
+                    if label != "dalal2018_safe"
+                    else "Full hierarchical method with Dalal 2018-style local action correction replacing the default smooth predictive derating path"
+                ),
             }
         elif variant == "single_led":
             variant_definitions[label] = {
@@ -3510,7 +3607,7 @@ def parse_args() -> argparse.Namespace:
         type=str,
         nargs="+",
         default=["full"],
-        choices=["full", "wo_meta", "wo_lagrangian", "hard_clip"],
+        choices=["full", "wo_meta", "wo_lagrangian", "hard_clip", "smooth_relaxed"],
         help="Ablation settings applied on top of each selected variant.",
     )
     parser.add_argument(
