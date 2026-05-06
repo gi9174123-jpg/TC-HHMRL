@@ -184,11 +184,17 @@ def test_benchmark_supports_ablations_and_learning_baseline(tmp_path: Path):
 
     env_df = pd.read_csv(scenario_dir / "env.csv")
     for col in [
+        "action_decode_mode",
         "raw_current_total",
         "masked_current_total",
         "bus_projected_current_total",
         "projected_current_total",
         "projection_compression_ratio",
+        "raw_current_frac_tx0",
+        "raw_current_frac_tx1",
+        "raw_current_frac_tx2",
+        "rho_raw_decoded",
+        "tau_raw_decoded",
         "thermal_scale_tx0",
         "thermal_scale_tx1",
         "thermal_scale_tx2",
@@ -236,10 +242,10 @@ def test_benchmark_supports_shin2024_and_dalal_baselines(tmp_path: Path):
     assert sac_dalal_rows[0]["runner"] == "sac_lagrangian"
     assert shin_rows[0]["baseline_family"] == "shin2024_matched"
     assert shin_rows[0]["exact_reproduction"] is False
-    assert shin_rows[0]["safety_protocol"] == "common_smooth_projection"
+    assert shin_rows[0]["safety_protocol"] == "common_smooth_relaxed_projection"
     assert shin_rows[0]["lower_learned_action_dim"] == 2
     assert shin_rows[0]["fixed_mode_exec"] == 2
-    assert shin_rows[0]["fixed_current_template"] == "sigmoid_logit_fraction"
+    assert shin_rows[0]["fixed_current_template"] == "tanh_affine_fraction"
     assert sac_dalal_rows[0]["baseline_family"] == "sac_dalal_safe"
     assert sac_dalal_rows[0]["exact_reproduction"] is False
     assert sac_dalal_rows[0]["external_baseline"] is True
@@ -251,7 +257,8 @@ def test_benchmark_supports_shin2024_and_dalal_baselines(tmp_path: Path):
     sac_dalal_cfg = yaml.safe_load(Path(sac_dalal_rows[0]["resolved_config"]).read_text(encoding="utf-8"))
     assert int(shin_cfg["agent"]["z_dim"]) == 0
     assert bool(shin_cfg["context"]["enabled"]) is False
-    assert shin_cfg["safety"]["projection_mode"] == "smooth"
+    assert shin_cfg["safety"]["projection_mode"] == "smooth_relaxed"
+    assert shin_cfg["safety"]["action_decode_mode"] == "tanh_affine"
     assert shin_cfg["lower_ddpg"]["action_contract"] == "rho_tau_fixed_current"
     assert int(shin_cfg["lower_ddpg"]["learned_action_dim"]) == 2
     assert dalal_cfg["safety"]["projection_mode"] == "dalal_safe"
@@ -301,6 +308,8 @@ def test_statistics_contract_trusts_pvalue_only_with_two_or_more_pairs():
                     "alignment_version": "system_model_v1",
                     "task_summary_version": "site_v2",
                     "pre_alignment": False,
+                    "projection_mode": "smooth_relaxed",
+                    "action_decode_mode": "tanh_affine",
                 }
             )
 
@@ -347,6 +356,8 @@ def test_statistics_excludes_pilot_sensitivity_rows_even_if_ordered():
                 "alignment_version": "system_model_v1",
                 "task_summary_version": "site_v2",
                 "pre_alignment": False,
+                "projection_mode": "smooth_relaxed",
+                "action_decode_mode": "tanh_affine",
                 "pilot_only": variant == "hybrid_smooth_relaxed",
                 "formal_ranking_exclude": variant == "hybrid_smooth_relaxed",
             }
@@ -365,6 +376,50 @@ def test_statistics_excludes_pilot_sensitivity_rows_even_if_ordered():
         row["left_variant"] != "hybrid_smooth_relaxed" and row["right_variant"] != "hybrid_smooth_relaxed"
         for row in artifact["pairwise"]["hard_stress"]
     )
+
+
+def test_statistics_excludes_legacy_rows_without_action_mapping_metadata():
+    rows = [
+        {
+            "scenario": "hard_stress",
+            "variant": "hybrid",
+            "seed": 101,
+            "eval_task_batch_hash": "same-task-set",
+            "ordered_eval_task_batch_hash": "same-task-order",
+            "eval_reward": 1.0,
+            "eval_se": 1.0,
+            "eval_eh": 1.0,
+            "eval_cost": 0.1,
+            "eval_violation_rate": 0.0,
+            "alignment_version": "system_model_v1",
+            "task_summary_version": "site_v2",
+            "pre_alignment": False,
+        },
+        {
+            "scenario": "hard_stress",
+            "variant": "sac_lagrangian",
+            "seed": 101,
+            "eval_task_batch_hash": "same-task-set",
+            "ordered_eval_task_batch_hash": "same-task-order",
+            "eval_reward": 1.0,
+            "eval_se": 1.0,
+            "eval_eh": 1.0,
+            "eval_cost": 0.1,
+            "eval_violation_rate": 0.0,
+            "alignment_version": "system_model_v1",
+            "task_summary_version": "site_v2",
+            "pre_alignment": False,
+        },
+    ]
+
+    artifact = build_statistics_artifact(
+        rows,
+        artifact_name="stats_contract",
+        scenarios=["hard_stress"],
+        variant_order=("hybrid", "sac_lagrangian"),
+        metrics=["reward"],
+    )
+    assert artifact is None
 
 
 def test_benchmark_can_run_baselines_only(tmp_path: Path):

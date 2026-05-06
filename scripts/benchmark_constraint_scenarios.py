@@ -27,6 +27,7 @@ from tchhmrl.envs.task_contract import (
     build_task_summary_v2,
     filter_formal_ranking_records,
     filter_formally_comparable_records,
+    is_formal_ranking_record,
     is_formally_comparable_record,
     ordered_task_batch_hash,
     task_batch_hash,
@@ -36,7 +37,7 @@ from tchhmrl.envs.task_contract import (
 from tchhmrl.envs.task_sampler import TaskSampler, validate_site_bank
 from tchhmrl.envs.uw_slipt_env import MultiTxUwSliptEnv
 from tchhmrl.meta.meta_trainer import MetaTrainer
-from tchhmrl.safety.safety_layer import SafetyLayer
+from tchhmrl.safety.safety_layer import SafetyLayer, raw_from_frac01
 from tchhmrl.utils.config import apply_cli_overrides, load_cfg, resolve_device
 from tchhmrl.utils.logger import Logger
 from tchhmrl.utils.seed import set_seed
@@ -288,11 +289,11 @@ def apply_baseline_overrides(cfg: Dict, baseline: str) -> None:
         cfg["baseline_metadata"] = {
             "baseline_family": "shin2024_matched",
             "exact_reproduction": False,
-            "safety_protocol": "common_smooth_projection",
+            "safety_protocol": f"common_{cfg.get('safety', {}).get('projection_mode', 'smooth_relaxed')}_projection",
             "lower_learned_action_dim": 2,
             "fixed_mode_exec": 2,
             "fixed_mode_name": "HY",
-            "fixed_current_template": "sigmoid_logit_fraction",
+            "fixed_current_template": str(cfg.get("safety", {}).get("action_decode_mode", "tanh_affine")) + "_fraction",
             "fixed_current_fraction": 0.5,
         }
         cfg["agent"]["batch_size"] = 64
@@ -951,6 +952,10 @@ def _safe_projection_aux(safe: Dict) -> Dict[str, object]:
         "thermal_soft_scale": safe.get("thermal_soft_scale"),
         "thermal_cutoff_scale": safe.get("thermal_cutoff_scale"),
         "thermal_margin_min": safe.get("thermal_margin_min"),
+        "action_decode_mode": safe.get("action_decode_mode"),
+        "raw_current_frac": safe.get("raw_current_frac"),
+        "rho_raw_decoded": safe.get("rho_raw_decoded"),
+        "tau_raw_decoded": safe.get("tau_raw_decoded"),
         "raw_current_total": safe.get("raw_current_total"),
         "masked_current_total": safe.get("masked_current_total"),
         "bus_projected_current_total": safe.get("bus_projected_current_total"),
@@ -981,12 +986,19 @@ def _projection_vector(aux: Dict, key: str, n: int = 3) -> np.ndarray:
 
 def _add_projection_diagnostics(row: Dict, aux: Dict, currents_exec: np.ndarray) -> None:
     projected_default = float(np.sum(np.asarray(currents_exec, dtype=np.float32)))
+    row["action_decode_mode"] = str(aux.get("action_decode_mode", ""))
     row["raw_current_total"] = _projection_scalar(aux, "raw_current_total")
     row["masked_current_total"] = _projection_scalar(aux, "masked_current_total")
     row["bus_projected_current_total"] = _projection_scalar(aux, "bus_projected_current_total")
     row["projected_current_total"] = _projection_scalar(aux, "projected_current_total", projected_default)
     row["projection_compression_ratio"] = _projection_scalar(aux, "projection_compression_ratio")
     row["thermal_margin_min"] = _projection_scalar(aux, "thermal_margin_min")
+    row["rho_raw_decoded"] = _projection_scalar(aux, "rho_raw_decoded")
+    row["tau_raw_decoded"] = _projection_scalar(aux, "tau_raw_decoded")
+
+    raw_frac = _projection_vector(aux, "raw_current_frac")
+    for tx_idx, val in enumerate(raw_frac.tolist()):
+        row[f"raw_current_frac_tx{tx_idx}"] = float(val)
 
     for prefix, key in [
         ("thermal_scale", "thermal_scale"),
@@ -1173,11 +1185,6 @@ class SacLagEpisodeStats:
     smooth_term: float
 
 
-def _logit01(x: np.ndarray) -> np.ndarray:
-    x = np.clip(np.asarray(x, dtype=np.float32), 1.0e-4, 1.0 - 1.0e-4)
-    return np.log(x / (1.0 - x)).astype(np.float32)
-
-
 def _heuristic_macro_selection(env: MultiTxUwSliptEnv) -> tuple[int, int, np.ndarray, np.ndarray]:
     temps = env.temps.copy().astype(np.float32)
     channel = env.channel.copy().astype(np.float32)
@@ -1215,6 +1222,7 @@ def _heuristic_macro_selection(env: MultiTxUwSliptEnv) -> tuple[int, int, np.nda
 
 def heuristic_safe_action(env: MultiTxUwSliptEnv, trainer: MetaTrainer) -> tuple[Dict, Dict]:
     safety = trainer.agent.safety
+    action_decode_mode = str(getattr(safety, "action_decode_mode", "tanh_affine"))
     temps = env.temps.copy().astype(np.float32)
     boost_combo, mode, channel, temp_margin = _heuristic_macro_selection(env)
     mean_channel = float(np.mean(channel))
@@ -1243,9 +1251,9 @@ def heuristic_safe_action(env: MultiTxUwSliptEnv, trainer: MetaTrainer) -> tuple
     current_ratio = currents_des / np.maximum(env.current_max.astype(np.float32), 1.0e-6)
     lower_raw = np.concatenate(
         [
-            _logit01(current_ratio),
-            _logit01(np.asarray([rho_des], dtype=np.float32)),
-            _logit01(np.asarray([min(max(tau_des, 0.0), 1.0)], dtype=np.float32)),
+            raw_from_frac01(current_ratio, action_decode_mode),
+            raw_from_frac01(np.asarray([rho_des], dtype=np.float32), action_decode_mode),
+            raw_from_frac01(np.asarray([min(max(tau_des, 0.0), 1.0)], dtype=np.float32), action_decode_mode),
         ]
     ).astype(np.float32)
 
@@ -3078,6 +3086,15 @@ def run_one_scenario(
             pilot_only = bool(pilot_meta.get("pilot_only", False))
             formal_ranking_exclude = bool(pilot_meta.get("formal_ranking_exclude", False))
             formally_comparable = bool(is_formally_comparable_record(alignment_snapshot(cfg)))
+            projection_mode = str(cfg.get("safety", {}).get("projection_mode", ""))
+            action_decode_mode = str(cfg.get("safety", {}).get("action_decode_mode", "tanh_affine"))
+            formal_record_probe = {
+                **alignment_snapshot(cfg),
+                "projection_mode": projection_mode,
+                "action_decode_mode": action_decode_mode,
+                "pilot_only": pilot_only,
+                "formal_ranking_exclude": formal_ranking_exclude,
+            }
 
             run_summaries.append(
                 {
@@ -3106,6 +3123,8 @@ def run_one_scenario(
                     "env_thermal_cutoff": float(cfg["env"]["thermal_cutoff"]),
                     "safety_thermal_safe": float(cfg["safety"]["thermal_safe"]),
                     "safety_thermal_cutoff": float(cfg["safety"]["thermal_cutoff"]),
+                    "projection_mode": projection_mode,
+                    "action_decode_mode": action_decode_mode,
                     "shared_init": bool(effective_shared_init),
                     "shared_init_pretrain_iters": int(pre_iters) if effective_shared_init else 0,
                     "shared_init_ckpt": str(shared_init_paths[int(seed)]) if effective_shared_init else "",
@@ -3136,9 +3155,7 @@ def run_one_scenario(
                     "formal_ranking_exclude": formal_ranking_exclude,
                     "smooth_relaxed_margin_c": pilot_meta.get("smooth_relaxed_margin_c"),
                     "formally_comparable": formally_comparable,
-                    "formal_ranking_comparable": bool(
-                        formally_comparable and not pilot_only and not formal_ranking_exclude
-                    ),
+                    "formal_ranking_comparable": bool(is_formal_ranking_record(formal_record_probe)),
                     **alignment_snapshot(cfg),
                     "eval_reward": float(ev["reward"]),
                     "eval_se": float(ev["se"]),
@@ -3258,7 +3275,7 @@ def run_one_scenario(
                 "baseline_family": "sac_dalal_safe" if is_sac_dalal else "sac_lagrangian",
                 "exact_reproduction": False if is_sac_dalal else None,
                 "external_baseline": True if is_sac_dalal else None,
-                "safety_protocol": "dalal_style_projection" if is_sac_dalal else "common_smooth_projection",
+                "safety_protocol": "dalal_style_projection" if is_sac_dalal else "common_smooth_relaxed_projection",
                 "comparison_role": "external_safety_layer_baseline" if is_sac_dalal else "learning_baseline",
                 "description": (
                     "SAC-style external safety-layer baseline with context/meta/dual disabled and Dalal-style action correction."
@@ -3275,11 +3292,11 @@ def run_one_scenario(
                 "tx_enabled": [1.0, 1.0, 1.0],
                 "baseline_family": "shin2024_matched",
                 "exact_reproduction": False,
-                "safety_protocol": "common_smooth_projection",
+                "safety_protocol": "common_smooth_relaxed_projection",
                 "lower_learned_action_dim": 2,
                 "fixed_mode_exec": 2,
                 "fixed_mode_name": "HY",
-                "fixed_current_template": "sigmoid_logit_fraction",
+                "fixed_current_template": "tanh_affine_fraction",
                 "fixed_current_fraction": 0.5,
                 "description": "Matched Shin 2024-style hierarchical DQN-DDPG baseline under the common benchmark safety protocol: upper DQN selects HY-mode macro boost, lower DDPG learns only rho/tau, and currents come from a fixed feasible template.",
             }

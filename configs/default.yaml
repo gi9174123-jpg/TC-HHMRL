@@ -60,7 +60,8 @@ env:
     burst_ld_factor: 1.40
 
 safety:
-  projection_mode: smooth
+  projection_mode: smooth_relaxed
+  action_decode_mode: tanh_affine
   min_dwell_steps: 2
   soft_alpha: 0.22
   smooth_relaxed_margin_c: 1.0

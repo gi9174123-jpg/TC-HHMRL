@@ -7,7 +7,7 @@ import torch
 import torch.nn.functional as F
 
 from tchhmrl.models.networks import ContinuousQNetwork, DeterministicTanhPolicy
-from tchhmrl.safety.safety_layer import SafetyLayer
+from tchhmrl.safety.safety_layer import SafetyLayer, raw_from_frac01
 
 
 class LowerDDPG:
@@ -28,8 +28,9 @@ class LowerDDPG:
             self.learned_act_dim = int(ddpg_cfg.get("learned_action_dim", self.act_dim))
         self.fixed_current_fraction = float(ddpg_cfg.get("fixed_current_fraction", 0.5))
         self.fixed_current_fraction = float(np.clip(self.fixed_current_fraction, 1.0e-4, 1.0 - 1.0e-4))
-        self._fixed_current_logit = float(
-            np.log(self.fixed_current_fraction / (1.0 - self.fixed_current_fraction))
+        self.action_decode_mode = str(cfg.get("safety", {}).get("action_decode_mode", "tanh_affine")).lower()
+        self._fixed_current_raw = float(
+            raw_from_frac01(self.fixed_current_fraction, self.action_decode_mode).reshape(-1)[0]
         )
         self.upper_ctx_dim = int(agent_cfg.get("lower_upper_ctx_dim", 7))
         self.obs_aug_dim = self.obs_dim + self.upper_ctx_dim
@@ -57,7 +58,7 @@ class LowerDDPG:
             return learned_raw
         fixed = torch.full(
             (learned_raw.shape[0], 3),
-            self._fixed_current_logit,
+            self._fixed_current_raw,
             dtype=learned_raw.dtype,
             device=learned_raw.device,
         )
@@ -71,7 +72,7 @@ class LowerDDPG:
             return learned_raw.astype(np.float32)
         if learned_raw.size != 2:
             raise ValueError(f"rho_tau_fixed_current expects 2 learned action dims, got {learned_raw.size}")
-        fixed = np.full((3,), self._fixed_current_logit, dtype=np.float32)
+        fixed = np.full((3,), self._fixed_current_raw, dtype=np.float32)
         return np.concatenate([fixed, learned_raw.astype(np.float32)], axis=0)
 
     @staticmethod

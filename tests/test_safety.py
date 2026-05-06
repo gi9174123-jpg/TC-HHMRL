@@ -5,7 +5,7 @@ import copy
 import numpy as np
 import torch
 
-from tchhmrl.safety.safety_layer import SafetyLayer
+from tchhmrl.safety.safety_layer import SafetyLayer, raw_from_frac01
 from tchhmrl.utils.config import load_cfg
 
 
@@ -30,6 +30,43 @@ def test_safety_projection_bounds():
     assert float(np.sum(currents)) <= cfg["safety"]["bus_current_max"] + 1e-5
     assert 0.0 <= out["rho_exec"] <= 1.0
     assert 0.0 <= out["tau_exec"] <= 1.0
+
+
+def test_action_decode_tanh_affine_maps_tanh_outputs_to_fractions():
+    cfg = copy.deepcopy(load_cfg("configs/default.yaml"))
+    cfg["safety"]["action_decode_mode"] = "tanh_affine"
+    safety = SafetyLayer(cfg)
+
+    raw = np.asarray([-1.0, 0.0, 1.0], dtype=np.float32)
+    decoded_np = safety._decode_frac_np(raw)
+    decoded_torch = safety._decode_frac_torch(torch.tensor(raw)).detach().cpu().numpy()
+
+    assert np.allclose(decoded_np, [0.0, 0.5, 1.0], atol=1e-7)
+    assert np.allclose(decoded_torch, decoded_np, atol=1e-7)
+
+
+def test_action_decode_sigmoid_logit_preserves_legacy_sigmoid_behavior():
+    cfg = copy.deepcopy(load_cfg("configs/default.yaml"))
+    cfg["safety"]["action_decode_mode"] = "sigmoid_logit"
+    safety = SafetyLayer(cfg)
+
+    raw = np.asarray([-1.0, 0.0, 1.0], dtype=np.float32)
+    decoded = safety._decode_frac_np(raw)
+    expected = 1.0 / (1.0 + np.exp(-raw))
+
+    assert np.allclose(decoded, expected, atol=1e-7)
+
+
+def test_raw_from_frac01_matches_decode_modes():
+    frac = np.asarray([0.0, 0.5, 1.0], dtype=np.float32)
+
+    tanh_raw = raw_from_frac01(frac, "tanh_affine")
+    sigmoid_raw = raw_from_frac01(frac, "sigmoid_logit")
+
+    assert np.allclose(tanh_raw, [-1.0, 0.0, 1.0], atol=1e-7)
+    assert np.allclose(sigmoid_raw[1], 0.0, atol=1e-7)
+    assert sigmoid_raw[0] < -9.0
+    assert sigmoid_raw[2] > 9.0
 
 
 def test_safety_high_temp_soft_suppression():
@@ -106,7 +143,7 @@ def test_safety_respects_tx_enabled_hardware_mask():
 def test_safety_mode_aware_projection_for_rho_tau():
     cfg = load_cfg("configs/default.yaml")
     safety = SafetyLayer(cfg)
-    lower_raw = np.array([0.0, 0.0, 0.0, 4.0, -4.0], dtype=np.float32)
+    lower_raw = np.array([0.0, 0.0, 0.0, 0.4, -0.4], dtype=np.float32)
     temps = np.array([20.0, 20.0, 20.0], dtype=np.float32)
     mem = {"current_boost": 0, "dwell_count": 3}
 
@@ -164,6 +201,7 @@ def test_safety_dalal_correction_respects_bus_and_thermal_safe():
 def test_safety_smooth_relaxed_keeps_smooth_unchanged_and_relaxes_cool_margin():
     cfg_smooth = copy.deepcopy(load_cfg("configs/default.yaml"))
     cfg_relaxed = copy.deepcopy(load_cfg("configs/default.yaml"))
+    cfg_smooth["safety"]["projection_mode"] = "smooth"
     cfg_relaxed["safety"]["projection_mode"] = "smooth_relaxed"
     cfg_relaxed["safety"]["smooth_relaxed_margin_c"] = 1.0
 
@@ -191,6 +229,7 @@ def test_safety_smooth_relaxed_keeps_smooth_unchanged_and_relaxes_cool_margin():
 def test_safety_smooth_relaxed_matches_smooth_above_safe_boundary():
     cfg_smooth = copy.deepcopy(load_cfg("configs/default.yaml"))
     cfg_relaxed = copy.deepcopy(load_cfg("configs/default.yaml"))
+    cfg_smooth["safety"]["projection_mode"] = "smooth"
     cfg_relaxed["safety"]["projection_mode"] = "smooth_relaxed"
     cfg_relaxed["safety"]["smooth_relaxed_margin_c"] = 1.0
 

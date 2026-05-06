@@ -18,6 +18,18 @@ def _sigmoid_np(x: np.ndarray) -> np.ndarray:
     return out
 
 
+def raw_from_frac01(x: np.ndarray | float, action_decode_mode: str = "tanh_affine") -> np.ndarray:
+    """Encode physical [0, 1] fractions back to lower-policy raw action space."""
+    frac = np.clip(np.asarray(x, dtype=np.float32), 0.0, 1.0)
+    mode = str(action_decode_mode).lower()
+    if mode == "sigmoid_logit":
+        clipped = np.clip(frac, 1.0e-4, 1.0 - 1.0e-4)
+        return np.log(clipped / (1.0 - clipped)).astype(np.float32)
+    if mode == "tanh_affine":
+        return (2.0 * frac - 1.0).astype(np.float32)
+    raise ValueError(f"unsupported safety.action_decode_mode={mode}")
+
+
 def _softplus_np(x: np.ndarray, beta: float) -> np.ndarray:
     return np.logaddexp(0.0, beta * x) / beta
 
@@ -29,9 +41,12 @@ class SafetyLayer:
         safety_cfg = cfg["safety"]
         env_cfg = cfg.get("env", {})
         hybrid_cfg = env_cfg.get("hybrid", {})
-        self.projection_mode = str(safety_cfg.get("projection_mode", "smooth")).lower()
+        self.projection_mode = str(safety_cfg.get("projection_mode", "smooth_relaxed")).lower()
         if self.projection_mode not in {"smooth", "smooth_relaxed", "hard_clip", "dalal_safe"}:
             raise ValueError(f"unsupported safety.projection_mode={self.projection_mode}")
+        self.action_decode_mode = str(safety_cfg.get("action_decode_mode", "tanh_affine")).lower()
+        if self.action_decode_mode not in {"tanh_affine", "sigmoid_logit"}:
+            raise ValueError(f"unsupported safety.action_decode_mode={self.action_decode_mode}")
         self.min_dwell_steps = int(safety_cfg["min_dwell_steps"])
         self.soft_alpha = float(safety_cfg["soft_alpha"])
         self.smooth_relaxed_margin_c = float(safety_cfg.get("smooth_relaxed_margin_c", 1.0))
@@ -154,6 +169,17 @@ class SafetyLayer:
         t = torch.clamp(gap / self.smooth_relaxed_margin_c, min=0.0, max=1.0)
         return base_scale * (1.0 - t) + t
 
+    def _decode_frac_np(self, lower_raw: np.ndarray) -> np.ndarray:
+        raw = np.asarray(lower_raw, dtype=np.float32)
+        if self.action_decode_mode == "sigmoid_logit":
+            return _sigmoid_np(raw)
+        return np.clip((raw + 1.0) * 0.5, 0.0, 1.0).astype(np.float32)
+
+    def _decode_frac_torch(self, lower_raw: torch.Tensor) -> torch.Tensor:
+        if self.action_decode_mode == "sigmoid_logit":
+            return torch.sigmoid(lower_raw)
+        return torch.clamp((lower_raw + 1.0) * 0.5, min=0.0, max=1.0)
+
     @staticmethod
     def _project_mode_params_np(mode: int, rho_raw: float, tau_raw: float) -> Tuple[float, float]:
         rho = float(np.clip(rho_raw, 0.0, 1.0))
@@ -192,7 +218,9 @@ class SafetyLayer:
         exec_boost, mem = self._apply_dwell(desired_boost, mem)
 
         lower_raw = np.asarray(lower_raw, dtype=np.float32)
-        currents = _sigmoid_np(lower_raw[:3]) * self.current_max
+        decoded = self._decode_frac_np(lower_raw[:5])
+        current_frac = decoded[:3].astype(np.float32)
+        currents = current_frac * self.current_max
         raw_current_total = float(np.sum(currents))
 
         mask = self._boost_mask(exec_boost)
@@ -217,8 +245,8 @@ class SafetyLayer:
             currents *= self._hard_bus_scale_np(total)
         bus_projected_current_total = float(np.sum(currents))
 
-        rho_raw = float(_sigmoid_np(np.asarray([lower_raw[3]])).item())
-        tau_raw = float(_sigmoid_np(np.asarray([lower_raw[4]])).item())
+        rho_raw = float(decoded[3])
+        tau_raw = float(decoded[4])
         rho, tau = self._project_mode_params_np(mode, rho_raw, tau_raw)
 
         temps = np.asarray(temps, dtype=np.float32)
@@ -259,6 +287,10 @@ class SafetyLayer:
                 "thermal_cutoff_scale": cutoff_scale.astype(np.float32),
                 "thermal_margin": thermal_margin,
                 "thermal_margin_min": float(np.min(thermal_margin)),
+                "action_decode_mode": self.action_decode_mode,
+                "raw_current_frac": current_frac.astype(np.float32),
+                "rho_raw_decoded": float(rho_raw),
+                "tau_raw_decoded": float(tau_raw),
                 "raw_current_total": raw_current_total,
                 "masked_current_total": masked_current_total,
                 "bus_projected_current_total": bus_projected_current_total,
@@ -283,7 +315,9 @@ class SafetyLayer:
         device = lower_raw.device
 
         current_max = torch.as_tensor(self.current_max, device=device, dtype=lower_raw.dtype).view(1, -1)
-        currents = torch.sigmoid(lower_raw[:, :3]) * current_max
+        decoded = self._decode_frac_torch(lower_raw[:, :5])
+        current_frac = decoded[:, :3]
+        currents = current_frac * current_max
         raw_current_total = currents.sum(dim=1)
 
         boost_combo = boost_combo.long().view(-1)
@@ -317,8 +351,8 @@ class SafetyLayer:
             currents = currents * self._hard_bus_scale_torch(total)
         bus_projected_current_total = currents.sum(dim=1)
 
-        rho_raw = torch.sigmoid(lower_raw[:, 3:4])
-        tau_raw = torch.sigmoid(lower_raw[:, 4:5])
+        rho_raw = decoded[:, 3:4]
+        tau_raw = decoded[:, 4:5]
         rho, tau = self._project_mode_params_torch(mode, rho_raw, tau_raw)
 
         if temps.dim() == 1:
@@ -374,6 +408,9 @@ class SafetyLayer:
             "thermal_cutoff_scale": cutoff_scale,
             "thermal_margin": thermal_margin,
             "thermal_margin_min": thermal_margin.min(dim=1).values,
+            "raw_current_frac": current_frac,
+            "rho_raw_decoded": rho_raw,
+            "tau_raw_decoded": tau_raw,
             "raw_current_total": raw_current_total,
             "masked_current_total": masked_current_total,
             "bus_projected_current_total": bus_projected_current_total,
