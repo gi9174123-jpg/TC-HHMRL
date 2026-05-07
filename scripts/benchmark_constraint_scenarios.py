@@ -228,6 +228,20 @@ def apply_ablation(cfg: Dict, ablation: str) -> None:
         }
         sync_site_bank_with_cfg(cfg)
         return
+    if ablation == "thermal_cap":
+        cfg.setdefault("safety", {})["projection_mode"] = "thermal_cap"
+        cfg.setdefault("safety", {})["thermal_cap_margin_c"] = float(
+            cfg.get("safety", {}).get("thermal_cap_margin_c", 0.5)
+        )
+        cfg["pilot_metadata"] = {
+            "projection_variant": "thermal_cap",
+            "pilot_only": True,
+            "formal_ranking_exclude": True,
+            "comparison_role": "projection_sensitivity",
+            "thermal_cap_margin_c": float(cfg["safety"]["thermal_cap_margin_c"]),
+        }
+        sync_site_bank_with_cfg(cfg)
+        return
     raise ValueError(f"Unknown ablation: {ablation}")
 
 
@@ -951,6 +965,9 @@ def _safe_projection_aux(safe: Dict) -> Dict[str, object]:
         "thermal_scale": safe.get("thermal_scale"),
         "thermal_soft_scale": safe.get("thermal_soft_scale"),
         "thermal_cutoff_scale": safe.get("thermal_cutoff_scale"),
+        "thermal_cap_current": safe.get("thermal_cap_current"),
+        "thermal_cap_scale": safe.get("thermal_cap_scale"),
+        "thermal_cap_margin_c": safe.get("thermal_cap_margin_c"),
         "thermal_margin_min": safe.get("thermal_margin_min"),
         "action_decode_mode": safe.get("action_decode_mode"),
         "raw_current_frac": safe.get("raw_current_frac"),
@@ -993,6 +1010,7 @@ def _add_projection_diagnostics(row: Dict, aux: Dict, currents_exec: np.ndarray)
     row["projected_current_total"] = _projection_scalar(aux, "projected_current_total", projected_default)
     row["projection_compression_ratio"] = _projection_scalar(aux, "projection_compression_ratio")
     row["thermal_margin_min"] = _projection_scalar(aux, "thermal_margin_min")
+    row["thermal_cap_margin_c"] = _projection_scalar(aux, "thermal_cap_margin_c")
     row["rho_raw_decoded"] = _projection_scalar(aux, "rho_raw_decoded")
     row["tau_raw_decoded"] = _projection_scalar(aux, "tau_raw_decoded")
 
@@ -1004,6 +1022,8 @@ def _add_projection_diagnostics(row: Dict, aux: Dict, currents_exec: np.ndarray)
         ("thermal_scale", "thermal_scale"),
         ("thermal_soft_scale", "thermal_soft_scale"),
         ("thermal_cutoff_scale", "thermal_cutoff_scale"),
+        ("thermal_cap_current", "thermal_cap_current"),
+        ("thermal_cap_scale", "thermal_cap_scale"),
         ("t_pred", "t_pred"),
     ]:
         arr = _projection_vector(aux, key)
@@ -3154,6 +3174,7 @@ def run_one_scenario(
                     "pilot_only": pilot_only,
                     "formal_ranking_exclude": formal_ranking_exclude,
                     "smooth_relaxed_margin_c": pilot_meta.get("smooth_relaxed_margin_c"),
+                    "thermal_cap_margin_c": pilot_meta.get("thermal_cap_margin_c"),
                     "formally_comparable": formally_comparable,
                     "formal_ranking_comparable": bool(is_formal_ranking_record(formal_record_probe)),
                     **alignment_snapshot(cfg),
@@ -3302,18 +3323,22 @@ def run_one_scenario(
             }
         elif variant == "hybrid":
             is_smooth_relaxed = ablation == "smooth_relaxed"
+            is_thermal_cap = ablation == "thermal_cap"
+            projection_variant = "thermal_cap" if is_thermal_cap else "smooth_relaxed" if is_smooth_relaxed else ""
             variant_definitions[label] = {
                 "runner": "trainer",
                 "base_variant": variant,
                 "ablation": ablation,
                 "tx_device": ["LED", "LD", "LD"],
                 "tx_enabled": [1.0, 1.0, 1.0],
-                "projection_variant": "smooth_relaxed" if is_smooth_relaxed else "",
-                "pilot_only": True if is_smooth_relaxed else None,
-                "formal_ranking_exclude": True if is_smooth_relaxed else None,
-                "comparison_role": "projection_sensitivity" if is_smooth_relaxed else "",
+                "projection_variant": projection_variant,
+                "pilot_only": True if (is_smooth_relaxed or is_thermal_cap) else None,
+                "formal_ranking_exclude": True if (is_smooth_relaxed or is_thermal_cap) else None,
+                "comparison_role": "projection_sensitivity" if (is_smooth_relaxed or is_thermal_cap) else "",
                 "description": (
-                    "Pilot-only projection sensitivity: full Hybrid with relaxed smooth thermal derating."
+                    "Pilot-only projection sensitivity: full Hybrid with thermal-cap current projection."
+                    if is_thermal_cap
+                    else "Pilot-only projection sensitivity: full Hybrid with relaxed smooth thermal derating."
                     if is_smooth_relaxed
                     else "Full hierarchical method on the fixed heterogeneous hybrid structure"
                     if label != "dalal2018_safe"
@@ -3624,7 +3649,7 @@ def parse_args() -> argparse.Namespace:
         type=str,
         nargs="+",
         default=["full"],
-        choices=["full", "wo_meta", "wo_lagrangian", "hard_clip", "smooth_relaxed"],
+        choices=["full", "wo_meta", "wo_lagrangian", "hard_clip", "smooth_relaxed", "thermal_cap"],
         help="Ablation settings applied on top of each selected variant.",
     )
     parser.add_argument(

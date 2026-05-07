@@ -42,7 +42,7 @@ class SafetyLayer:
         env_cfg = cfg.get("env", {})
         hybrid_cfg = env_cfg.get("hybrid", {})
         self.projection_mode = str(safety_cfg.get("projection_mode", "smooth_relaxed")).lower()
-        if self.projection_mode not in {"smooth", "smooth_relaxed", "hard_clip", "dalal_safe"}:
+        if self.projection_mode not in {"smooth", "smooth_relaxed", "thermal_cap", "hard_clip", "dalal_safe"}:
             raise ValueError(f"unsupported safety.projection_mode={self.projection_mode}")
         self.action_decode_mode = str(safety_cfg.get("action_decode_mode", "tanh_affine")).lower()
         if self.action_decode_mode not in {"tanh_affine", "sigmoid_logit"}:
@@ -50,6 +50,7 @@ class SafetyLayer:
         self.min_dwell_steps = int(safety_cfg["min_dwell_steps"])
         self.soft_alpha = float(safety_cfg["soft_alpha"])
         self.smooth_relaxed_margin_c = float(safety_cfg.get("smooth_relaxed_margin_c", 1.0))
+        self.thermal_cap_margin_c = float(safety_cfg.get("thermal_cap_margin_c", 0.5))
         self.cutoff_alpha = float(safety_cfg["cutoff_alpha"])
         self.projection_beta = float(safety_cfg["projection_beta"])
         self.mask_floor = float(safety_cfg["mask_floor"])
@@ -180,6 +181,49 @@ class SafetyLayer:
             return torch.sigmoid(lower_raw)
         return torch.clamp((lower_raw + 1.0) * 0.5, min=0.0, max=1.0)
 
+    def _thermal_cap_np(
+        self,
+        *,
+        currents: np.ndarray,
+        temps: np.ndarray,
+        amb_temp: float,
+        gamma: float,
+        delta: float,
+    ) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
+        base = (1.0 - gamma) * temps + gamma * amb_temp
+        allowed_rise = self.thermal_safe - self.thermal_cap_margin_c - base
+        denom = max(float(delta), 0.0) * self.tx_thermal_coeff + 1.0e-6
+        cap = np.sqrt(np.maximum(allowed_rise / denom, 0.0)).astype(np.float32)
+        cap = np.minimum(cap, self.current_max).astype(np.float32)
+        safe_currents = np.minimum(currents, cap).astype(np.float32)
+        scale = safe_currents / np.maximum(currents, 1.0e-6)
+        scale = np.where(currents > 1.0e-6, scale, 1.0).astype(np.float32)
+        return safe_currents, cap, scale
+
+    def _thermal_cap_torch(
+        self,
+        *,
+        currents: torch.Tensor,
+        temps: torch.Tensor,
+        amb_temp: torch.Tensor,
+        gamma: torch.Tensor,
+        delta: torch.Tensor,
+        current_max: torch.Tensor,
+        thermal_coeff: torch.Tensor,
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        base = (1.0 - gamma) * temps + gamma * amb_temp
+        allowed_rise = self.thermal_safe - self.thermal_cap_margin_c - base
+        denom = torch.clamp(delta, min=0.0) * thermal_coeff + 1.0e-6
+        cap = torch.sqrt(torch.clamp(allowed_rise / denom, min=0.0))
+        cap = torch.minimum(cap, current_max)
+        safe_currents = torch.minimum(currents, cap)
+        scale = torch.where(
+            currents > 1.0e-6,
+            safe_currents / torch.clamp(currents, min=1.0e-6),
+            torch.ones_like(currents),
+        )
+        return safe_currents, cap, scale
+
     @staticmethod
     def _project_mode_params_np(mode: int, rho_raw: float, tau_raw: float) -> Tuple[float, float]:
         rho = float(np.clip(rho_raw, 0.0, 1.0))
@@ -224,14 +268,14 @@ class SafetyLayer:
         raw_current_total = float(np.sum(currents))
 
         mask = self._boost_mask(exec_boost)
-        if self.projection_mode in {"smooth", "smooth_relaxed", "dalal_safe"}:
+        if self.projection_mode in {"smooth", "smooth_relaxed", "thermal_cap", "dalal_safe"}:
             mask = self.mask_floor + (1.0 - self.mask_floor) * mask
         mask = self.tx_enabled * mask
         currents *= mask.astype(np.float32)
         masked_current_total = float(np.sum(currents))
 
         total = float(np.sum(currents))
-        if self.projection_mode in {"smooth", "smooth_relaxed"}:
+        if self.projection_mode in {"smooth", "smooth_relaxed", "thermal_cap"}:
             currents *= self._smooth_bus_scale_np(total)
         elif self.projection_mode == "dalal_safe":
             currents = self._dalal_correct_currents_np(
@@ -251,6 +295,8 @@ class SafetyLayer:
 
         temps = np.asarray(temps, dtype=np.float32)
         T_pred = (1.0 - gamma) * temps + gamma * amb_temp + delta * self.tx_thermal_coeff * (currents**2)
+        thermal_cap_current = self.current_max.astype(np.float32)
+        thermal_cap_scale = np.ones_like(currents, dtype=np.float32)
 
         if self.projection_mode in {"smooth", "smooth_relaxed"}:
             gap = self.thermal_safe - T_pred
@@ -259,6 +305,18 @@ class SafetyLayer:
                 soft_scale = self._relaxed_soft_scale_np(gap, soft_scale)
             cutoff_scale = _sigmoid_np(self.cutoff_alpha * (self.thermal_cutoff - T_pred))
             thermal_scale = (soft_scale * cutoff_scale).astype(np.float32)
+        elif self.projection_mode == "thermal_cap":
+            currents, thermal_cap_current, thermal_scale = self._thermal_cap_np(
+                currents=currents,
+                temps=temps,
+                amb_temp=float(amb_temp),
+                gamma=float(gamma),
+                delta=float(delta),
+            )
+            T_pred = (1.0 - gamma) * temps + gamma * amb_temp + delta * self.tx_thermal_coeff * (currents**2)
+            thermal_cap_scale = thermal_scale.astype(np.float32)
+            soft_scale = thermal_scale.astype(np.float32)
+            cutoff_scale = np.ones_like(currents, dtype=np.float32)
         elif self.projection_mode == "dalal_safe":
             soft_scale = np.ones_like(currents, dtype=np.float32)
             cutoff_scale = np.ones_like(currents, dtype=np.float32)
@@ -267,7 +325,7 @@ class SafetyLayer:
             soft_scale = (T_pred <= self.thermal_safe).astype(np.float32)
             cutoff_scale = np.ones_like(currents, dtype=np.float32)
             thermal_scale = (T_pred <= self.thermal_safe).astype(np.float32)
-        if self.projection_mode != "dalal_safe":
+        if self.projection_mode not in {"dalal_safe", "thermal_cap"}:
             currents *= thermal_scale
         projected_current_total = float(np.sum(currents))
         projection_compression_ratio = float(projected_current_total / max(raw_current_total, 1.0e-6))
@@ -285,6 +343,9 @@ class SafetyLayer:
                 "thermal_scale": thermal_scale,
                 "thermal_soft_scale": soft_scale.astype(np.float32),
                 "thermal_cutoff_scale": cutoff_scale.astype(np.float32),
+                "thermal_cap_current": thermal_cap_current.astype(np.float32),
+                "thermal_cap_scale": thermal_cap_scale.astype(np.float32),
+                "thermal_cap_margin_c": float(self.thermal_cap_margin_c),
                 "thermal_margin": thermal_margin,
                 "thermal_margin_min": float(np.min(thermal_margin)),
                 "action_decode_mode": self.action_decode_mode,
@@ -329,7 +390,7 @@ class SafetyLayer:
         )
         boost_combo = torch.clamp(boost_combo, 0, table.shape[0] - 1)
         mask = table.index_select(0, boost_combo)
-        if self.projection_mode in {"smooth", "smooth_relaxed", "dalal_safe"}:
+        if self.projection_mode in {"smooth", "smooth_relaxed", "thermal_cap", "dalal_safe"}:
             mask = self.mask_floor + (1.0 - self.mask_floor) * mask
         tx_enabled = torch.as_tensor(self.tx_enabled, dtype=lower_raw.dtype, device=device).view(1, -1)
         mask = tx_enabled * mask
@@ -337,7 +398,7 @@ class SafetyLayer:
         masked_current_total = currents.sum(dim=1)
 
         total = currents.sum(dim=1, keepdim=True)
-        if self.projection_mode in {"smooth", "smooth_relaxed"}:
+        if self.projection_mode in {"smooth", "smooth_relaxed", "thermal_cap"}:
             currents = currents * self._smooth_bus_scale_torch(total)
         elif self.projection_mode == "dalal_safe":
             currents = self._dalal_correct_currents_torch(
@@ -370,6 +431,8 @@ class SafetyLayer:
             device=device,
         ).view(1, -1)
         T_pred = (1.0 - gamma) * temps + gamma * amb_temp + delta * thermal_coeff * (currents**2)
+        thermal_cap_current = current_max.expand_as(currents)
+        thermal_cap_scale = torch.ones_like(currents)
         if self.projection_mode in {"smooth", "smooth_relaxed"}:
             gap = self.thermal_safe - T_pred
             soft_scale = torch.sigmoid(self.soft_alpha * gap)
@@ -377,6 +440,20 @@ class SafetyLayer:
                 soft_scale = self._relaxed_soft_scale_torch(gap, soft_scale)
             cutoff_scale = torch.sigmoid(self.cutoff_alpha * (self.thermal_cutoff - T_pred))
             thermal_scale = soft_scale * cutoff_scale
+        elif self.projection_mode == "thermal_cap":
+            currents, thermal_cap_current, thermal_scale = self._thermal_cap_torch(
+                currents=currents,
+                temps=temps,
+                amb_temp=amb_temp,
+                gamma=gamma,
+                delta=delta,
+                current_max=current_max,
+                thermal_coeff=thermal_coeff,
+            )
+            T_pred = (1.0 - gamma) * temps + gamma * amb_temp + delta * thermal_coeff * (currents**2)
+            thermal_cap_scale = thermal_scale
+            soft_scale = thermal_scale
+            cutoff_scale = torch.ones_like(currents)
         elif self.projection_mode == "dalal_safe":
             soft_scale = torch.ones_like(currents)
             cutoff_scale = torch.ones_like(currents)
@@ -389,7 +466,7 @@ class SafetyLayer:
             soft_scale = (T_pred <= self.thermal_safe).to(lower_raw.dtype)
             cutoff_scale = torch.ones_like(currents)
             thermal_scale = (T_pred <= self.thermal_safe).to(lower_raw.dtype)
-        if self.projection_mode != "dalal_safe":
+        if self.projection_mode not in {"dalal_safe", "thermal_cap"}:
             currents = currents * thermal_scale
         projected_current_total = currents.sum(dim=1)
         projection_compression_ratio = projected_current_total / torch.clamp(raw_current_total, min=1.0e-6)
@@ -406,6 +483,14 @@ class SafetyLayer:
             "thermal_scale": thermal_scale,
             "thermal_soft_scale": soft_scale,
             "thermal_cutoff_scale": cutoff_scale,
+            "thermal_cap_current": thermal_cap_current,
+            "thermal_cap_scale": thermal_cap_scale,
+            "thermal_cap_margin_c": torch.full(
+                (lower_raw.shape[0],),
+                float(self.thermal_cap_margin_c),
+                dtype=lower_raw.dtype,
+                device=device,
+            ),
             "thermal_margin": thermal_margin,
             "thermal_margin_min": thermal_margin.min(dim=1).values,
             "raw_current_frac": current_frac,

@@ -105,7 +105,7 @@ def test_benchmark_supports_ablations_and_learning_baseline(tmp_path: Path):
         use_curriculum=False,
         shared_init=False,
         variants=["hybrid"],
-        ablations=["full", "wo_meta", "wo_lagrangian", "smooth_relaxed"],
+        ablations=["full", "wo_meta", "wo_lagrangian", "smooth_relaxed", "thermal_cap"],
         baselines=["heuristic_safe", "sac_lagrangian"],
     )
     assert report_path.exists()
@@ -131,6 +131,7 @@ def test_benchmark_supports_ablations_and_learning_baseline(tmp_path: Path):
         "hybrid_wo_meta",
         "hybrid_wo_lagrangian",
         "hybrid_smooth_relaxed",
+        "hybrid_thermal_cap",
         "heuristic_safe",
         "sac_lagrangian",
     }
@@ -140,6 +141,13 @@ def test_benchmark_supports_ablations_and_learning_baseline(tmp_path: Path):
     assert smooth_relaxed_rows[0]["pilot_only"] is True
     assert smooth_relaxed_rows[0]["formal_ranking_exclude"] is True
     assert smooth_relaxed_rows[0]["formal_ranking_comparable"] is False
+    thermal_cap_rows = [row for row in rows if row["variant"] == "hybrid_thermal_cap"]
+    assert len(thermal_cap_rows) == 1
+    assert thermal_cap_rows[0]["projection_variant"] == "thermal_cap"
+    assert thermal_cap_rows[0]["pilot_only"] is True
+    assert thermal_cap_rows[0]["formal_ranking_exclude"] is True
+    assert thermal_cap_rows[0]["formal_ranking_comparable"] is False
+    assert float(thermal_cap_rows[0]["thermal_cap_margin_c"]) == 0.5
 
     saclag_rows = [row for row in rows if row["variant"] == "sac_lagrangian"]
     assert len(saclag_rows) == 1
@@ -164,8 +172,10 @@ def test_benchmark_supports_ablations_and_learning_baseline(tmp_path: Path):
     ]
     pairs = stats_payload["pairwise"]["hard_stress"]
     assert "hybrid_smooth_relaxed" not in stats_payload["scenarios"]["hard_stress"]
+    assert "hybrid_thermal_cap" not in stats_payload["scenarios"]["hard_stress"]
     assert all(
-        row["left_variant"] != "hybrid_smooth_relaxed" and row["right_variant"] != "hybrid_smooth_relaxed"
+        row["left_variant"] not in {"hybrid_smooth_relaxed", "hybrid_thermal_cap"}
+        and row["right_variant"] not in {"hybrid_smooth_relaxed", "hybrid_thermal_cap"}
         for row in pairs
     )
     reward_pair = next(
@@ -200,10 +210,29 @@ def test_benchmark_supports_ablations_and_learning_baseline(tmp_path: Path):
         "thermal_scale_tx2",
         "thermal_soft_scale_tx0",
         "thermal_cutoff_scale_tx0",
+        "thermal_cap_margin_c",
+        "thermal_cap_current_tx0",
+        "thermal_cap_current_tx1",
+        "thermal_cap_current_tx2",
+        "thermal_cap_scale_tx0",
+        "thermal_cap_scale_tx1",
+        "thermal_cap_scale_tx2",
         "t_pred_tx0",
         "thermal_margin_min",
     ]:
         assert col in env_df.columns
+    thermal_cap_env = env_df[env_df["variant"] == "hybrid_thermal_cap"]
+    assert not thermal_cap_env.empty
+    for col in [
+        "thermal_cap_margin_c",
+        "thermal_cap_current_tx0",
+        "thermal_cap_current_tx1",
+        "thermal_cap_current_tx2",
+        "thermal_cap_scale_tx0",
+        "thermal_cap_scale_tx1",
+        "thermal_cap_scale_tx2",
+    ]:
+        assert thermal_cap_env[col].notna().all()
 
 
 def test_benchmark_supports_shin2024_and_dalal_baselines(tmp_path: Path):
@@ -340,7 +369,8 @@ def test_statistics_contract_trusts_pvalue_only_with_two_or_more_pairs():
 
 def test_statistics_excludes_pilot_sensitivity_rows_even_if_ordered():
     rows = []
-    for variant in ["hybrid", "hybrid_smooth_relaxed", "sac_lagrangian"]:
+    for variant in ["hybrid", "hybrid_smooth_relaxed", "hybrid_thermal_cap", "sac_lagrangian"]:
+        is_pilot = variant in {"hybrid_smooth_relaxed", "hybrid_thermal_cap"}
         rows.append(
             {
                 "scenario": "hard_stress",
@@ -356,10 +386,10 @@ def test_statistics_excludes_pilot_sensitivity_rows_even_if_ordered():
                 "alignment_version": "system_model_v1",
                 "task_summary_version": "site_v2",
                 "pre_alignment": False,
-                "projection_mode": "smooth_relaxed",
+                "projection_mode": "thermal_cap" if variant == "hybrid_thermal_cap" else "smooth_relaxed",
                 "action_decode_mode": "tanh_affine",
-                "pilot_only": variant == "hybrid_smooth_relaxed",
-                "formal_ranking_exclude": variant == "hybrid_smooth_relaxed",
+                "pilot_only": is_pilot,
+                "formal_ranking_exclude": is_pilot,
             }
         )
 
@@ -367,13 +397,14 @@ def test_statistics_excludes_pilot_sensitivity_rows_even_if_ordered():
         rows,
         artifact_name="stats_contract",
         scenarios=["hard_stress"],
-        variant_order=("hybrid", "hybrid_smooth_relaxed", "sac_lagrangian"),
+        variant_order=("hybrid", "hybrid_smooth_relaxed", "hybrid_thermal_cap", "sac_lagrangian"),
         metrics=["reward"],
     )
     assert artifact is not None
     assert set(artifact["scenarios"]["hard_stress"]) == {"hybrid", "sac_lagrangian"}
     assert all(
-        row["left_variant"] != "hybrid_smooth_relaxed" and row["right_variant"] != "hybrid_smooth_relaxed"
+        row["left_variant"] not in {"hybrid_smooth_relaxed", "hybrid_thermal_cap"}
+        and row["right_variant"] not in {"hybrid_smooth_relaxed", "hybrid_thermal_cap"}
         for row in artifact["pairwise"]["hard_stress"]
     )
 

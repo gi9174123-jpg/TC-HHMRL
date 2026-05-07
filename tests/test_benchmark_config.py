@@ -25,6 +25,7 @@ def test_default_safety_uses_corrected_action_mapping_and_main_projection():
     assert cfg["safety"]["projection_mode"] == "smooth_relaxed"
     assert cfg["safety"]["action_decode_mode"] == "tanh_affine"
     assert float(cfg["safety"]["smooth_relaxed_margin_c"]) == 1.0
+    assert float(cfg["safety"]["thermal_cap_margin_c"]) == 0.5
 
 
 def test_practical_hard_safety_is_earlier_than_env():
@@ -177,6 +178,20 @@ def test_ablation_smooth_relaxed_sets_pilot_metadata():
     assert cfg["pilot_metadata"]["pilot_only"] is True
     assert cfg["pilot_metadata"]["formal_ranking_exclude"] is True
     assert cfg["pilot_metadata"]["comparison_role"] == "projection_sensitivity"
+
+
+def test_ablation_thermal_cap_sets_pilot_metadata():
+    cfg = load_cfg("configs/default.yaml")
+    cfg = copy.deepcopy(cfg)
+    apply_ablation(cfg, "thermal_cap")
+
+    assert cfg["safety"]["projection_mode"] == "thermal_cap"
+    assert float(cfg["safety"]["thermal_cap_margin_c"]) == 0.5
+    assert cfg["pilot_metadata"]["projection_variant"] == "thermal_cap"
+    assert cfg["pilot_metadata"]["pilot_only"] is True
+    assert cfg["pilot_metadata"]["formal_ranking_exclude"] is True
+    assert cfg["pilot_metadata"]["comparison_role"] == "projection_sensitivity"
+    assert float(cfg["pilot_metadata"]["thermal_cap_margin_c"]) == 0.5
 
 
 def test_baseline_shin2024_disables_meta_and_sets_ddpg_hparams():

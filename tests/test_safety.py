@@ -292,6 +292,113 @@ def test_safety_smooth_relaxed_numpy_torch_consistency():
     )
 
 
+def test_safety_thermal_cap_limits_final_predicted_temperature_when_feasible():
+    cfg = copy.deepcopy(load_cfg("configs/default.yaml"))
+    cfg["safety"]["projection_mode"] = "thermal_cap"
+    cfg["safety"]["thermal_cap_margin_c"] = 0.5
+    safety = SafetyLayer(cfg)
+
+    lower_raw = np.array([1.0, 1.0, 1.0, 0.0, 0.0], dtype=np.float32)
+    temps = np.array([42.0, 42.0, 42.0], dtype=np.float32)
+    out, _ = safety.project_np(
+        upper_raw=11,
+        lower_raw=lower_raw,
+        temps=temps,
+        amb_temp=35.0,
+        gamma=0.06,
+        delta=4.0,
+        mem={"current_boost": 3, "dwell_count": 3},
+    )
+
+    target = float(cfg["safety"]["thermal_safe"]) - float(cfg["safety"]["thermal_cap_margin_c"])
+    assert float(np.max(out["t_pred"])) <= target + 2e-5
+    assert np.all(out["thermal_cap_scale"] <= 1.0 + 1e-6)
+    assert np.any(out["thermal_cap_scale"] < 1.0 - 1e-5)
+
+
+def test_safety_thermal_cap_does_not_reduce_current_when_below_cap():
+    cfg = copy.deepcopy(load_cfg("configs/default.yaml"))
+    cfg["safety"]["projection_mode"] = "thermal_cap"
+    cfg["safety"]["thermal_cap_margin_c"] = 0.5
+    safety = SafetyLayer(cfg)
+
+    lower_raw = np.array([-0.8, -0.8, -0.8, 0.0, 0.0], dtype=np.float32)
+    temps = np.array([25.0, 25.0, 25.0], dtype=np.float32)
+    out, _ = safety.project_np(
+        upper_raw=11,
+        lower_raw=lower_raw,
+        temps=temps,
+        amb_temp=26.0,
+        gamma=0.04,
+        delta=1.0,
+        mem={"current_boost": 3, "dwell_count": 3},
+    )
+
+    assert np.allclose(out["thermal_cap_scale"], 1.0, atol=1e-6)
+    assert np.isclose(
+        float(out["projected_current_total"]),
+        float(out["bus_projected_current_total"]),
+        atol=1e-6,
+    )
+
+
+def test_safety_thermal_cap_zeroes_current_when_thermal_base_exceeds_target():
+    cfg = copy.deepcopy(load_cfg("configs/default.yaml"))
+    cfg["safety"]["projection_mode"] = "thermal_cap"
+    cfg["safety"]["thermal_cap_margin_c"] = 0.5
+    safety = SafetyLayer(cfg)
+
+    lower_raw = np.array([1.0, 1.0, 1.0, 0.0, 0.0], dtype=np.float32)
+    hot_temps = np.array([100.0, 100.0, 100.0], dtype=np.float32)
+    out, _ = safety.project_np(
+        upper_raw=11,
+        lower_raw=lower_raw,
+        temps=hot_temps,
+        amb_temp=35.0,
+        gamma=0.04,
+        delta=4.0,
+        mem={"current_boost": 3, "dwell_count": 3},
+    )
+
+    assert np.allclose(out["currents_exec"], 0.0, atol=1e-7)
+    assert np.allclose(out["thermal_cap_current"], 0.0, atol=1e-7)
+
+
+def test_safety_thermal_cap_numpy_torch_consistency():
+    cfg = copy.deepcopy(load_cfg("configs/default.yaml"))
+    cfg["safety"]["projection_mode"] = "thermal_cap"
+    cfg["safety"]["thermal_cap_margin_c"] = 0.5
+    safety = SafetyLayer(cfg)
+
+    lower_raw_np = np.array([0.9, 0.6, 0.3, 0.2, -0.2], dtype=np.float32)
+    temps_np = np.array([43.0, 42.0, 41.0], dtype=np.float32)
+    np_out, _ = safety.project_np(
+        upper_raw=11,
+        lower_raw=lower_raw_np,
+        temps=temps_np,
+        amb_temp=35.0,
+        gamma=0.06,
+        delta=4.0,
+        mem={"current_boost": 3, "dwell_count": 3},
+    )
+    torch_out = safety.project_torch(
+        lower_raw=torch.tensor(lower_raw_np).unsqueeze(0),
+        boost_combo=torch.tensor([3]),
+        mode=torch.tensor([2]),
+        temps=torch.tensor(temps_np).unsqueeze(0),
+        amb_temp=torch.tensor([35.0]),
+        gamma=torch.tensor([0.06]),
+        delta=torch.tensor([4.0]),
+    )
+
+    for key in ["currents_exec", "thermal_cap_scale", "t_pred"]:
+        assert np.allclose(
+            np_out[key],
+            torch_out[key].detach().cpu().numpy().reshape(-1),
+            atol=1e-5,
+        )
+
+
 def test_safety_raw_to_exec_map_matches_preview():
     cfg = load_cfg("configs/default.yaml")
     safety = SafetyLayer(cfg)
