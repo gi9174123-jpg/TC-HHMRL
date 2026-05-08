@@ -109,6 +109,11 @@ def pick_first_existing(candidates):
     raise FileNotFoundError(f'No candidate paths exist: {candidates}')
 
 
+def scenario_dir_from_summary(run_summary: Path, scenario: str) -> Path:
+    nested = run_summary.parent / scenario
+    return nested if nested.exists() else run_summary.parent
+
+
 def detect_thermal_source():
     candidates = [
         (ROOT / 'logs' / 'thermal_rebalanced_targeted' / 'run_summary.json', 'thermal_rebalanced'),
@@ -220,7 +225,14 @@ def style_bar_axis(ax, title: str, scientific_y: bool = False):
 
 
 # Fig. 3
-bench_stats = grouped_stats_from_run_summary(ROOT / 'logs' / 'bench_cpu_full' / 'run_summary.json')
+FIG3_RUN_SUMMARY = pick_first_existing(
+    [
+        ROOT / 'logs' / 'fig3_structural_thermal_cap_10seeds_gpu' / 'run_summary.json',
+        ROOT / 'logs' / 'fig3_structural_10seeds_gpu' / 'run_summary.json',
+        ROOT / 'logs' / 'bench_cpu_full' / 'run_summary.json',
+    ]
+)
+bench_stats = grouped_stats_from_run_summary(FIG3_RUN_SUMMARY)
 methods_fig3_pref = ['hybrid', 'single_led', 'single_ld', 'shin2024_matched']
 methods_fig3 = [m for m in methods_fig3_pref if all((s, m) in bench_stats for s in SCENARIOS)]
 if not methods_fig3:
@@ -295,7 +307,14 @@ with open(OUT / 'Fig3_main_benchmark_overall.csv', 'w', newline='') as f:
             ])
 
 # Fig. 4
-hard_stats = grouped_stats_from_run_summary(ROOT / 'logs' / 'hard_stress_full_ablation_baseline_v2' / 'run_summary.json')
+FIG4_RUN_SUMMARY = pick_first_existing(
+    [
+        ROOT / 'logs' / 'fig4_hard_stress_thermal_cap_10seeds_gpu' / 'run_summary.json',
+        ROOT / 'logs' / 'fig4_hard_stress_targeted_10seeds_gpu' / 'run_summary.json',
+        ROOT / 'logs' / 'hard_stress_full_ablation_baseline_v2' / 'run_summary.json',
+    ]
+)
+hard_stats = grouped_stats_from_run_summary(FIG4_RUN_SUMMARY)
 methods_fig4_pref = ['hybrid', 'hybrid_wo_meta', 'hybrid_wo_lagrangian', 'hybrid_hard_clip', 'heuristic_safe', 'sac_lagrangian', 'shin2024_matched', 'sac_dalal_safe']
 methods_fig4 = [m for m in methods_fig4_pref if ('hard_stress', m) in hard_stats]
 if not methods_fig4:
@@ -337,7 +356,7 @@ with open(OUT / 'Fig4_hard_stress_ablation_baselines.csv', 'w', newline='') as f
 
 # Fig. 5
 methods_fig5 = ['hybrid', 'hybrid_wo_meta', 'hybrid_wo_lagrangian', 'sac_lagrangian']
-base_dir = ROOT / 'logs' / 'hard_stress_full_ablation_baseline_v2' / 'hard_stress'
+base_dir = scenario_dir_from_summary(FIG4_RUN_SUMMARY, 'hard_stress')
 curves = {m: defaultdict(list) for m in methods_fig5}
 for method in methods_fig5:
     for p in sorted(base_dir.glob(f'hard_stress_{method}_seed*/checkpoint_selection.csv')):
@@ -537,35 +556,32 @@ if inset_method is not None:
 fig.set_constrained_layout_pads(w_pad=5 / 72, h_pad=8 / 72, hspace=0.05, wspace=0.08)
 savefig(fig, 'Fig7_thermal_activation_decomposition_v2')
 
-optional_src = ROOT / 'logs' / 'paper_figs_bench_cpu_full' / 'Fig6_hard_stress_stepwise_stability.png'
+fig3_moderate_dir = scenario_dir_from_summary(FIG3_RUN_SUMMARY, 'moderate_practical')
+fig3_hard_dir = scenario_dir_from_summary(FIG3_RUN_SUMMARY, 'hard_stress')
+fig3_channel_dir = scenario_dir_from_summary(FIG3_RUN_SUMMARY, 'channel_harsh')
+
+optional_src = fig3_hard_dir / 'stepwise_stability.png'
 if optional_src.exists():
     shutil.copy2(optional_src, OUT / 'Fig8_optional_hard_stress_bridge_stability.png')
 
-copy_map = {
-    ROOT / 'logs' / 'paper_figs_bench_cpu_full' / 'Fig3_scenario_realism_triptych.png': OUT / 'Appendix_Fig_A_scenario_realism_triptych.png',
-}
-for src, dst in copy_map.items():
-    if src.exists():
-        shutil.copy2(src, dst)
-
 redraw_env_realism(
-    ROOT / 'logs' / 'bench_cpu_full' / 'moderate_practical' / 'env.csv',
+    fig3_moderate_dir / 'env.csv',
     'Fig8a_moderate_practical_realism',
 )
 redraw_env_realism(
-    ROOT / 'logs' / 'bench_cpu_full' / 'hard_stress' / 'env.csv',
+    fig3_hard_dir / 'env.csv',
     'Fig8b_hard_stress_realism',
 )
 redraw_env_realism(
-    ROOT / 'logs' / 'bench_cpu_full' / 'channel_harsh' / 'env.csv',
+    fig3_channel_dir / 'env.csv',
     'Fig8c_channel_harsh_realism',
 )
 redraw_current_allocation(
-    ROOT / 'logs' / 'bench_cpu_full' / 'moderate_practical' / 'current_trace.csv',
+    fig3_moderate_dir / 'current_trace.csv',
     'Appendix_Fig_B_moderate_practical_current_allocation',
 )
 redraw_utilization_tradeoff(
-    ROOT / 'logs' / 'bench_cpu_full' / 'channel_harsh' / 'env.csv',
+    fig3_channel_dir / 'env.csv',
     'Appendix_Fig_C_channel_harsh_utilization_tradeoff',
 )
 
@@ -636,8 +652,8 @@ manifest.write_text(
     '- Appendix_Fig_C_channel_harsh_utilization_tradeoff\n'
     '- Appendix_Fig_D_detailed_thermal_breakdown_v2\n\n'
     '## Notes\n'
-    '- Main benchmark figures are based on logs/bench_cpu_full.\n'
-    '- Hard-stress targeted figures are based on logs/hard_stress_full_ablation_baseline_v2.\n'
+    f'- Main benchmark figures are based on {FIG3_RUN_SUMMARY.parent.relative_to(ROOT)}.\n'
+    f'- Hard-stress targeted figures are based on {FIG4_RUN_SUMMARY.parent.relative_to(ROOT)}.\n'
     '- Thermal targeted figures are based on logs/thermal_extreme_targeted_v2.\n'
     '- Fig. 3 uses symlog-style handling for cost/violation because exact zeros exist in the main benchmark results.\n'
 )

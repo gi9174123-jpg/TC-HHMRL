@@ -60,7 +60,7 @@ env:
     burst_ld_factor: 1.40
 
 safety:
-  projection_mode: smooth_relaxed
+  projection_mode: thermal_cap
   action_decode_mode: tanh_affine
   min_dwell_steps: 2
   soft_alpha: 0.22

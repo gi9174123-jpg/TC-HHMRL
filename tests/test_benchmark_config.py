@@ -22,7 +22,7 @@ from tchhmrl.utils.config import load_cfg
 def test_default_safety_uses_corrected_action_mapping_and_main_projection():
     cfg = load_cfg("configs/default.yaml")
 
-    assert cfg["safety"]["projection_mode"] == "smooth_relaxed"
+    assert cfg["safety"]["projection_mode"] == "thermal_cap"
     assert cfg["safety"]["action_decode_mode"] == "tanh_affine"
     assert float(cfg["safety"]["smooth_relaxed_margin_c"]) == 1.0
     assert float(cfg["safety"]["thermal_cap_margin_c"]) == 0.5
@@ -213,7 +213,7 @@ def test_baseline_shin2024_disables_meta_and_sets_ddpg_hparams():
     assert float(cfg["lower_ddpg"]["fixed_current_fraction"]) == 0.5
     assert cfg["baseline_metadata"]["baseline_family"] == "shin2024_matched"
     assert cfg["baseline_metadata"]["exact_reproduction"] is False
-    assert cfg["baseline_metadata"]["safety_protocol"] == "common_smooth_relaxed_projection"
+    assert cfg["baseline_metadata"]["safety_protocol"] == "common_thermal_cap_projection"
     assert cfg["baseline_metadata"]["fixed_mode_name"] == "HY"
     assert cfg["baseline_metadata"]["fixed_current_template"] == "tanh_affine_fraction"
 

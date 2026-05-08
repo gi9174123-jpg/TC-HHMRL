@@ -200,7 +200,7 @@ def is_formal_ranking_record(record: Mapping[str, Any]) -> bool:
     action_decode_mode = str(record.get("action_decode_mode", ""))
     return (
         is_formally_comparable_record(record)
-        and projection_mode in {"smooth", "smooth_relaxed", "thermal_cap", "hard_clip", "dalal_safe"}
+        and projection_mode in {"thermal_cap", "hard_clip", "dalal_safe"}
         and action_decode_mode in {"tanh_affine", "sigmoid_logit"}
         and bool(record.get("pilot_only", False)) is False
         and bool(record.get("formal_ranking_exclude", False)) is False

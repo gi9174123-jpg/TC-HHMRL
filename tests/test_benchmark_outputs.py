@@ -271,7 +271,7 @@ def test_benchmark_supports_shin2024_and_dalal_baselines(tmp_path: Path):
     assert sac_dalal_rows[0]["runner"] == "sac_lagrangian"
     assert shin_rows[0]["baseline_family"] == "shin2024_matched"
     assert shin_rows[0]["exact_reproduction"] is False
-    assert shin_rows[0]["safety_protocol"] == "common_smooth_relaxed_projection"
+    assert shin_rows[0]["safety_protocol"] == "common_thermal_cap_projection"
     assert shin_rows[0]["lower_learned_action_dim"] == 2
     assert shin_rows[0]["fixed_mode_exec"] == 2
     assert shin_rows[0]["fixed_current_template"] == "tanh_affine_fraction"
@@ -286,7 +286,7 @@ def test_benchmark_supports_shin2024_and_dalal_baselines(tmp_path: Path):
     sac_dalal_cfg = yaml.safe_load(Path(sac_dalal_rows[0]["resolved_config"]).read_text(encoding="utf-8"))
     assert int(shin_cfg["agent"]["z_dim"]) == 0
     assert bool(shin_cfg["context"]["enabled"]) is False
-    assert shin_cfg["safety"]["projection_mode"] == "smooth_relaxed"
+    assert shin_cfg["safety"]["projection_mode"] == "thermal_cap"
     assert shin_cfg["safety"]["action_decode_mode"] == "tanh_affine"
     assert shin_cfg["lower_ddpg"]["action_contract"] == "rho_tau_fixed_current"
     assert int(shin_cfg["lower_ddpg"]["learned_action_dim"]) == 2
@@ -337,7 +337,7 @@ def test_statistics_contract_trusts_pvalue_only_with_two_or_more_pairs():
                     "alignment_version": "system_model_v1",
                     "task_summary_version": "site_v2",
                     "pre_alignment": False,
-                    "projection_mode": "smooth_relaxed",
+                    "projection_mode": "thermal_cap",
                     "action_decode_mode": "tanh_affine",
                 }
             )
@@ -386,7 +386,7 @@ def test_statistics_excludes_pilot_sensitivity_rows_even_if_ordered():
                 "alignment_version": "system_model_v1",
                 "task_summary_version": "site_v2",
                 "pre_alignment": False,
-                "projection_mode": "thermal_cap" if variant == "hybrid_thermal_cap" else "smooth_relaxed",
+                "projection_mode": "smooth_relaxed" if variant == "hybrid_smooth_relaxed" else "thermal_cap",
                 "action_decode_mode": "tanh_affine",
                 "pilot_only": is_pilot,
                 "formal_ranking_exclude": is_pilot,

@@ -41,7 +41,7 @@ class SafetyLayer:
         safety_cfg = cfg["safety"]
         env_cfg = cfg.get("env", {})
         hybrid_cfg = env_cfg.get("hybrid", {})
-        self.projection_mode = str(safety_cfg.get("projection_mode", "smooth_relaxed")).lower()
+        self.projection_mode = str(safety_cfg.get("projection_mode", "thermal_cap")).lower()
         if self.projection_mode not in {"smooth", "smooth_relaxed", "thermal_cap", "hard_clip", "dalal_safe"}:
             raise ValueError(f"unsupported safety.projection_mode={self.projection_mode}")
         self.action_decode_mode = str(safety_cfg.get("action_decode_mode", "tanh_affine")).lower()

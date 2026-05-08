@@ -303,7 +303,7 @@ def apply_baseline_overrides(cfg: Dict, baseline: str) -> None:
         cfg["baseline_metadata"] = {
             "baseline_family": "shin2024_matched",
             "exact_reproduction": False,
-            "safety_protocol": f"common_{cfg.get('safety', {}).get('projection_mode', 'smooth_relaxed')}_projection",
+            "safety_protocol": f"common_{cfg.get('safety', {}).get('projection_mode', 'thermal_cap')}_projection",
             "lower_learned_action_dim": 2,
             "fixed_mode_exec": 2,
             "fixed_mode_name": "HY",
@@ -3272,6 +3272,7 @@ def run_one_scenario(
             }
         )
 
+    common_projection_protocol = f"common_{base_cfg.get('safety', {}).get('projection_mode', 'thermal_cap')}_projection"
     variant_definitions = {}
     for spec in exp_specs:
         label = str(spec["label"])
@@ -3296,7 +3297,7 @@ def run_one_scenario(
                 "baseline_family": "sac_dalal_safe" if is_sac_dalal else "sac_lagrangian",
                 "exact_reproduction": False if is_sac_dalal else None,
                 "external_baseline": True if is_sac_dalal else None,
-                "safety_protocol": "dalal_style_projection" if is_sac_dalal else "common_smooth_relaxed_projection",
+                "safety_protocol": "dalal_style_projection" if is_sac_dalal else common_projection_protocol,
                 "comparison_role": "external_safety_layer_baseline" if is_sac_dalal else "learning_baseline",
                 "description": (
                     "SAC-style external safety-layer baseline with context/meta/dual disabled and Dalal-style action correction."
@@ -3313,7 +3314,7 @@ def run_one_scenario(
                 "tx_enabled": [1.0, 1.0, 1.0],
                 "baseline_family": "shin2024_matched",
                 "exact_reproduction": False,
-                "safety_protocol": "common_smooth_relaxed_projection",
+                "safety_protocol": common_projection_protocol,
                 "lower_learned_action_dim": 2,
                 "fixed_mode_exec": 2,
                 "fixed_mode_name": "HY",
