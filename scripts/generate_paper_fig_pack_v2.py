@@ -129,6 +129,7 @@ def detect_thermal_source():
 
 def savefig(fig: plt.Figure, stem: str):
     fig.savefig(OUT / f'{stem}.png', bbox_inches='tight', facecolor='white', dpi=320)
+    fig.savefig(OUT / f'{stem}.pdf', bbox_inches='tight', facecolor='white')
     fig.savefig(OUT / f'{stem}.svg', bbox_inches='tight', facecolor='white')
     plt.close(fig)
 
@@ -237,26 +238,24 @@ methods_fig3_pref = ['hybrid', 'single_led', 'single_ld', 'shin2024_matched']
 methods_fig3 = [m for m in methods_fig3_pref if all((s, m) in bench_stats for s in SCENARIOS)]
 if not methods_fig3:
     raise RuntimeError('No formally comparable methods available for Fig. 3')
-metrics_fig = [
-    ('eval_reward', 'Reward'),
-    ('eval_se', 'SE'),
-    ('eval_eh', 'EH'),
-    ('eval_cost', 'Cost'),
-    ('eval_violation_rate', 'Violation Rate'),
+metrics_fig3 = [
+    ('eval_se', '(a) Spectral Efficiency'),
+    ('eval_eh', '(b) Harvested Energy'),
+    ('eval_violation_rate', '(c) Violation Rate'),
 ]
-fig, axes = plt.subplots(1, 5, figsize=(44.0, 12.5), dpi=220, constrained_layout=True)
+fig, axes = plt.subplots(1, 3, figsize=(31.0, 11.5), dpi=220, constrained_layout=True)
 width = min(0.80 / max(len(methods_fig3), 1), 0.22)
 x = np.arange(len(SCENARIOS))
 legend_handles = None
 offset_center = (len(methods_fig3) - 1) / 2.0
-for ax, (metric, title) in zip(axes, metrics_fig):
+for ax, (metric, title) in zip(axes, metrics_fig3):
     local_handles = []
     for i, method in enumerate(methods_fig3):
         means = [bench_stats[(s, method)][metric]['mean'] for s in SCENARIOS]
         stds = [bench_stats[(s, method)][metric]['std'] for s in SCENARIOS]
         xpos = x + (i - offset_center) * width
         plot_means = means[:]
-        if metric in ['eval_cost', 'eval_violation_rate']:
+        if metric == 'eval_violation_rate':
             plot_means = [max(v, 1e-5) for v in plot_means]
         bars = ax.bar(
             xpos,
@@ -272,39 +271,44 @@ for ax, (metric, title) in zip(axes, metrics_fig):
     style_bar_axis(ax, title, scientific_y=(metric == 'eval_eh'))
     ax.set_xticks(x)
     ax.set_xticklabels(SCENARIO_LABELS)
-    if metric in ['eval_cost', 'eval_violation_rate']:
-        ax.set_yscale('symlog', linthresh=1e-4)
+    if metric == 'eval_violation_rate':
+        ax.set_yscale('log')
     if legend_handles is None:
         legend_handles = local_handles
 fig.legend(
     legend_handles,
     [LABELS[m] for m in methods_fig3],
-    loc='lower center',
-    bbox_to_anchor=(0.5, -0.08),
+    loc='upper center',
+    bbox_to_anchor=(0.5, 1.06),
     ncol=min(len(methods_fig3), 4),
     frameon=False,
 )
 fig.set_constrained_layout_pads(w_pad=4 / 72, h_pad=6 / 72, hspace=0.04, wspace=0.08)
-savefig(fig, 'Fig3_main_benchmark_overall')
-with open(OUT / 'Fig3_main_benchmark_overall.csv', 'w', newline='') as f:
+savefig(fig, 'Fig3_structural_SE_EH_violation_3panel')
+with open(OUT / 'Fig3_structural_SE_EH_violation_3panel.csv', 'w', newline='') as f:
     w = csv.writer(f)
-    w.writerow(['scenario', 'variant', 'reward_mean', 'reward_std', 'se_mean', 'se_std', 'eh_mean', 'eh_std', 'cost_mean', 'cost_std', 'violation_mean', 'violation_std'])
+    w.writerow(['scenario', 'variant', 'se_mean', 'se_std', 'eh_mean', 'eh_std', 'violation_mean', 'violation_std'])
     for s in SCENARIOS:
         for method in methods_fig3:
             w.writerow([
                 s,
                 method,
-                bench_stats[(s, method)]['eval_reward']['mean'],
-                bench_stats[(s, method)]['eval_reward']['std'],
                 bench_stats[(s, method)]['eval_se']['mean'],
                 bench_stats[(s, method)]['eval_se']['std'],
                 bench_stats[(s, method)]['eval_eh']['mean'],
                 bench_stats[(s, method)]['eval_eh']['std'],
-                bench_stats[(s, method)]['eval_cost']['mean'],
-                bench_stats[(s, method)]['eval_cost']['std'],
                 bench_stats[(s, method)]['eval_violation_rate']['mean'],
                 bench_stats[(s, method)]['eval_violation_rate']['std'],
             ])
+
+# Fig. 4 and the remaining compact result panels keep the full metric set.
+metrics_fig = [
+    ('eval_reward', 'Reward'),
+    ('eval_se', 'SE'),
+    ('eval_eh', 'EH'),
+    ('eval_cost', 'Cost'),
+    ('eval_violation_rate', 'Violation Rate'),
+]
 
 # Fig. 4
 FIG4_RUN_SUMMARY = pick_first_existing(
