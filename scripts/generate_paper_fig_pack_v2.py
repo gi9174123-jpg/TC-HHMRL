@@ -16,6 +16,7 @@ from mpl_toolkits.axes_grid1.inset_locator import inset_axes
 from tchhmrl.envs.task_contract import filter_formal_ranking_records, filter_formally_comparable_records
 
 ROOT = Path('/Users/lja/Desktop/TC-HHMRL /TC-HHMRL')
+OFFICIAL = ROOT / 'paper_official_data'
 OUT = ROOT / 'logs' / 'paper_fig_pack_v2'
 OUT.mkdir(parents=True, exist_ok=True)
 
@@ -116,9 +117,14 @@ def scenario_dir_from_summary(run_summary: Path, scenario: str) -> Path:
 
 def detect_thermal_source():
     candidates = [
+        (OFFICIAL / 'fig6_fig7_thermal_rebalanced_10seeds_gpu' / 'run_summary.json', 'thermal_rebalanced'),
+        (OFFICIAL / 'thermal_rebalanced_targeted' / 'run_summary.json', 'thermal_rebalanced'),
+        (OFFICIAL / 'thermal_rebalanced_targeted_v2' / 'run_summary.json', 'thermal_rebalanced'),
+        (ROOT / 'logs' / 'fig6_fig7_thermal_rebalanced_10seeds_gpu' / 'run_summary.json', 'thermal_rebalanced'),
         (ROOT / 'logs' / 'thermal_rebalanced_targeted' / 'run_summary.json', 'thermal_rebalanced'),
         (ROOT / 'logs' / 'thermal_rebalanced_targeted_v2' / 'run_summary.json', 'thermal_rebalanced'),
         (ROOT / 'logs' / 'thermal_rebalanced_targeted_v1' / 'run_summary.json', 'thermal_rebalanced'),
+        (OFFICIAL / 'thermal_extreme_targeted_v2' / 'run_summary.json', 'thermal_extreme'),
         (ROOT / 'logs' / 'thermal_extreme_targeted_v2' / 'run_summary.json', 'thermal_extreme'),
     ]
     for run_summary, scenario_name in candidates:
@@ -228,7 +234,9 @@ def style_bar_axis(ax, title: str, scientific_y: bool = False):
 # Fig. 3
 FIG3_RUN_SUMMARY = pick_first_existing(
     [
+        OFFICIAL / 'fig3_structural_thermal_cap_10seeds_gpu' / 'run_summary.json',
         ROOT / 'logs' / 'fig3_structural_thermal_cap_10seeds_gpu' / 'run_summary.json',
+        OFFICIAL / 'fig3_structural_10seeds_gpu' / 'run_summary.json',
         ROOT / 'logs' / 'fig3_structural_10seeds_gpu' / 'run_summary.json',
         ROOT / 'logs' / 'bench_cpu_full' / 'run_summary.json',
     ]
@@ -313,7 +321,9 @@ metrics_fig = [
 # Fig. 4
 FIG4_RUN_SUMMARY = pick_first_existing(
     [
+        OFFICIAL / 'fig4_hard_stress_thermal_cap_10seeds_gpu' / 'run_summary.json',
         ROOT / 'logs' / 'fig4_hard_stress_thermal_cap_10seeds_gpu' / 'run_summary.json',
+        OFFICIAL / 'fig4_hard_stress_targeted_10seeds_gpu' / 'run_summary.json',
         ROOT / 'logs' / 'fig4_hard_stress_targeted_10seeds_gpu' / 'run_summary.json',
         ROOT / 'logs' / 'hard_stress_full_ablation_baseline_v2' / 'run_summary.json',
     ]
