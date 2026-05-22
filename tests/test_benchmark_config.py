@@ -22,6 +22,10 @@ from tchhmrl.utils.config import load_cfg
 def test_default_safety_uses_corrected_action_mapping_and_main_projection():
     cfg = load_cfg("configs/default.yaml")
 
+    assert cfg["physics"]["physics_version"] == "physics_v2"
+    assert cfg["physics"]["eh_model"] == "logistic"
+    assert cfg["physics"]["thermal_model"] == "coupled"
+    assert cfg["physics"]["safety_projection_version"] == "coupled_thermal_cap_v1"
     assert cfg["safety"]["projection_mode"] == "thermal_cap"
     assert cfg["safety"]["action_decode_mode"] == "tanh_affine"
     assert float(cfg["safety"]["smooth_relaxed_margin_c"]) == 1.0
@@ -283,3 +287,17 @@ def test_baseline_sac_dalal_safe_disables_meta_dual_and_sets_metadata():
     assert cfg["baseline_metadata"]["external_baseline"] is True
     assert cfg["baseline_metadata"]["safety_protocol"] == "dalal_style_projection"
     assert cfg["baseline_metadata"]["comparison_role"] == "external_safety_layer_baseline"
+
+
+def test_baseline_mpc_lite_oracle_sets_metadata():
+    cfg = copy.deepcopy(load_cfg("configs/default.yaml"))
+    apply_baseline_overrides(cfg, "mpc_lite_oracle")
+
+    meta = cfg["baseline_metadata"]
+    assert meta["baseline_family"] == "mpc_lite_oracle"
+    assert meta["uses_task_oracle"] is True
+    assert meta["uses_learned_policy"] is False
+    assert meta["uses_same_safety_projection"] is True
+    assert int(meta["horizon"]) == 1
+    assert int(meta["candidate_count"]) == 256
+    assert meta["comparison_role"] == "model_based_optimizer"

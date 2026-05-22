@@ -62,6 +62,24 @@ LABELS = {
 SCENARIOS = ['moderate_practical', 'hard_stress', 'channel_harsh']
 SCENARIO_LABELS = ['Moderate\nPractical', 'Hard\nStress', 'Channel\nHarsh']
 
+PHYSICS_GUARD_FIELDS = [
+    'physics_version',
+    'eh_model',
+    'thermal_model',
+    'safety_projection_version',
+    'thermal_coupling_matrix_hash',
+    'eh_calibration_hash',
+]
+
+
+def assert_single_physics_context(rows, source: Path) -> None:
+    if not rows:
+        raise ValueError(f'No formal Physics-v2 rows found in {source}')
+    for field in PHYSICS_GUARD_FIELDS:
+        values = {str(row.get(field, '')) for row in rows}
+        if len(values) != 1 or '' in values:
+            raise ValueError(f'{source} mixes incompatible {field}: {sorted(values)}')
+
 
 def grouped_stats_from_run_summary(path: Path):
     with path.open('r', encoding='utf-8') as f:
@@ -69,6 +87,7 @@ def grouped_stats_from_run_summary(path: Path):
             filter_formally_comparable_records(json.load(f), strict=True),
             strict=False,
         )
+    assert_single_physics_context(data, path)
     grouped = defaultdict(lambda: defaultdict(list))
     for row in data:
         key = (row['scenario'], row['variant'])
@@ -97,10 +116,12 @@ def grouped_stats_from_run_summary(path: Path):
 
 def load_formal_run_summary(path: Path):
     with path.open('r', encoding='utf-8') as f:
-        return filter_formal_ranking_records(
+        rows = filter_formal_ranking_records(
             filter_formally_comparable_records(json.load(f), strict=True),
             strict=False,
         )
+    assert_single_physics_context(rows, path)
+    return rows
 
 
 def pick_first_existing(candidates):

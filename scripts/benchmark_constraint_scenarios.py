@@ -30,6 +30,7 @@ from tchhmrl.envs.task_contract import (
     is_formal_ranking_record,
     is_formally_comparable_record,
     ordered_task_batch_hash,
+    physics_snapshot_from_cfg,
     task_batch_hash,
     task_defaults_from_cfg,
     task_distribution_summary,
@@ -88,6 +89,13 @@ def alignment_snapshot(cfg: Dict, *, pre_alignment: bool | None = None, task_sou
         "task_summary_version": str(alignment_cfg.get("task_summary_version", "site_v2")),
         "pre_alignment": bool(alignment_cfg.get("pre_alignment", False) if pre_alignment is None else pre_alignment),
         "task_source": str(task_source or infer_task_source(cfg)),
+    }
+
+
+def formal_metadata_snapshot(cfg: Dict, *, pre_alignment: bool | None = None, task_source: str | None = None) -> Dict[str, object]:
+    return {
+        **alignment_snapshot(cfg, pre_alignment=pre_alignment, task_source=task_source),
+        **physics_snapshot_from_cfg(cfg),
     }
 
 
@@ -316,6 +324,22 @@ def apply_baseline_overrides(cfg: Dict, baseline: str) -> None:
         cfg.setdefault("safety", {})["projection_mode"] = "dalal_safe"
         return
     if baseline == "heuristic_safe":
+        return
+    if baseline in {"mpc_lite_oracle", "mpc_lite"}:
+        cfg.setdefault("mpc_lite", {})
+        cfg["mpc_lite"]["horizon"] = 1
+        cfg["mpc_lite"]["candidate_count"] = int(cfg["mpc_lite"].get("candidate_count", 256))
+        cfg["baseline_metadata"] = {
+            "baseline_family": "mpc_lite_oracle",
+            "uses_task_oracle": True,
+            "uses_learned_policy": False,
+            "uses_same_safety_projection": True,
+            "horizon": 1,
+            "candidate_count": int(cfg["mpc_lite"]["candidate_count"]),
+            "exact_reproduction": False,
+            "external_baseline": True,
+            "comparison_role": "model_based_optimizer",
+        }
         return
     raise ValueError(f"Unknown baseline override target: {baseline}")
 
@@ -706,6 +730,7 @@ def validate_training_config(cfg: Dict, scenario: str, *, strict_thermal: bool =
     env_cfg = cfg.get("env", {})
     sampler_cfg = cfg.get("sampler", {})
     alignment_cfg = alignment_snapshot(cfg)
+    physics_cfg = physics_snapshot_from_cfg(cfg)
     dual_enabled = bool(meta_cfg.get("dual_enabled", True))
 
     expected_dual_lrs = np.asarray([0.02, 0.05, 0.05, 0.05], dtype=np.float32)
@@ -740,6 +765,7 @@ def validate_training_config(cfg: Dict, scenario: str, *, strict_thermal: bool =
         "pre_alignment": bool(alignment_cfg["pre_alignment"]),
         "site_bank_valid": len(site_bank_issues) == 0,
         "site_bank_issues": site_bank_issues,
+        **physics_cfg,
     }
     checks["all_passed"] = bool(
         checks["dual_lrs_match"]
@@ -751,6 +777,12 @@ def validate_training_config(cfg: Dict, scenario: str, *, strict_thermal: bool =
         and checks["alignment_version"] == "system_model_v1"
         and checks["task_summary_version"] == "site_v2"
         and (checks["pre_alignment"] is False)
+        and checks["physics_version"] == "physics_v2"
+        and checks["eh_model"] == "logistic"
+        and checks["thermal_model"] == "coupled"
+        and checks["safety_projection_version"] == "coupled_thermal_cap_v1"
+        and bool(checks["thermal_coupling_matrix_hash"])
+        and bool(checks["eh_calibration_hash"])
     )
 
     if not checks["all_passed"]:
@@ -968,6 +1000,13 @@ def _safe_projection_aux(safe: Dict) -> Dict[str, object]:
         "thermal_cap_current": safe.get("thermal_cap_current"),
         "thermal_cap_scale": safe.get("thermal_cap_scale"),
         "thermal_cap_margin_c": safe.get("thermal_cap_margin_c"),
+        "thermal_coupling_term": safe.get("thermal_coupling_term"),
+        "thermal_base_coupled": safe.get("thermal_base_coupled"),
+        "thermal_pred_temp": safe.get("thermal_pred_temp"),
+        "thermal_pred_margin": safe.get("thermal_pred_margin"),
+        "thermal_model": safe.get("thermal_model"),
+        "thermal_coupling_matrix_hash": safe.get("thermal_coupling_matrix_hash"),
+        "safety_projection_version": safe.get("safety_projection_version"),
         "thermal_margin_min": safe.get("thermal_margin_min"),
         "action_decode_mode": safe.get("action_decode_mode"),
         "raw_current_frac": safe.get("raw_current_frac"),
@@ -1004,6 +1043,9 @@ def _projection_vector(aux: Dict, key: str, n: int = 3) -> np.ndarray:
 def _add_projection_diagnostics(row: Dict, aux: Dict, currents_exec: np.ndarray) -> None:
     projected_default = float(np.sum(np.asarray(currents_exec, dtype=np.float32)))
     row["action_decode_mode"] = str(aux.get("action_decode_mode", ""))
+    row["thermal_model"] = str(aux.get("thermal_model", ""))
+    row["thermal_coupling_matrix_hash"] = str(aux.get("thermal_coupling_matrix_hash", ""))
+    row["safety_projection_version"] = str(aux.get("safety_projection_version", ""))
     row["raw_current_total"] = _projection_scalar(aux, "raw_current_total")
     row["masked_current_total"] = _projection_scalar(aux, "masked_current_total")
     row["bus_projected_current_total"] = _projection_scalar(aux, "bus_projected_current_total")
@@ -1025,6 +1067,10 @@ def _add_projection_diagnostics(row: Dict, aux: Dict, currents_exec: np.ndarray)
         ("thermal_cap_current", "thermal_cap_current"),
         ("thermal_cap_scale", "thermal_cap_scale"),
         ("t_pred", "t_pred"),
+        ("thermal_coupling_term", "thermal_coupling_term"),
+        ("thermal_base_coupled", "thermal_base_coupled"),
+        ("thermal_pred_temp", "thermal_pred_temp"),
+        ("thermal_pred_margin", "thermal_pred_margin"),
     ]:
         arr = _projection_vector(aux, key)
         for tx_idx, val in enumerate(arr.tolist()):
@@ -1087,6 +1133,14 @@ def collect_env_data(
                     "alignment_version": str(getattr(env, "alignment_version", "system_model_v1")),
                     "task_summary_version": str(getattr(env, "task_summary_version", "site_v2")),
                     "pre_alignment": bool(getattr(env, "pre_alignment", False)),
+                    "physics_version": str(getattr(env, "physics_version", "")),
+                    "eh_model": str(info.get("eh_model", getattr(env, "eh_model", ""))),
+                    "thermal_model": str(info.get("thermal_model", getattr(env, "thermal_model", ""))),
+                    "safety_projection_version": str(getattr(env, "safety_projection_version", "")),
+                    "eh_calibration_hash": str(info.get("eh_calibration_hash", getattr(env, "eh_calibration_hash", ""))),
+                    "thermal_coupling_matrix_hash": str(
+                        info.get("thermal_coupling_matrix_hash", getattr(env, "thermal_coupling_matrix_hash", ""))
+                    ),
                     "distance_tx0": float(env.distances[0]),
                     "distance_tx1": float(env.distances[1]),
                     "distance_tx2": float(env.distances[2]),
@@ -1100,6 +1154,8 @@ def collect_env_data(
                     "snr": float(info["snr"]),
                     "qos_rate": float(info["qos_rate"]),
                     "eh_metric": float(info["eh_metric"]),
+                    "eh_input_eff": float(info.get("eh_input_eff", info["eh_metric"])),
+                    "eh_metric_linear_proxy": float(info.get("eh_metric_linear_proxy", info["eh_metric"])),
                     "info_share": float(info["info_share"]),
                     "eh_share": float(info["eh_share"]),
                     "se": float(info["se"]),
@@ -1108,6 +1164,10 @@ def collect_env_data(
                     "reward_se_term": float(info.get("reward_se_term", info["se"])),
                     "reward_eh_term": float(info.get("reward_eh_term", info["eh"])),
                     "reward_margin_term": float(info.get("reward_margin_term", 0.0)),
+                    "reward_cost_penalty": float(info.get("reward_cost_penalty", info.get("penalty_cost_term", 0.0))),
+                    "reward_power_penalty": float(
+                        info.get("reward_power_penalty", info.get("penalty_power_term", 0.0))
+                    ),
                     "penalty_cost_term": float(info.get("penalty_cost_term", 0.0)),
                     "penalty_power_term": float(info.get("penalty_power_term", 0.0)),
                     "penalty_smooth_term": float(info.get("penalty_smooth_term", 0.0)),
@@ -1338,6 +1398,7 @@ class SacLagrangianBaseline:
         self.alignment_version = str(alignment_cfg.get("alignment_version", "system_model_v1"))
         self.task_summary_version = str(alignment_cfg.get("task_summary_version", "site_v2"))
         self.pre_alignment = bool(alignment_cfg.get("pre_alignment", False))
+        self.physics_meta = physics_snapshot_from_cfg(self.cfg)
         self.loaded_alignment_meta = self._alignment_meta()
 
         self.batch_size = int(self.cfg["agent"]["batch_size"])
@@ -1369,6 +1430,7 @@ class SacLagrangianBaseline:
             "alignment_version": self.alignment_version,
             "task_summary_version": self.task_summary_version,
             "pre_alignment": bool(self.pre_alignment if pre_alignment is None else pre_alignment),
+            **self.physics_meta,
         }
 
     def is_formally_comparable(self) -> bool:
@@ -1766,6 +1828,7 @@ class Shin2024MatchedBaseline(SacLagrangianBaseline):
         self.alignment_version = str(alignment_cfg.get("alignment_version", "system_model_v1"))
         self.task_summary_version = str(alignment_cfg.get("task_summary_version", "site_v2"))
         self.pre_alignment = bool(alignment_cfg.get("pre_alignment", False))
+        self.physics_meta = physics_snapshot_from_cfg(self.cfg)
         self.loaded_alignment_meta = self._alignment_meta()
 
         lower_batch = int(self.cfg.get("lower_ddpg", {}).get("batch_size", self.cfg["agent"]["batch_size"]))
@@ -1897,6 +1960,163 @@ class Shin2024MatchedBaseline(SacLagrangianBaseline):
             "next_exec_map": next_exec_map.astype(np.float32),
         }
 
+
+class MpcLiteOracleBaseline:
+    """One-step model-informed optimizer baseline using current task/environment parameters."""
+
+    def __init__(self, cfg: Dict):
+        self.cfg = copy.deepcopy(cfg)
+        self.safety = SafetyLayer(self.cfg)
+        self.candidate_count = int(self.cfg.get("mpc_lite", {}).get("candidate_count", 256))
+        seed = int(self.cfg["experiment"]["seed"])
+        self.rng = np.random.default_rng(seed)
+        self.safety_mem = {"current_boost": 0, "dwell_count": self.cfg["safety"]["min_dwell_steps"]}
+
+    def reset_episode_state(self) -> None:
+        self.safety_mem = {"current_boost": 0, "dwell_count": self.cfg["safety"]["min_dwell_steps"]}
+
+    def train(self, meta_iters: int | None = None) -> Path:
+        log_dir = Path(self.cfg["experiment"]["log_dir"])
+        run_name = str(self.cfg["experiment"]["run_name"])
+        out = log_dir / run_name / "training.csv"
+        out.parent.mkdir(parents=True, exist_ok=True)
+        pd.DataFrame(
+            [
+                {
+                    "iter": 0.0,
+                    "query_reward": 0.0,
+                    "query_se": 0.0,
+                    "query_eh": 0.0,
+                    "query_cost": 0.0,
+                    "query_violation_rate": 0.0,
+                }
+            ]
+        ).to_csv(out, index=False)
+        return out
+
+    def save(self, ckpt_path: str | Path) -> None:
+        Path(ckpt_path).parent.mkdir(parents=True, exist_ok=True)
+        torch.save({"baseline_family": "mpc_lite_oracle"}, ckpt_path)
+
+    def load(self, ckpt_path: str | Path) -> None:
+        return None
+
+    def _score_safe_action(self, env: MultiTxUwSliptEnv, safe: Dict[str, object]) -> float:
+        currents = np.asarray(safe["currents_exec"], dtype=np.float32)
+        mode = int(safe["mode_exec"])
+        rho = float(safe["rho_exec"])
+        tau = float(safe["tau_exec"])
+        tx_signal = env._compute_tx_signal(currents)
+        signal_led = float(np.sum(tx_signal * env.tx_is_led))
+        signal_ld = float(np.sum(tx_signal * env.tx_is_ld))
+        se_tx_weight = env._tx_vector(env.se_led_weight, env.se_ld_weight)
+        eh_tx_weight = env._tx_vector(env.eh_led_weight, env.eh_ld_weight)
+        info_signal = float(np.sum(tx_signal * se_tx_weight))
+        eh_input = float(np.sum(tx_signal * eh_tx_weight))
+        noise_power = env.noise_floor + env.noise_led_coeff * abs(signal_led) + env.noise_ld_coeff * abs(signal_ld)
+        snr = max(info_signal / max(noise_power, 1.0e-6), 1.0e-6)
+        mode_se = env._mode_gain(mode, env.mode_se_gain)
+        mode_eh = env._mode_gain(mode, env.mode_eh_gain)
+        if mode == 0:
+            info_share, eh_share = 1.0 - rho, rho
+        elif mode == 1:
+            info_share, eh_share = tau, 1.0 - tau
+        else:
+            info_share = tau * (1.0 - rho)
+            eh_share = 1.0 - info_share
+        qos_rate = float(mode_se * info_share * np.log2(1.0 + snr))
+        eh_input_eff = float(mode_eh * eh_share * eh_input)
+        eh_metric = env._compute_eh_metric(eh_input_eff)
+        thermal_coeff = env._tx_vector(env.thermal_led_coeff, env.thermal_ld_coeff)
+        coupling = env._thermal_coupling_term(env.temps)
+        thermal_base = (1.0 - env.gamma) * env.temps + env.gamma * env.amb_temp + coupling
+        temps_next = thermal_base + env.delta * thermal_coeff * (currents**2)
+        thermal_violation = np.maximum(temps_next - env.thermal_safe, 0.0)
+        qos_violation = max(env.qos_min_rate - qos_rate, 0.0)
+        cost = float(qos_violation + float(np.sum(thermal_violation)))
+        power_penalty = float(np.sum(currents**2))
+        margin_norm = float(
+            np.clip((env.thermal_safe - float(np.max(temps_next))) / max(env.thermal_safe, 1.0e-6), 0.0, 1.0)
+        )
+        return float(
+            env.se_weight * qos_rate
+            + env.eh_weight * eh_metric
+            + env.thermal_margin_weight * margin_norm
+            - env.cost_weight * cost
+            - env.power_weight * power_penalty
+        )
+
+    def _candidate_lower_raw(self, env: MultiTxUwSliptEnv, n: int) -> np.ndarray:
+        random_frac = self.rng.uniform(0.0, 1.0, size=(max(n - 6, 0), 5)).astype(np.float32)
+        templates = np.asarray(
+            [
+                [0.35, 0.35, 0.35, 0.20, 0.85],
+                [0.55, 0.55, 0.55, 0.20, 0.85],
+                [0.75, 0.75, 0.75, 0.15, 0.90],
+                [0.45, 0.25, 0.25, 0.25, 0.80],
+                [0.70, 0.35, 0.35, 0.20, 0.90],
+                [0.90, 0.50, 0.50, 0.10, 0.95],
+            ],
+            dtype=np.float32,
+        )
+        frac = np.vstack([templates, random_frac])[:n]
+        return raw_from_frac01(frac, self.safety.action_decode_mode).astype(np.float32)
+
+    def act(self, obs: np.ndarray, env: MultiTxUwSliptEnv, eval_mode: bool = False) -> tuple[Dict, Dict]:
+        del obs, eval_mode
+        per_upper = max(4, int(math.ceil(self.candidate_count / 12)))
+        lower_candidates = self._candidate_lower_raw(env, per_upper)
+        best_score = -float("inf")
+        best_raw = 0
+        best_lower = lower_candidates[0]
+        for upper_raw in range(12):
+            for lower_raw in lower_candidates:
+                safe, _ = self.safety.project_np(
+                    upper_raw,
+                    lower_raw,
+                    temps=env.temps.copy().astype(np.float32),
+                    amb_temp=env.amb_temp,
+                    gamma=env.gamma,
+                    delta=env.delta,
+                    mem=dict(self.safety_mem),
+                )
+                score = self._score_safe_action(env, safe)
+                if score > best_score:
+                    best_score = score
+                    best_raw = upper_raw
+                    best_lower = lower_raw.astype(np.float32)
+        safe, self.safety_mem = self.safety.project_np(
+            best_raw,
+            best_lower,
+            temps=env.temps.copy().astype(np.float32),
+            amb_temp=env.amb_temp,
+            gamma=env.gamma,
+            delta=env.delta,
+            mem=self.safety_mem,
+        )
+        action = {
+            "upper_idx": int(best_raw),
+            "upper_idx_exec": int(safe["upper_idx_exec"]),
+            "boost_combo_exec": int(safe["boost_combo_exec"]),
+            "mode_exec": int(safe["mode_exec"]),
+            "currents_exec": safe["currents_exec"],
+            "rho_exec": np.asarray([safe["rho_exec"]], dtype=np.float32),
+            "tau_exec": np.asarray([safe["tau_exec"]], dtype=np.float32),
+        }
+        aux = {
+            "upper_idx_raw": int(best_raw),
+            "upper_idx_exec": int(safe["upper_idx_exec"]),
+            "boost_combo_exec": int(safe["boost_combo_exec"]),
+            "mode_exec": int(safe["mode_exec"]),
+            "act_raw": best_lower.astype(np.float32),
+            "act_exec": np.concatenate(
+                [safe["currents_exec"], np.asarray([safe["rho_exec"], safe["tau_exec"]], dtype=np.float32)]
+            ).astype(np.float32),
+            "mpc_lite_score": float(best_score),
+        }
+        aux.update(_safe_projection_aux(safe))
+        return action, aux
+
 def _run_heuristic_episode(trainer: MetaTrainer, env: MultiTxUwSliptEnv) -> Dict[str, float | np.ndarray]:
     obs, _ = env.reset()
     trainer.agent.reset_episode_state()
@@ -1958,6 +2178,54 @@ def evaluate_heuristic_on_tasks(
         env = MultiTxUwSliptEnv(cfg, overrides=task.to_env_overrides())
         for _ in range(episodes_per_task):
             stats.append(_run_heuristic_episode(trainer, env))
+    return {
+        "reward": float(np.mean([s["reward"] for s in stats])),
+        "se": float(np.mean([s["se"] for s in stats])),
+        "eh": float(np.mean([s["eh"] for s in stats])),
+        "cost": float(np.mean([s["cost"] for s in stats])),
+        "violation_rate": float(np.mean([s["violation_rate"] for s in stats])),
+        "len": float(np.mean([s["len"] for s in stats])),
+    }
+
+
+def _run_mpc_lite_episode(policy: MpcLiteOracleBaseline, env: MultiTxUwSliptEnv) -> Dict[str, float]:
+    obs, _ = env.reset()
+    policy.reset_episode_state()
+    done = False
+    ep_reward = ep_se = ep_eh = ep_cost = ep_viol = 0.0
+    ep_len = 0
+    while not done:
+        action, _ = policy.act(obs, env, eval_mode=True)
+        next_obs, reward, terminated, truncated, info = env.step(action)
+        done = bool(terminated or truncated)
+        obs = next_obs
+        ep_reward += float(reward)
+        ep_se += float(info["se"])
+        ep_eh += float(info["eh"])
+        ep_cost += float(info["cost"])
+        ep_viol += float(np.any(np.asarray(info.get("cost_vec", [info["cost"]]), dtype=np.float32) > 0.0))
+        ep_len += 1
+    return {
+        "reward": ep_reward / max(ep_len, 1),
+        "se": ep_se / max(ep_len, 1),
+        "eh": ep_eh / max(ep_len, 1),
+        "cost": ep_cost / max(ep_len, 1),
+        "violation_rate": ep_viol / max(ep_len, 1),
+        "len": float(ep_len),
+    }
+
+
+def evaluate_mpc_lite_on_tasks(
+    policy: MpcLiteOracleBaseline,
+    cfg: Dict,
+    tasks,
+    episodes_per_task: int,
+) -> Dict[str, float]:
+    stats = []
+    for task in tasks:
+        env = MultiTxUwSliptEnv(cfg, overrides=task.to_env_overrides())
+        for _ in range(episodes_per_task):
+            stats.append(_run_mpc_lite_episode(policy, env))
     return {
         "reward": float(np.mean([s["reward"] for s in stats])),
         "se": float(np.mean([s["se"] for s in stats])),
@@ -2041,6 +2309,14 @@ def collect_env_data_heuristic(
                     "alignment_version": str(getattr(env, "alignment_version", "system_model_v1")),
                     "task_summary_version": str(getattr(env, "task_summary_version", "site_v2")),
                     "pre_alignment": bool(getattr(env, "pre_alignment", False)),
+                    "physics_version": str(getattr(env, "physics_version", "")),
+                    "eh_model": str(info.get("eh_model", getattr(env, "eh_model", ""))),
+                    "thermal_model": str(info.get("thermal_model", getattr(env, "thermal_model", ""))),
+                    "safety_projection_version": str(getattr(env, "safety_projection_version", "")),
+                    "eh_calibration_hash": str(info.get("eh_calibration_hash", getattr(env, "eh_calibration_hash", ""))),
+                    "thermal_coupling_matrix_hash": str(
+                        info.get("thermal_coupling_matrix_hash", getattr(env, "thermal_coupling_matrix_hash", ""))
+                    ),
                     "distance_tx0": float(env.distances[0]),
                     "distance_tx1": float(env.distances[1]),
                     "distance_tx2": float(env.distances[2]),
@@ -2054,6 +2330,8 @@ def collect_env_data_heuristic(
                     "snr": float(info["snr"]),
                     "qos_rate": float(info["qos_rate"]),
                     "eh_metric": float(info["eh_metric"]),
+                    "eh_input_eff": float(info.get("eh_input_eff", info["eh_metric"])),
+                    "eh_metric_linear_proxy": float(info.get("eh_metric_linear_proxy", info["eh_metric"])),
                     "info_share": float(info["info_share"]),
                     "eh_share": float(info["eh_share"]),
                     "se": float(info["se"]),
@@ -2062,6 +2340,10 @@ def collect_env_data_heuristic(
                     "reward_se_term": float(info.get("reward_se_term", info["se"])),
                     "reward_eh_term": float(info.get("reward_eh_term", info["eh"])),
                     "reward_margin_term": float(info.get("reward_margin_term", 0.0)),
+                    "reward_cost_penalty": float(info.get("reward_cost_penalty", info.get("penalty_cost_term", 0.0))),
+                    "reward_power_penalty": float(
+                        info.get("reward_power_penalty", info.get("penalty_power_term", 0.0))
+                    ),
                     "penalty_cost_term": float(info.get("penalty_cost_term", 0.0)),
                     "penalty_power_term": float(info.get("penalty_power_term", 0.0)),
                     "penalty_smooth_term": float(info.get("penalty_smooth_term", 0.0)),
@@ -2136,6 +2418,14 @@ def collect_env_data_plain_hierarchical_baseline(
                     "alignment_version": str(getattr(env, "alignment_version", "system_model_v1")),
                     "task_summary_version": str(getattr(env, "task_summary_version", "site_v2")),
                     "pre_alignment": bool(getattr(env, "pre_alignment", False)),
+                    "physics_version": str(getattr(env, "physics_version", "")),
+                    "eh_model": str(info.get("eh_model", getattr(env, "eh_model", ""))),
+                    "thermal_model": str(info.get("thermal_model", getattr(env, "thermal_model", ""))),
+                    "safety_projection_version": str(getattr(env, "safety_projection_version", "")),
+                    "eh_calibration_hash": str(info.get("eh_calibration_hash", getattr(env, "eh_calibration_hash", ""))),
+                    "thermal_coupling_matrix_hash": str(
+                        info.get("thermal_coupling_matrix_hash", getattr(env, "thermal_coupling_matrix_hash", ""))
+                    ),
                     "distance_tx0": float(env.distances[0]),
                     "distance_tx1": float(env.distances[1]),
                     "distance_tx2": float(env.distances[2]),
@@ -2149,6 +2439,8 @@ def collect_env_data_plain_hierarchical_baseline(
                     "snr": float(info["snr"]),
                     "qos_rate": float(info["qos_rate"]),
                     "eh_metric": float(info["eh_metric"]),
+                    "eh_input_eff": float(info.get("eh_input_eff", info["eh_metric"])),
+                    "eh_metric_linear_proxy": float(info.get("eh_metric_linear_proxy", info["eh_metric"])),
                     "info_share": float(info["info_share"]),
                     "eh_share": float(info["eh_share"]),
                     "se": float(info["se"]),
@@ -2157,6 +2449,10 @@ def collect_env_data_plain_hierarchical_baseline(
                     "reward_se_term": float(info.get("reward_se_term", info["se"])),
                     "reward_eh_term": float(info.get("reward_eh_term", info["eh"])),
                     "reward_margin_term": float(info.get("reward_margin_term", 0.0)),
+                    "reward_cost_penalty": float(info.get("reward_cost_penalty", info.get("penalty_cost_term", 0.0))),
+                    "reward_power_penalty": float(
+                        info.get("reward_power_penalty", info.get("penalty_power_term", 0.0))
+                    ),
                     "penalty_cost_term": float(info.get("penalty_cost_term", 0.0)),
                     "penalty_power_term": float(info.get("penalty_power_term", 0.0)),
                     "penalty_smooth_term": float(info.get("penalty_smooth_term", 0.0)),
@@ -2199,6 +2495,26 @@ def collect_env_data_sac_lagrangian(
 ) -> pd.DataFrame:
     return collect_env_data_plain_hierarchical_baseline(
         trainer=trainer,
+        cfg=cfg,
+        scenario=scenario,
+        variant=variant,
+        seed=seed,
+        tasks=tasks,
+        episodes_per_task=episodes_per_task,
+    )
+
+
+def collect_env_data_mpc_lite(
+    policy: MpcLiteOracleBaseline,
+    cfg: Dict,
+    scenario: str,
+    variant: str,
+    seed: int,
+    tasks,
+    episodes_per_task: int,
+) -> pd.DataFrame:
+    return collect_env_data_plain_hierarchical_baseline(
+        trainer=policy,  # type: ignore[arg-type]
         cfg=cfg,
         scenario=scenario,
         variant=variant,
@@ -2511,7 +2827,7 @@ STAT_METRIC_FIELDS = {
 }
 
 MAIN_BENCHMARK_SCENARIOS = ("moderate_practical", "hard_stress", "channel_harsh")
-STRUCTURAL_VARIANT_ORDER = ("hybrid", "single_led", "single_ld", "shin2024_matched")
+STRUCTURAL_VARIANT_ORDER = ("hybrid", "single_led", "single_ld", "shin2024_matched", "mpc_lite_oracle")
 HARD_TARGETED_VARIANT_ORDER = (
     "hybrid",
     "hybrid_wo_meta",
@@ -2522,6 +2838,7 @@ HARD_TARGETED_VARIANT_ORDER = (
     "shin2024_matched",
     "sac_dalal_safe",
     "dalal2018_safe",
+    "mpc_lite_oracle",
 )
 THERMAL_VARIANT_ORDER = (
     "hybrid",
@@ -2531,6 +2848,7 @@ THERMAL_VARIANT_ORDER = (
     "shin2024_matched",
     "sac_dalal_safe",
     "dalal2018_safe",
+    "mpc_lite_oracle",
 )
 
 PAIRING_KEY_FIELDS = ("scenario", "seed", "eval_task_batch_hash", "ordered_eval_task_batch_hash")
@@ -2641,6 +2959,18 @@ def build_statistics_artifact(
     ]
     if not filtered:
         return None
+    guard_fields = [
+        "physics_version",
+        "eh_model",
+        "thermal_model",
+        "safety_projection_version",
+        "thermal_coupling_matrix_hash",
+        "eh_calibration_hash",
+    ]
+    for field in guard_fields:
+        values = {str(row.get(field, "")) for row in filtered}
+        if len(values) != 1 or "" in values:
+            raise ValueError(f"{artifact_name} mixes incompatible {field}: {sorted(values)}")
 
     grouped_payload: Dict[str, Dict[str, Dict[str, float]]] = {}
     pairwise_payload: Dict[str, List[Dict[str, object]]] = {}
@@ -2841,6 +3171,8 @@ def run_one_scenario(
             "sac_dalal_safe",
             "shin2024_matched",
             "dalal2018_safe",
+            "mpc_lite_oracle",
+            "mpc_lite",
         }:
             raise ValueError(f"Unknown baseline: {baseline}")
         if baseline == "heuristic_safe":
@@ -2851,6 +3183,9 @@ def run_one_scenario(
             baseline_override = baseline
         elif baseline == "shin2024_matched":
             runner = "shin2024_matched"
+            baseline_override = baseline
+        elif baseline in {"mpc_lite_oracle", "mpc_lite"}:
+            runner = "mpc_lite"
             baseline_override = baseline
         else:
             runner = "trainer"
@@ -2880,7 +3215,7 @@ def run_one_scenario(
     apply_scenario(precheck_cfg, scenario)
     strict_thermal = scenario in {"moderate_practical", "thermal_moderate", "practical_hard"}
     precheck_result = validate_training_config(precheck_cfg, scenario, strict_thermal=strict_thermal)
-    precheck_result.update(alignment_snapshot(precheck_cfg))
+    precheck_result.update(formal_metadata_snapshot(precheck_cfg))
     precheck_result["task_distribution"] = task_distribution_summary(precheck_cfg)
     precheck_path = scenario_dir / "precheck.json"
     with precheck_path.open("w", encoding="utf-8") as f:
@@ -2972,6 +3307,8 @@ def run_one_scenario(
                 trainer = SacLagrangianBaseline(cfg)
             elif runner == "shin2024_matched":
                 trainer = Shin2024MatchedBaseline(cfg)
+            elif runner == "mpc_lite":
+                trainer = MpcLiteOracleBaseline(cfg)
             else:
                 trainer = MetaTrainer(cfg)
                 if effective_shared_init:
@@ -3039,6 +3376,13 @@ def run_one_scenario(
                 )
                 if ckpt_pick.get("selected_path"):
                     trainer.load(ckpt_pick["selected_path"])
+            elif runner == "mpc_lite":
+                train_csv = trainer.train(meta_iters=0)
+                run_df = pd.read_csv(train_csv)
+                run_df["scenario"] = scenario
+                run_df["variant"] = label
+                run_df["seed"] = float(seed)
+                train_all.append(run_df)
 
             if ckpt_pick.get("selection_rows"):
                 pd.DataFrame(ckpt_pick["selection_rows"]).to_csv(run_dir / "checkpoint_selection.csv", index=False)
@@ -3082,6 +3426,22 @@ def run_one_scenario(
                     tasks=env_task_subset,
                     episodes_per_task=env_eps,
                 )
+            elif runner == "mpc_lite":
+                ev = evaluate_mpc_lite_on_tasks(
+                    policy=trainer,
+                    cfg=cfg,
+                    tasks=eval_task_subset,
+                    episodes_per_task=eval_eps,
+                )
+                env_df = collect_env_data_mpc_lite(
+                    policy=trainer,
+                    cfg=cfg,
+                    scenario=scenario,
+                    variant=label,
+                    seed=seed,
+                    tasks=env_task_subset,
+                    episodes_per_task=env_eps,
+                )
             else:
                 ev = evaluate_heuristic_on_tasks(
                     trainer=trainer,
@@ -3105,11 +3465,11 @@ def run_one_scenario(
             pilot_meta = dict(cfg.get("pilot_metadata", {}))
             pilot_only = bool(pilot_meta.get("pilot_only", False))
             formal_ranking_exclude = bool(pilot_meta.get("formal_ranking_exclude", False))
-            formally_comparable = bool(is_formally_comparable_record(alignment_snapshot(cfg)))
+            formally_comparable = bool(is_formally_comparable_record(formal_metadata_snapshot(cfg)))
             projection_mode = str(cfg.get("safety", {}).get("projection_mode", ""))
             action_decode_mode = str(cfg.get("safety", {}).get("action_decode_mode", "tanh_affine"))
             formal_record_probe = {
-                **alignment_snapshot(cfg),
+                **formal_metadata_snapshot(cfg),
                 "projection_mode": projection_mode,
                 "action_decode_mode": action_decode_mode,
                 "pilot_only": pilot_only,
@@ -3163,6 +3523,11 @@ def run_one_scenario(
                     "baseline_family": str(baseline_meta.get("baseline_family", baseline_override or "")),
                     "exact_reproduction": baseline_meta.get("exact_reproduction"),
                     "external_baseline": baseline_meta.get("external_baseline"),
+                    "uses_task_oracle": baseline_meta.get("uses_task_oracle"),
+                    "uses_learned_policy": baseline_meta.get("uses_learned_policy"),
+                    "uses_same_safety_projection": baseline_meta.get("uses_same_safety_projection"),
+                    "mpc_horizon": baseline_meta.get("horizon"),
+                    "mpc_candidate_count": baseline_meta.get("candidate_count"),
                     "safety_protocol": str(baseline_meta.get("safety_protocol", "")),
                     "comparison_role": str(pilot_meta.get("comparison_role", baseline_meta.get("comparison_role", ""))),
                     "lower_learned_action_dim": baseline_meta.get("lower_learned_action_dim"),
@@ -3177,7 +3542,7 @@ def run_one_scenario(
                     "thermal_cap_margin_c": pilot_meta.get("thermal_cap_margin_c"),
                     "formally_comparable": formally_comparable,
                     "formal_ranking_comparable": bool(is_formal_ranking_record(formal_record_probe)),
-                    **alignment_snapshot(cfg),
+                    **formal_metadata_snapshot(cfg),
                     "eval_reward": float(ev["reward"]),
                     "eval_se": float(ev["se"]),
                     "eval_eh": float(ev["eh"]),
@@ -3322,6 +3687,24 @@ def run_one_scenario(
                 "fixed_current_fraction": 0.5,
                 "description": "Matched Shin 2024-style hierarchical DQN-DDPG baseline under the common benchmark safety protocol: upper DQN selects HY-mode macro boost, lower DDPG learns only rho/tau, and currents come from a fixed feasible template.",
             }
+        elif runner == "mpc_lite":
+            variant_definitions[label] = {
+                "runner": "mpc_lite",
+                "base_variant": variant,
+                "ablation": ablation,
+                "tx_device": ["LED", "LD", "LD"],
+                "tx_enabled": [1.0, 1.0, 1.0],
+                "baseline_family": "mpc_lite_oracle",
+                "uses_task_oracle": True,
+                "uses_learned_policy": False,
+                "uses_same_safety_projection": True,
+                "horizon": 1,
+                "candidate_count": int(base_cfg.get("mpc_lite", {}).get("candidate_count", 256)),
+                "exact_reproduction": False,
+                "external_baseline": True,
+                "comparison_role": "model_based_optimizer",
+                "description": "One-step model-informed optimizer baseline using current task parameters and the same coupled-aware safety projection.",
+            }
         elif variant == "hybrid":
             is_smooth_relaxed = ablation == "smooth_relaxed"
             is_thermal_cap = ablation == "thermal_cap"
@@ -3375,6 +3758,7 @@ def run_one_scenario(
     summary = {
         "scenario": scenario,
         "alignment": alignment_snapshot(precheck_cfg),
+        "physics": physics_snapshot_from_cfg(precheck_cfg),
         "task_distribution": task_distribution_summary(precheck_cfg),
         "variant_definitions": variant_definitions,
         "eval_summary": evaluate_summary(eval_df),
@@ -3389,6 +3773,8 @@ def run_one_scenario(
                     "reward_se_term",
                     "reward_eh_term",
                     "reward_margin_term",
+                    "reward_cost_penalty",
+                    "reward_power_penalty",
                     "penalty_cost_term",
                     "penalty_power_term",
                     "penalty_smooth_term",
@@ -3559,6 +3945,7 @@ def run_benchmark(
     report = {
         "cfg_path": cfg_path,
         "alignment": alignment_snapshot(base_cfg),
+        "physics": physics_snapshot_from_cfg(base_cfg),
         "task_distribution_scope": "base_config_snapshot",
         "task_distribution": task_distribution_summary(base_cfg),
         "meta_iters": meta_iters,
@@ -3658,7 +4045,15 @@ def parse_args() -> argparse.Namespace:
         type=str,
         nargs="*",
         default=[],
-        choices=["heuristic_safe", "sac_lagrangian", "sac_dalal_safe", "shin2024_matched", "dalal2018_safe"],
+        choices=[
+            "heuristic_safe",
+            "sac_lagrangian",
+            "sac_dalal_safe",
+            "shin2024_matched",
+            "dalal2018_safe",
+            "mpc_lite_oracle",
+            "mpc_lite",
+        ],
         help="Optional heuristic/learning baselines to evaluate.",
     )
     parser.add_argument(

@@ -1,0 +1,24 @@
+{
+  "physics_version": "physics_v2",
+  "eh_model": "logistic",
+  "calibration_scenarios": [
+    "moderate_practical",
+    "hard_stress",
+    "channel_harsh"
+  ],
+  "seeds": [
+    101,
+    202,
+    303
+  ],
+  "sample_count": 2880,
+  "Q25": 0.0005043011020860283,
+  "Q90": 0.007636848311607475,
+  "Q95": 0.010436976526856465,
+  "r_sat": 0.85,
+  "M_EH": 0.010436976526856465,
+  "a_EH": 339.7589407781355,
+  "b_EH": 0.0005043011020860283,
+  "commit_hash": "c773e4bc664c3540fb5f5a408f27cc8ce4bc0b53",
+  "eh_calibration_hash": "9282780b68b41465ed0568ff03816c355c3003e73fc68800b82a46760f01794a"
+}

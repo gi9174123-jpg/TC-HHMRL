@@ -5,6 +5,7 @@ import copy
 import numpy as np
 import torch
 
+from tchhmrl.envs.physics_v2 import calibrate_logistic_eh_from_samples, logistic_eh_metric, validate_coupling_matrix
 from tchhmrl.safety.safety_layer import SafetyLayer, raw_from_frac01
 from tchhmrl.utils.config import load_cfg
 
@@ -410,3 +411,88 @@ def test_safety_raw_to_exec_map_matches_preview():
     for raw_idx in range(12):
         boost_exec, mode_exec = safety.preview_exec(raw_idx, mem=mem)
         assert int(exec_map[raw_idx]) == safety.encode_exec(boost_exec, mode_exec)
+
+
+def test_logistic_eh_zero_monotonic_saturation():
+    vals = np.asarray(
+        [logistic_eh_metric(x, M=0.2, a=12.0, b=0.1) for x in [0.0, 0.05, 0.1, 0.2, 1.0]],
+        dtype=np.float64,
+    )
+    assert vals[0] <= 1.0e-10
+    assert np.all(np.diff(vals) >= -1.0e-12)
+    assert vals[-1] <= 0.2 + 1.0e-12
+    assert vals[-1] > vals[1]
+
+
+def test_eh_calibration_manifest_reproducible_and_rejects_degenerate_distribution():
+    samples = np.linspace(0.001, 0.02, 256)
+    first = calibrate_logistic_eh_from_samples(samples)
+    second = calibrate_logistic_eh_from_samples(samples)
+    assert first == second
+    assert first["eh_nl_M"] > 0.0
+    assert first["eh_nl_a"] > 0.0
+    try:
+        calibrate_logistic_eh_from_samples(np.ones(64) * 0.001)
+    except ValueError as exc:
+        assert "Degenerate" in str(exc)
+    else:
+        raise AssertionError("degenerate EH calibration samples should fail")
+
+
+def test_coupling_matrix_shape_direction_and_row_sum():
+    mat = validate_coupling_matrix(
+        [
+            [0.0, 0.015, 0.0075],
+            [0.015, 0.0, 0.015],
+            [0.0075, 0.015, 0.0],
+        ],
+        n_tx=3,
+    )
+    assert mat.shape == (3, 3)
+    assert np.allclose(np.diag(mat), 0.0)
+    assert np.all(np.sum(mat, axis=1) <= 0.03 + 1.0e-8)
+
+
+def test_thermal_coupling_zero_equals_independent_and_direction():
+    cfg_ind = copy.deepcopy(load_cfg("configs/default.yaml"))
+    cfg_coup = copy.deepcopy(load_cfg("configs/default.yaml"))
+    cfg_ind["physics"]["thermal_model"] = "independent"
+    cfg_coup["physics"]["thermal_model"] = "coupled"
+    cfg_coup["physics"]["thermal_coupling_matrix"] = [
+        [0.0, 0.0, 0.0],
+        [0.0, 0.0, 0.0],
+        [0.0, 0.0, 0.0],
+    ]
+    temps = np.asarray([42.0, 40.0, 39.0], dtype=np.float32)
+    safety_ind = SafetyLayer(cfg_ind)
+    safety_zero = SafetyLayer(cfg_coup)
+    base_ind, coupling_ind = safety_ind._thermal_base_np(temps, 35.0, 0.06)
+    base_zero, coupling_zero = safety_zero._thermal_base_np(temps, 35.0, 0.06)
+    assert np.allclose(base_ind, base_zero, atol=1.0e-7)
+    assert np.allclose(coupling_ind, 0.0, atol=1.0e-7)
+    assert np.allclose(coupling_zero, 0.0, atol=1.0e-7)
+
+    cfg_dir = copy.deepcopy(load_cfg("configs/default.yaml"))
+    safety_dir = SafetyLayer(cfg_dir)
+    _, coupling = safety_dir._thermal_base_np(np.asarray([50.0, 40.0, 40.0], dtype=np.float32), 35.0, 0.06)
+    assert coupling[1] > 0.0
+    assert coupling[0] < 0.0
+
+
+def test_thermal_pred_temp_and_margin_logged():
+    cfg = copy.deepcopy(load_cfg("configs/default.yaml"))
+    safety = SafetyLayer(cfg)
+    out, _ = safety.project_np(
+        upper_raw=11,
+        lower_raw=np.asarray([1.0, 0.8, 0.6, 0.0, 0.0], dtype=np.float32),
+        temps=np.asarray([44.0, 42.0, 41.0], dtype=np.float32),
+        amb_temp=35.0,
+        gamma=0.06,
+        delta=4.0,
+        mem={"current_boost": 3, "dwell_count": 3},
+    )
+    for key in ["thermal_coupling_term", "thermal_base_coupled", "thermal_pred_temp", "thermal_pred_margin"]:
+        assert key in out
+        assert np.asarray(out[key]).shape == (3,)
+    assert np.allclose(out["thermal_pred_temp"], out["t_pred"], atol=1.0e-7)
+    assert np.allclose(out["thermal_pred_margin"], out["thermal_margin"], atol=1.0e-7)

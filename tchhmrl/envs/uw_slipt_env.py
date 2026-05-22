@@ -6,6 +6,18 @@ import gymnasium as gym
 import numpy as np
 from gymnasium import spaces
 
+from tchhmrl.envs.physics_v2 import (
+    DEFAULT_EH_MODEL,
+    DEFAULT_PHYSICS_VERSION,
+    DEFAULT_SAFETY_PROJECTION_VERSION,
+    DEFAULT_THERMAL_COUPLING_MATRIX,
+    DEFAULT_THERMAL_MODEL,
+    coupling_matrix_hash,
+    eh_calibration_hash,
+    logistic_eh_metric,
+    thermal_coupling_term_np,
+    validate_coupling_matrix,
+)
 from tchhmrl.envs.task_contract import TaskSpec
 
 
@@ -30,8 +42,41 @@ class MultiTxUwSliptEnv(gym.Env):
         self.pre_alignment = bool(alignment_cfg.get("pre_alignment", False))
         self.default_alignment_version = str(self.alignment_version)
         self.default_task_summary_version = str(self.task_summary_version)
-
         self.n_tx = int(env_cfg["n_tx"])
+
+        physics_cfg = dict(cfg.get("physics", {}))
+        self.physics_version = str(physics_cfg.get("physics_version", DEFAULT_PHYSICS_VERSION))
+        self.eh_model = str(physics_cfg.get("eh_model", DEFAULT_EH_MODEL)).lower()
+        if self.eh_model not in {"linear", "logistic"}:
+            raise ValueError(f"unsupported physics.eh_model={self.eh_model}")
+        self.eh_nl_M = float(physics_cfg.get("eh_nl_M", 0.0))
+        self.eh_nl_a = float(physics_cfg.get("eh_nl_a", 1.0))
+        self.eh_nl_b = float(physics_cfg.get("eh_nl_b", 0.0))
+        self.eh_calibration_hash = str(
+            physics_cfg.get(
+                "eh_calibration_hash",
+                eh_calibration_hash(
+                    {
+                        "eh_model": self.eh_model,
+                        "eh_nl_M": self.eh_nl_M,
+                        "eh_nl_a": self.eh_nl_a,
+                        "eh_nl_b": self.eh_nl_b,
+                    }
+                ),
+            )
+        )
+        self.thermal_model = str(physics_cfg.get("thermal_model", DEFAULT_THERMAL_MODEL)).lower()
+        if self.thermal_model not in {"independent", "coupled"}:
+            raise ValueError(f"unsupported physics.thermal_model={self.thermal_model}")
+        self.safety_projection_version = str(
+            physics_cfg.get("safety_projection_version", DEFAULT_SAFETY_PROJECTION_VERSION)
+        )
+        coupling_matrix = physics_cfg.get("thermal_coupling_matrix", DEFAULT_THERMAL_COUPLING_MATRIX.tolist())
+        self.thermal_coupling_matrix = validate_coupling_matrix(coupling_matrix, n_tx=3)
+        if self.n_tx != 3:
+            raise ValueError("physics_v2 currently requires n_tx=3")
+        self.thermal_coupling_matrix_hash = coupling_matrix_hash(self.thermal_coupling_matrix)
+
         self.episode_len = int(env_cfg["episode_len"])
         self.obs_noise_std = float(env_cfg["obs_noise_std"])
         hybrid_cfg = env_cfg.get("hybrid", {})
@@ -351,16 +396,38 @@ class MultiTxUwSliptEnv(gym.Env):
         eh_share = 1.0 - info_share
         snr = max(info_signal / max(noise_power, 1.0e-6), 1.0e-6)
         qos_rate = float(self._mode_gain(mode_exec, self.mode_se_gain) * info_share * np.log2(1.0 + snr))
-        eh_metric = float(self._mode_gain(mode_exec, self.mode_eh_gain) * eh_share * eh_input)
+        eh_input_eff = float(self._mode_gain(mode_exec, self.mode_eh_gain) * eh_share * eh_input)
+        eh_metric = self._compute_eh_metric(eh_input_eff)
         return {
             "info_share": float(info_share),
             "eh_share": float(eh_share),
             "qos_rate": float(qos_rate),
+            "eh_input_eff": float(eh_input_eff),
+            "eh_metric_linear_proxy": float(eh_input_eff),
             "eh_metric": float(eh_metric),
             "reward_id_term": float(self.se_weight * qos_rate),
             "reward_eh_term": float(self.eh_weight * eh_metric),
             "total_reward_no_penalty": float(self.se_weight * qos_rate + self.eh_weight * eh_metric),
         }
+
+    def _compute_eh_metric(self, eh_input_eff: float) -> float:
+        if self.eh_model == "linear":
+            return float(eh_input_eff)
+        return float(
+            logistic_eh_metric(
+                float(eh_input_eff),
+                M=self.eh_nl_M,
+                a=self.eh_nl_a,
+                b=self.eh_nl_b,
+            )
+        )
+
+    def _thermal_coupling_term(self, temps: np.ndarray) -> np.ndarray:
+        return thermal_coupling_term_np(
+            np.asarray(temps, dtype=np.float32),
+            self.thermal_coupling_matrix,
+            thermal_model=self.thermal_model,
+        )
 
     def step(self, action: Dict):
         self.t += 1
@@ -424,13 +491,18 @@ class MultiTxUwSliptEnv(gym.Env):
             assert abs((info_share + eh_share) - 1.0) < 1.0e-6
 
         qos_rate = float(mode_se * info_share * np.log2(1.0 + snr))
-        eh_metric = float(mode_eh * eh_share * eh_input)
+        eh_input_eff = float(mode_eh * eh_share * eh_input)
+        eh_metric_linear_proxy = float(eh_input_eff)
+        eh_metric = self._compute_eh_metric(eh_input_eff)
         id_term = self.se_weight * qos_rate
         eh_term = self.eh_weight * eh_metric
 
         thermal_coeff = self._tx_vector(self.thermal_led_coeff, self.thermal_ld_coeff)
+        temps_before_update = self.temps.copy()
+        thermal_coupling_term = self._thermal_coupling_term(temps_before_update)
+        thermal_base = (1.0 - self.gamma) * temps_before_update + self.gamma * self.amb_temp + thermal_coupling_term
         thermal_drive = self.delta * thermal_coeff * (currents**2)
-        self.temps = (1.0 - self.gamma) * self.temps + self.gamma * self.amb_temp + thermal_drive
+        self.temps = (thermal_base + thermal_drive).astype(np.float32)
 
         thermal_violation_vec = np.maximum(self.temps - self.thermal_safe, 0.0).astype(np.float32)
         thermal_violation = float(thermal_violation_vec.sum())
@@ -475,10 +547,19 @@ class MultiTxUwSliptEnv(gym.Env):
             "se": float(id_term),
             "eh": float(eh_term),
             "qos_rate": float(qos_rate),
+            "eh_input_eff": float(eh_input_eff),
+            "eh_metric_linear_proxy": float(eh_metric_linear_proxy),
             "eh_metric": float(eh_metric),
+            "eh_model": self.eh_model,
+            "eh_nl_M": float(self.eh_nl_M),
+            "eh_nl_a": float(self.eh_nl_a),
+            "eh_nl_b": float(self.eh_nl_b),
+            "eh_calibration_hash": str(self.eh_calibration_hash),
             "reward_se_term": float(id_term),
             "reward_eh_term": float(eh_term),
             "reward_id_term": float(id_term),
+            "reward_cost_penalty": float(cost_penalty),
+            "reward_power_penalty": float(power_penalty_term),
             "penalty_cost_term": float(cost_penalty),
             "penalty_power_term": float(power_penalty_term),
             "penalty_smooth_term": float(smooth_penalty),
@@ -515,6 +596,14 @@ class MultiTxUwSliptEnv(gym.Env):
             "bus_current_max": float(self.bus_current_max),
             "bus_utilization": float(total / max(self.bus_current_max, 1.0e-6)),
             "temps": self.temps.copy(),
+            "thermal_model": self.thermal_model,
+            "thermal_coupling_matrix_hash": self.thermal_coupling_matrix_hash,
+            "thermal_coupling_term_tx0": float(thermal_coupling_term[0]) if self.n_tx > 0 else 0.0,
+            "thermal_coupling_term_tx1": float(thermal_coupling_term[1]) if self.n_tx > 1 else 0.0,
+            "thermal_coupling_term_tx2": float(thermal_coupling_term[2]) if self.n_tx > 2 else 0.0,
+            "thermal_base_coupled_tx0": float(thermal_base[0]) if self.n_tx > 0 else 0.0,
+            "thermal_base_coupled_tx1": float(thermal_base[1]) if self.n_tx > 1 else 0.0,
+            "thermal_base_coupled_tx2": float(thermal_base[2]) if self.n_tx > 2 else 0.0,
             "gamma": float(self.gamma),
             "delta": float(self.delta),
             "attenuation_eff": float(self.attenuation_eff),
@@ -529,5 +618,7 @@ class MultiTxUwSliptEnv(gym.Env):
             "alignment_version": self.alignment_version,
             "task_summary_version": self.task_summary_version,
             "pre_alignment": bool(self.pre_alignment),
+            "physics_version": self.physics_version,
+            "safety_projection_version": self.safety_projection_version,
         }
         return obs, reward, terminated, truncated, info

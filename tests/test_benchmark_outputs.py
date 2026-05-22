@@ -7,6 +7,12 @@ import pandas as pd
 import yaml
 
 from scripts.benchmark_constraint_scenarios import build_statistics_artifact, run_benchmark
+from tchhmrl.envs.task_contract import physics_snapshot_from_cfg
+
+
+def _physics_meta() -> dict:
+    cfg = yaml.safe_load(Path("configs/default.yaml").read_text(encoding="utf-8"))
+    return physics_snapshot_from_cfg(cfg)
 
 
 def test_benchmark_writes_resolved_config_and_run_summary(tmp_path: Path):
@@ -51,6 +57,12 @@ def test_benchmark_writes_resolved_config_and_run_summary(tmp_path: Path):
         assert row["alignment_version"] == "system_model_v1"
         assert row["task_summary_version"] == "site_v2"
         assert row["pre_alignment"] is False
+        assert row["physics_version"] == "physics_v2"
+        assert row["eh_model"] == "logistic"
+        assert row["thermal_model"] == "coupled"
+        assert row["safety_projection_version"] == "coupled_thermal_cap_v1"
+        assert row["thermal_coupling_matrix_hash"]
+        assert row["eh_calibration_hash"]
         assert row["task_source"] == "site_bank"
         assert row["formally_comparable"] is True
         assert row["selection_task_batch_hash"]
@@ -81,10 +93,14 @@ def test_benchmark_writes_resolved_config_and_run_summary(tmp_path: Path):
     assert precheck["alignment_version"] == "system_model_v1"
     assert precheck["task_summary_version"] == "site_v2"
     assert precheck["task_source"] == "site_bank"
+    assert precheck["physics_version"] == "physics_v2"
+    assert precheck["eh_model"] == "logistic"
+    assert precheck["thermal_model"] == "coupled"
     assert precheck["task_distribution"]["task_source"] == "site_bank"
 
     report = json.loads(report_path.read_text(encoding="utf-8"))
     assert report["task_distribution_scope"] == "base_config_snapshot"
+    assert report["physics"]["physics_version"] == "physics_v2"
     stats = report.get("stats_artifacts", {})
     assert stats == {}
 
@@ -320,6 +336,7 @@ def test_benchmark_supports_shin2024_and_dalal_baselines(tmp_path: Path):
 
 def test_statistics_contract_trusts_pvalue_only_with_two_or_more_pairs():
     rows = []
+    physics_meta = _physics_meta()
     for seed, h_reward, s_reward in [(101, 10.0, 8.0), (202, 11.0, 7.0)]:
         for variant, reward in [("hybrid", h_reward), ("sac_lagrangian", s_reward)]:
             rows.append(
@@ -337,6 +354,7 @@ def test_statistics_contract_trusts_pvalue_only_with_two_or_more_pairs():
                     "alignment_version": "system_model_v1",
                     "task_summary_version": "site_v2",
                     "pre_alignment": False,
+                    **physics_meta,
                     "projection_mode": "thermal_cap",
                     "action_decode_mode": "tanh_affine",
                 }
@@ -369,6 +387,7 @@ def test_statistics_contract_trusts_pvalue_only_with_two_or_more_pairs():
 
 def test_statistics_excludes_pilot_sensitivity_rows_even_if_ordered():
     rows = []
+    physics_meta = _physics_meta()
     for variant in ["hybrid", "hybrid_smooth_relaxed", "hybrid_thermal_cap", "sac_lagrangian"]:
         is_pilot = variant in {"hybrid_smooth_relaxed", "hybrid_thermal_cap"}
         rows.append(
@@ -386,6 +405,7 @@ def test_statistics_excludes_pilot_sensitivity_rows_even_if_ordered():
                 "alignment_version": "system_model_v1",
                 "task_summary_version": "site_v2",
                 "pre_alignment": False,
+                **physics_meta,
                 "projection_mode": "smooth_relaxed" if variant == "hybrid_smooth_relaxed" else "thermal_cap",
                 "action_decode_mode": "tanh_affine",
                 "pilot_only": is_pilot,
@@ -482,3 +502,40 @@ def test_benchmark_can_run_baselines_only(tmp_path: Path):
     report = json.loads(report_path.read_text(encoding="utf-8"))
     assert report["include_variants"] is False
     assert report["baselines_only"] is True
+
+
+def test_benchmark_supports_mpc_lite_oracle_baseline(tmp_path: Path):
+    out_dir = tmp_path / "bench_mpc"
+    report_path = run_benchmark(
+        cfg_path="configs/default.yaml",
+        out_dir=str(out_dir),
+        scenarios=["easy_baseline"],
+        meta_iters=1,
+        fast_mode=True,
+        seeds=[101],
+        eval_tasks=1,
+        eval_eps=1,
+        env_tasks=1,
+        env_eps=1,
+        use_curriculum=False,
+        shared_init=False,
+        variants=["hybrid"],
+        ablations=["full"],
+        baselines=["mpc_lite_oracle"],
+        include_variants=False,
+    )
+    assert report_path.exists()
+    rows = json.loads((out_dir / "easy_baseline" / "run_summary.json").read_text(encoding="utf-8"))
+    assert len(rows) == 1
+    row = rows[0]
+    assert row["variant"] == "mpc_lite_oracle"
+    assert row["runner"] == "mpc_lite"
+    assert row["baseline_family"] == "mpc_lite_oracle"
+    assert row["uses_task_oracle"] is True
+    assert row["uses_learned_policy"] is False
+    assert row["uses_same_safety_projection"] is True
+    assert int(row["mpc_horizon"]) == 1
+    assert int(row["mpc_candidate_count"]) == 256
+    env_df = pd.read_csv(out_dir / "easy_baseline" / "env.csv")
+    assert "thermal_pred_temp_tx0" in env_df.columns
+    assert "thermal_base_coupled_tx0" in env_df.columns

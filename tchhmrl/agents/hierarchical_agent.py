@@ -13,7 +13,7 @@ from tchhmrl.agents.dqn_upper import UpperDQN
 from tchhmrl.agents.sac_lower import LowerSAC
 from tchhmrl.buffers.replay_buffer import EpisodeBuffer, ReplayBuffer
 from tchhmrl.models.context_encoder import ContextEncoder
-from tchhmrl.envs.task_contract import build_task_summary_v2, is_formally_comparable_record
+from tchhmrl.envs.task_contract import build_task_summary_v2, is_formally_comparable_record, physics_snapshot_from_cfg
 from tchhmrl.safety.safety_layer import SafetyLayer
 
 
@@ -39,6 +39,7 @@ class HierarchicalAgent:
         self.alignment_version = str(alignment_cfg.get("alignment_version", "system_model_v1"))
         self.task_summary_version = str(alignment_cfg.get("task_summary_version", "site_v2"))
         self.pre_alignment = bool(alignment_cfg.get("pre_alignment", False))
+        self.physics_meta = physics_snapshot_from_cfg(cfg)
         self.loaded_alignment_meta = self._alignment_meta()
 
         ctx_cfg = cfg["context"]
@@ -133,6 +134,7 @@ class HierarchicalAgent:
             "alignment_version": self.alignment_version,
             "task_summary_version": self.task_summary_version,
             "pre_alignment": bool(self.pre_alignment if pre_alignment is None else pre_alignment),
+            **self.physics_meta,
         }
 
     def is_formally_comparable(self) -> bool:

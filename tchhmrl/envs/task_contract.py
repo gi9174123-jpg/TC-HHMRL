@@ -7,6 +7,15 @@ from typing import Any, Iterable, Mapping, Sequence, Tuple
 
 import numpy as np
 
+from tchhmrl.envs.physics_v2 import (
+    DEFAULT_EH_MODEL,
+    DEFAULT_PHYSICS_VERSION,
+    DEFAULT_SAFETY_PROJECTION_VERSION,
+    DEFAULT_THERMAL_MODEL,
+    coupling_matrix_hash,
+    eh_calibration_hash,
+)
+
 
 DEFAULT_ALIGNMENT_VERSION = "system_model_v1"
 DEFAULT_TASK_SUMMARY_VERSION = "site_v2"
@@ -127,6 +136,46 @@ def task_defaults_from_cfg(cfg: Mapping[str, Any]) -> dict[str, Any]:
     }
 
 
+def physics_snapshot_from_cfg(cfg: Mapping[str, Any]) -> dict[str, Any]:
+    physics_cfg = cfg.get("physics", {})
+    matrix = physics_cfg.get("thermal_coupling_matrix", [])
+    return {
+        "physics_version": str(physics_cfg.get("physics_version", DEFAULT_PHYSICS_VERSION)),
+        "eh_model": str(physics_cfg.get("eh_model", DEFAULT_EH_MODEL)),
+        "thermal_model": str(physics_cfg.get("thermal_model", DEFAULT_THERMAL_MODEL)),
+        "safety_projection_version": str(
+            physics_cfg.get("safety_projection_version", DEFAULT_SAFETY_PROJECTION_VERSION)
+        ),
+        "thermal_coupling_matrix_hash": str(
+            physics_cfg.get("thermal_coupling_matrix_hash", coupling_matrix_hash(matrix) if matrix else "")
+        ),
+        "eh_calibration_hash": str(
+            physics_cfg.get(
+                "eh_calibration_hash",
+                eh_calibration_hash(
+                    {
+                        "eh_model": physics_cfg.get("eh_model", DEFAULT_EH_MODEL),
+                        "eh_nl_M": physics_cfg.get("eh_nl_M", 0.0),
+                        "eh_nl_a": physics_cfg.get("eh_nl_a", 0.0),
+                        "eh_nl_b": physics_cfg.get("eh_nl_b", 0.0),
+                    }
+                ),
+            )
+        ),
+    }
+
+
+def physics_snapshot_from_record(record: Mapping[str, Any]) -> dict[str, Any]:
+    return {
+        "physics_version": str(record.get("physics_version", "")),
+        "eh_model": str(record.get("eh_model", "")),
+        "thermal_model": str(record.get("thermal_model", "")),
+        "safety_projection_version": str(record.get("safety_projection_version", "")),
+        "thermal_coupling_matrix_hash": str(record.get("thermal_coupling_matrix_hash", "")),
+        "eh_calibration_hash": str(record.get("eh_calibration_hash", "")),
+    }
+
+
 def build_task_summary_v2(task_like: TaskSpec | Mapping[str, Any]) -> np.ndarray:
     spec = task_like if isinstance(task_like, TaskSpec) else TaskSpec.from_mapping(task_like)
     return np.asarray(
@@ -192,6 +241,12 @@ def is_formally_comparable_record(record: Mapping[str, Any]) -> bool:
         record.get("alignment_version") == DEFAULT_ALIGNMENT_VERSION
         and record.get("task_summary_version") == DEFAULT_TASK_SUMMARY_VERSION
         and bool(record.get("pre_alignment", True)) is False
+        and record.get("physics_version") == DEFAULT_PHYSICS_VERSION
+        and record.get("eh_model") == DEFAULT_EH_MODEL
+        and record.get("thermal_model") == DEFAULT_THERMAL_MODEL
+        and record.get("safety_projection_version") == DEFAULT_SAFETY_PROJECTION_VERSION
+        and bool(record.get("thermal_coupling_matrix_hash"))
+        and bool(record.get("eh_calibration_hash"))
     )
 
 

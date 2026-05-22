@@ -9,6 +9,21 @@ alignment:
   task_summary_version: site_v2
   pre_alignment: false
 
+physics:
+  physics_version: physics_v2
+  eh_model: logistic
+  eh_nl_M: 0.010436976526856465
+  eh_nl_a: 339.7589407781355
+  eh_nl_b: 0.0005043011020860283
+  eh_calibration_hash: 9282780b68b41465ed0568ff03816c355c3003e73fc68800b82a46760f01794a
+  eh_calibration_r_sat: 0.85
+  thermal_model: coupled
+  safety_projection_version: coupled_thermal_cap_v1
+  thermal_coupling_matrix:
+    - [0.0, 0.015, 0.0075]
+    - [0.015, 0.0, 0.015]
+    - [0.0075, 0.015, 0.0]
+
 env:
   episode_len: 80
   n_tx: 3
@@ -112,6 +127,10 @@ lower_ddpg:
   target_tau: 0.2
   noise_std: 0.10
   grad_clip: 5.0
+
+mpc_lite:
+  horizon: 1
+  candidate_count: 256
 
 meta:
   n_tasks_per_iter: 6

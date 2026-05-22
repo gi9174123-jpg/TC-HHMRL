@@ -11,6 +11,7 @@ from tchhmrl.envs.task_contract import (
     filter_formally_comparable_records,
     is_formally_comparable_record,
     ordered_task_batch_hash,
+    physics_snapshot_from_cfg,
     task_batch_hash,
     task_defaults_from_cfg,
 )
@@ -102,7 +103,8 @@ def test_hy_energy_conserving_chain_updates_reward_terms():
 
     expected_info_share = tau * (1.0 - rho)
     expected_eh_share = 1.0 - expected_info_share
-    expected_eh_metric = float(env.mode_eh_gain[2] * expected_eh_share * eh_input)
+    expected_eh_input_eff = float(env.mode_eh_gain[2] * expected_eh_share * eh_input)
+    expected_eh_metric = env._compute_eh_metric(expected_eh_input_eff)
 
     _, _, _, _, info = env.step(action)
     expected_qos_rate = float(env.mode_se_gain[2] * expected_info_share * np.log2(1.0 + info["snr"]))
@@ -111,7 +113,9 @@ def test_hy_energy_conserving_chain_updates_reward_terms():
     assert np.isclose(info["eh_share"], expected_eh_share, atol=1.0e-6)
     assert np.isclose(info["info_share"] + info["eh_share"], 1.0, atol=1.0e-6)
     assert np.isclose(info["qos_rate"], expected_qos_rate, atol=1.5e-2)
-    assert np.isclose(info["eh_metric"], expected_eh_metric, atol=1.5e-2)
+    assert np.isclose(info["eh_input_eff"], expected_eh_input_eff, atol=1.5e-2)
+    assert np.isclose(info["eh_metric_linear_proxy"], expected_eh_input_eff, atol=1.5e-2)
+    assert np.isclose(info["eh_metric"], expected_eh_metric, atol=1.0e-8)
     assert np.isclose(info["reward_id_term"], env.se_weight * info["qos_rate"], atol=1.0e-6)
     assert np.isclose(info["reward_eh_term"], env.eh_weight * info["eh_metric"], atol=1.0e-6)
 
@@ -197,6 +201,7 @@ def test_task_batch_hash_and_formal_consumer_filter():
         "alignment_version": "system_model_v1",
         "task_summary_version": "site_v2",
         "pre_alignment": False,
+        **physics_snapshot_from_cfg(cfg),
     }
     old = {"pre_alignment": True}
     assert is_formally_comparable_record(good) is True
