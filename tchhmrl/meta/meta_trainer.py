@@ -32,6 +32,10 @@ class EpisodeStats:
     cost_term: float
     power_term: float
     smooth_term: float
+    eh_input_eff: float = 0.0
+    eh_metric_raw_nonlinear: float = 0.0
+    eh_saturation_fraction: float = 0.0
+    eh_near_zero_fraction: float = 0.0
 
 
 class MetaTrainer:
@@ -134,6 +138,10 @@ class MetaTrainer:
         ep_cost_term = 0.0
         ep_power_term = 0.0
         ep_smooth_term = 0.0
+        ep_eh_input_eff = 0.0
+        ep_eh_raw_nonlinear = 0.0
+        ep_eh_sat = 0.0
+        ep_eh_near_zero = 0.0
 
         macro_start_obs = None
         macro_start_z = None
@@ -289,6 +297,10 @@ class MetaTrainer:
             ep_cost_term += float(info.get("penalty_cost_term", 0.0))
             ep_power_term += float(info.get("penalty_power_term", 0.0))
             ep_smooth_term += float(info.get("penalty_smooth_term", 0.0))
+            ep_eh_input_eff += float(info.get("eh_input_eff", info.get("eh_metric", 0.0)))
+            ep_eh_raw_nonlinear += float(info.get("eh_metric_raw_nonlinear", info.get("eh_metric", 0.0)))
+            ep_eh_sat += float(info.get("eh_saturation_fraction", 0.0))
+            ep_eh_near_zero += float(info.get("eh_near_zero_fraction", 0.0))
 
             obs = next_obs
 
@@ -305,6 +317,10 @@ class MetaTrainer:
             cost_term=ep_cost_term / max(ep_len, 1),
             power_term=ep_power_term / max(ep_len, 1),
             smooth_term=ep_smooth_term / max(ep_len, 1),
+            eh_input_eff=ep_eh_input_eff / max(ep_len, 1),
+            eh_metric_raw_nonlinear=ep_eh_raw_nonlinear / max(ep_len, 1),
+            eh_saturation_fraction=ep_eh_sat / max(ep_len, 1),
+            eh_near_zero_fraction=ep_eh_near_zero / max(ep_len, 1),
         )
 
     def train(self, meta_iters: int | None = None) -> Path:
@@ -411,6 +427,12 @@ class MetaTrainer:
                 "support_cost_term": float(np.mean([s.cost_term for s in support_stats])),
                 "support_power_term": float(np.mean([s.power_term for s in support_stats])),
                 "support_smooth_term": float(np.mean([s.smooth_term for s in support_stats])),
+                "support_eh_input_eff": float(np.mean([s.eh_input_eff for s in support_stats])),
+                "support_eh_metric_raw_nonlinear": float(
+                    np.mean([s.eh_metric_raw_nonlinear for s in support_stats])
+                ),
+                "support_eh_saturation_fraction": float(np.mean([s.eh_saturation_fraction for s in support_stats])),
+                "support_eh_near_zero_fraction": float(np.mean([s.eh_near_zero_fraction for s in support_stats])),
                 "query_reward": float(np.mean([s.reward for s in query_stats])) if query_stats else 0.0,
                 "query_se": float(np.mean([s.se for s in query_stats])) if query_stats else 0.0,
                 "query_eh": float(np.mean([s.eh for s in query_stats])) if query_stats else 0.0,
@@ -423,6 +445,18 @@ class MetaTrainer:
                 "query_cost_term": float(np.mean([s.cost_term for s in query_stats])) if query_stats else 0.0,
                 "query_power_term": float(np.mean([s.power_term for s in query_stats])) if query_stats else 0.0,
                 "query_smooth_term": float(np.mean([s.smooth_term for s in query_stats])) if query_stats else 0.0,
+                "query_eh_input_eff": float(np.mean([s.eh_input_eff for s in query_stats])) if query_stats else 0.0,
+                "query_eh_metric_raw_nonlinear": float(
+                    np.mean([s.eh_metric_raw_nonlinear for s in query_stats])
+                )
+                if query_stats
+                else 0.0,
+                "query_eh_saturation_fraction": float(np.mean([s.eh_saturation_fraction for s in query_stats]))
+                if query_stats
+                else 0.0,
+                "query_eh_near_zero_fraction": float(np.mean([s.eh_near_zero_fraction for s in query_stats]))
+                if query_stats
+                else 0.0,
                 "lambda": lambda_val,
                 "curriculum_stage": curriculum_stage,
                 "outer_step_size": float(self.outer_step_size if self.explicit_inner_outer else 0.0),

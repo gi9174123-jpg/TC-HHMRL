@@ -1077,6 +1077,16 @@ def _add_projection_diagnostics(row: Dict, aux: Dict, currents_exec: np.ndarray)
             row[f"{prefix}_tx{tx_idx}"] = float(val)
 
 
+def _add_eh_diagnostics(row: Dict, info: Dict) -> None:
+    row["eh_model"] = str(info.get("eh_model", "linear"))
+    row["eh_input_eff"] = float(info.get("eh_input_eff", info.get("eh_metric", 0.0)))
+    row["eh_metric_linear_proxy"] = float(info.get("eh_metric_linear_proxy", row["eh_input_eff"]))
+    row["eh_metric_raw_nonlinear"] = float(info.get("eh_metric_raw_nonlinear", row["eh_metric_linear_proxy"]))
+    row["eh_saturation_fraction"] = float(info.get("eh_saturation_fraction", 0.0))
+    row["eh_near_zero_fraction"] = float(info.get("eh_near_zero_fraction", 0.0))
+    row["eh_scale"] = float(info.get("eh_scale", 1.0))
+
+
 def collect_env_data(
     trainer: MetaTrainer,
     cfg: Dict,
@@ -1192,6 +1202,7 @@ def collect_env_data(
                 }
                 for tx_idx, current_val in enumerate(currents_exec.tolist()):
                     row[f"current_tx{tx_idx}"] = float(current_val)
+                _add_eh_diagnostics(row, info)
                 _add_projection_diagnostics(row, aux, currents_exec)
 
                 trainer.agent.episode.add(
@@ -1246,6 +1257,10 @@ def evaluate_on_tasks(
         "cost": float(np.mean([s.cost for s in stats])),
         "violation_rate": float(np.mean([s.violations for s in stats])),
         "len": float(np.mean([s.length for s in stats])),
+        "eh_input_eff": float(np.mean([s.eh_input_eff for s in stats])),
+        "eh_metric_raw_nonlinear": float(np.mean([s.eh_metric_raw_nonlinear for s in stats])),
+        "eh_saturation_fraction": float(np.mean([s.eh_saturation_fraction for s in stats])),
+        "eh_near_zero_fraction": float(np.mean([s.eh_near_zero_fraction for s in stats])),
     }
 
 
@@ -1263,6 +1278,10 @@ class SacLagEpisodeStats:
     cost_term: float
     power_term: float
     smooth_term: float
+    eh_input_eff: float = 0.0
+    eh_metric_raw_nonlinear: float = 0.0
+    eh_saturation_fraction: float = 0.0
+    eh_near_zero_fraction: float = 0.0
 
 
 def _heuristic_macro_selection(env: MultiTxUwSliptEnv) -> tuple[int, int, np.ndarray, np.ndarray]:
@@ -1574,6 +1593,10 @@ class SacLagrangianBaseline:
         ep_cost_term = 0.0
         ep_power_term = 0.0
         ep_smooth_term = 0.0
+        ep_eh_input_eff = 0.0
+        ep_eh_raw_nonlinear = 0.0
+        ep_eh_sat = 0.0
+        ep_eh_near_zero = 0.0
 
         macro_start_obs = None
         macro_start_z = None
@@ -1677,6 +1700,10 @@ class SacLagrangianBaseline:
             ep_cost_term += float(info.get("penalty_cost_term", 0.0))
             ep_power_term += float(info.get("penalty_power_term", 0.0))
             ep_smooth_term += float(info.get("penalty_smooth_term", 0.0))
+            ep_eh_input_eff += float(info.get("eh_input_eff", info.get("eh_metric", 0.0)))
+            ep_eh_raw_nonlinear += float(info.get("eh_metric_raw_nonlinear", info.get("eh_metric", 0.0)))
+            ep_eh_sat += float(info.get("eh_saturation_fraction", 0.0))
+            ep_eh_near_zero += float(info.get("eh_near_zero_fraction", 0.0))
             obs = next_obs
 
         return SacLagEpisodeStats(
@@ -1692,6 +1719,10 @@ class SacLagrangianBaseline:
             cost_term=ep_cost_term / max(ep_len, 1),
             power_term=ep_power_term / max(ep_len, 1),
             smooth_term=ep_smooth_term / max(ep_len, 1),
+            eh_input_eff=ep_eh_input_eff / max(ep_len, 1),
+            eh_metric_raw_nonlinear=ep_eh_raw_nonlinear / max(ep_len, 1),
+            eh_saturation_fraction=ep_eh_sat / max(ep_len, 1),
+            eh_near_zero_fraction=ep_eh_near_zero / max(ep_len, 1),
         )
 
     def train(self, meta_iters: int | None = None) -> Path:
@@ -1731,6 +1762,10 @@ class SacLagrangianBaseline:
                 "support_cost_term": float(np.mean([s.cost_term for s in train_stats])) if train_stats else 0.0,
                 "support_power_term": float(np.mean([s.power_term for s in train_stats])) if train_stats else 0.0,
                 "support_smooth_term": float(np.mean([s.smooth_term for s in train_stats])) if train_stats else 0.0,
+                "support_eh_input_eff": float(np.mean([s.eh_input_eff for s in train_stats])) if train_stats else 0.0,
+                "support_eh_metric_raw_nonlinear": float(np.mean([s.eh_metric_raw_nonlinear for s in train_stats])) if train_stats else 0.0,
+                "support_eh_saturation_fraction": float(np.mean([s.eh_saturation_fraction for s in train_stats])) if train_stats else 0.0,
+                "support_eh_near_zero_fraction": float(np.mean([s.eh_near_zero_fraction for s in train_stats])) if train_stats else 0.0,
                 "query_reward": float(np.mean([s.reward for s in train_stats])) if train_stats else 0.0,
                 "query_se": float(np.mean([s.se for s in train_stats])) if train_stats else 0.0,
                 "query_eh": float(np.mean([s.eh for s in train_stats])) if train_stats else 0.0,
@@ -1741,6 +1776,10 @@ class SacLagrangianBaseline:
                 "query_cost_term": float(np.mean([s.cost_term for s in train_stats])) if train_stats else 0.0,
                 "query_power_term": float(np.mean([s.power_term for s in train_stats])) if train_stats else 0.0,
                 "query_smooth_term": float(np.mean([s.smooth_term for s in train_stats])) if train_stats else 0.0,
+                "query_eh_input_eff": float(np.mean([s.eh_input_eff for s in train_stats])) if train_stats else 0.0,
+                "query_eh_metric_raw_nonlinear": float(np.mean([s.eh_metric_raw_nonlinear for s in train_stats])) if train_stats else 0.0,
+                "query_eh_saturation_fraction": float(np.mean([s.eh_saturation_fraction for s in train_stats])) if train_stats else 0.0,
+                "query_eh_near_zero_fraction": float(np.mean([s.eh_near_zero_fraction for s in train_stats])) if train_stats else 0.0,
                 "lambda": float(np.mean(self.dual.values)) if self.dual_enabled else 0.0,
                 "curriculum_stage": "base",
                 "outer_step_size": 0.0,
@@ -2026,7 +2065,7 @@ class MpcLiteOracleBaseline:
             eh_share = 1.0 - info_share
         qos_rate = float(mode_se * info_share * np.log2(1.0 + snr))
         eh_input_eff = float(mode_eh * eh_share * eh_input)
-        eh_metric = env._compute_eh_metric(eh_input_eff)
+        eh_metric = float(env._compute_eh_metric(eh_input_eff)["eh_metric"])
         thermal_coeff = env._tx_vector(env.thermal_led_coeff, env.thermal_ld_coeff)
         coupling = env._thermal_coupling_term(env.temps)
         thermal_base = (1.0 - env.gamma) * env.temps + env.gamma * env.amb_temp + coupling
@@ -2254,6 +2293,10 @@ def evaluate_plain_hierarchical_baseline_on_tasks(
         "cost": float(np.mean([s.cost for s in stats])),
         "violation_rate": float(np.mean([s.violations for s in stats])),
         "len": float(np.mean([s.length for s in stats])),
+        "eh_input_eff": float(np.mean([s.eh_input_eff for s in stats])),
+        "eh_metric_raw_nonlinear": float(np.mean([s.eh_metric_raw_nonlinear for s in stats])),
+        "eh_saturation_fraction": float(np.mean([s.eh_saturation_fraction for s in stats])),
+        "eh_near_zero_fraction": float(np.mean([s.eh_near_zero_fraction for s in stats])),
     }
 
 
@@ -2368,6 +2411,7 @@ def collect_env_data_heuristic(
                 }
                 for tx_idx, current_val in enumerate(currents_exec.tolist()):
                     row[f"current_tx{tx_idx}"] = float(current_val)
+                _add_eh_diagnostics(row, info)
                 _add_projection_diagnostics(row, aux, currents_exec)
                 rows.append(row)
                 obs = next_obs
@@ -2477,6 +2521,7 @@ def collect_env_data_plain_hierarchical_baseline(
                 }
                 for tx_idx, current_val in enumerate(currents_exec.tolist()):
                     row[f"current_tx{tx_idx}"] = float(current_val)
+                _add_eh_diagnostics(row, info)
                 _add_projection_diagnostics(row, aux, currents_exec)
                 rows.append(row)
                 obs = next_obs
@@ -3468,10 +3513,14 @@ def run_one_scenario(
             formally_comparable = bool(is_formally_comparable_record(formal_metadata_snapshot(cfg)))
             projection_mode = str(cfg.get("safety", {}).get("projection_mode", ""))
             action_decode_mode = str(cfg.get("safety", {}).get("action_decode_mode", "tanh_affine"))
+            physics_eh_model = str(cfg.get("physics", {}).get("eh_model", ""))
+            eh_model_cfg = str(cfg.get("env", {}).get("eh_model", physics_eh_model))
+            eh_nonlinear_cfg = dict(cfg.get("env", {}).get("eh_nonlinear", {}) or {})
             formal_record_probe = {
                 **formal_metadata_snapshot(cfg),
                 "projection_mode": projection_mode,
                 "action_decode_mode": action_decode_mode,
+                "eh_model": eh_model_cfg,
                 "pilot_only": pilot_only,
                 "formal_ranking_exclude": formal_ranking_exclude,
             }
@@ -3505,6 +3554,16 @@ def run_one_scenario(
                     "safety_thermal_cutoff": float(cfg["safety"]["thermal_cutoff"]),
                     "projection_mode": projection_mode,
                     "action_decode_mode": action_decode_mode,
+                    "eh_model": eh_model_cfg,
+                    "eh_nonlinear_type": str(eh_nonlinear_cfg.get("type", "logistic_normalized")),
+                    "eh_nonlinear_e_max": float(eh_nonlinear_cfg.get("e_max", 1.0)),
+                    "eh_nonlinear_a": float(eh_nonlinear_cfg.get("a", 12.0)),
+                    "eh_nonlinear_b": float(eh_nonlinear_cfg.get("b", 0.10)),
+                    "eh_nonlinear_scale": (
+                        None
+                        if eh_nonlinear_cfg.get("scale", None) in (None, "")
+                        else float(eh_nonlinear_cfg.get("scale"))
+                    ),
                     "shared_init": bool(effective_shared_init),
                     "shared_init_pretrain_iters": int(pre_iters) if effective_shared_init else 0,
                     "shared_init_ckpt": str(shared_init_paths[int(seed)]) if effective_shared_init else "",
@@ -3867,8 +3926,26 @@ def run_benchmark(
     baselines: List[str] | None = None,
     device: str | None = None,
     include_variants: bool = True,
+    eh_model: str | None = None,
+    eh_scale: float | None = None,
 ) -> Path:
     base_cfg = apply_cli_overrides(load_cfg(cfg_path), device=device)
+    if eh_model is not None:
+        eh_model = str(eh_model).strip().lower()
+        if eh_model not in {"linear", "nonlinear"}:
+            raise ValueError(f"--eh-model must be linear or nonlinear, got {eh_model!r}")
+        base_cfg.setdefault("env", {})["eh_model"] = eh_model
+    if eh_scale is not None:
+        base_cfg.setdefault("env", {}).setdefault("eh_nonlinear", {})["scale"] = float(eh_scale)
+    final_eh_model_raw = base_cfg.get("env", {}).get("eh_model", None)
+    final_eh_model = "" if final_eh_model_raw in (None, "") else str(final_eh_model_raw).strip().lower()
+    final_eh_scale = base_cfg.get("env", {}).get("eh_nonlinear", {}).get("scale", None)
+    if final_eh_model == "nonlinear" and final_eh_scale in (None, ""):
+        raise ValueError(
+            "Nonlinear EH benchmark runs require one fixed global scale. "
+            "Run scripts.nonlinear_eh_robustness stage1 first, then pass --eh-scale <scale> "
+            "or set env.eh_nonlinear.scale in a dedicated supplementary config."
+        )
     out_root = Path(out_dir)
     out_root.mkdir(parents=True, exist_ok=True)
 
@@ -3946,6 +4023,8 @@ def run_benchmark(
         "cfg_path": cfg_path,
         "alignment": alignment_snapshot(base_cfg),
         "physics": physics_snapshot_from_cfg(base_cfg),
+        "eh_override_model": str(base_cfg.get("env", {}).get("eh_model", "")),
+        "eh_nonlinear_override": dict(base_cfg.get("env", {}).get("eh_nonlinear", {}) or {}),
         "task_distribution_scope": "base_config_snapshot",
         "task_distribution": task_distribution_summary(base_cfg),
         "meta_iters": meta_iters,
@@ -4065,6 +4144,19 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--eval-eps", type=int, default=2)
     parser.add_argument("--env-tasks", type=int, default=6)
     parser.add_argument("--env-eps", type=int, default=1)
+    parser.add_argument(
+        "--eh-model",
+        type=str,
+        choices=["linear", "nonlinear"],
+        default=None,
+        help="Supplementary robustness override for env.eh_model. Default keeps the config value.",
+    )
+    parser.add_argument(
+        "--eh-scale",
+        type=float,
+        default=None,
+        help="Fixed global nonlinear-EH scale for supplementary robustness checks.",
+    )
     return parser.parse_args()
 
 
@@ -4089,6 +4181,8 @@ def main() -> None:
         baselines=args.baselines,
         device=args.device,
         include_variants=(not args.baselines_only),
+        eh_model=args.eh_model,
+        eh_scale=args.eh_scale,
     )
 
 

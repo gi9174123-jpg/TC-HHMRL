@@ -104,7 +104,7 @@ def test_hy_energy_conserving_chain_updates_reward_terms():
     expected_info_share = tau * (1.0 - rho)
     expected_eh_share = 1.0 - expected_info_share
     expected_eh_input_eff = float(env.mode_eh_gain[2] * expected_eh_share * eh_input)
-    expected_eh_metric = env._compute_eh_metric(expected_eh_input_eff)
+    expected_eh_metric = float(env._compute_eh_metric(expected_eh_input_eff)["eh_metric"])
 
     _, _, _, _, info = env.step(action)
     expected_qos_rate = float(env.mode_se_gain[2] * expected_info_share * np.log2(1.0 + info["snr"]))

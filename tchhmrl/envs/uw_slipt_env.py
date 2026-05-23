@@ -118,6 +118,26 @@ class MultiTxUwSliptEnv(gym.Env):
         self.thermal_margin_weight = float(env_cfg.get("thermal_margin_weight", 0.0))
         self.mode_se_gain = np.asarray(env_cfg.get("mode_se_gain", [1.0, 1.2, 0.85]), dtype=np.float32)
         self.mode_eh_gain = np.asarray(env_cfg.get("mode_eh_gain", [1.0, 0.85, 1.2]), dtype=np.float32)
+        # Optional supplementary EH override. If absent, the formal physics.* EH
+        # model remains active.
+        env_eh_override = env_cfg.get("eh_model", None)
+        if env_eh_override not in (None, ""):
+            env_eh_override = str(env_eh_override).strip().lower()
+            if env_eh_override not in {"linear", "nonlinear"}:
+                raise ValueError(
+                    f"env.eh_model override must be 'linear' or 'nonlinear', got {env_eh_override!r}"
+                )
+            self.eh_model = env_eh_override
+        self.eh_nonlinear_cfg = dict(env_cfg.get("eh_nonlinear", {}) or {})
+        self.eh_robust_type = str(self.eh_nonlinear_cfg.get("type", "logistic_normalized")).strip().lower()
+        if self.eh_robust_type != "logistic_normalized":
+            raise ValueError(f"Only logistic_normalized nonlinear EH is supported, got {self.eh_robust_type!r}")
+        self.eh_robust_e_max = float(self.eh_nonlinear_cfg.get("e_max", 1.0))
+        self.eh_robust_a = float(self.eh_nonlinear_cfg.get("a", 12.0))
+        self.eh_robust_b = float(self.eh_nonlinear_cfg.get("b", 0.10))
+        self.eh_robust_scale_match = bool(self.eh_nonlinear_cfg.get("scale_match", True))
+        scale_cfg = self.eh_nonlinear_cfg.get("scale", None)
+        self.eh_robust_scale = 1.0 if scale_cfg in (None, "") else float(scale_cfg)
 
         tx_device = hybrid_cfg.get("tx_device", ["LED", "LD", "LD"])
         if len(tx_device) != self.n_tx:
@@ -231,6 +251,57 @@ class MultiTxUwSliptEnv(gym.Env):
     def _compute_tx_signal(self, currents: np.ndarray) -> np.ndarray:
         eta_tx = self._tx_vector(self.eta_led, self.eta_ld)
         return currents * eta_tx * self.channel
+
+    @staticmethod
+    def _stable_sigmoid(x: float) -> float:
+        x = float(np.clip(x, -60.0, 60.0))
+        return float(1.0 / (1.0 + np.exp(-x)))
+
+    def _compute_nonlinear_eh_raw(self, eh_input_eff: float) -> float:
+        """Normalized logistic EH response before the global robustness-check scale.
+
+        This is only used when env.eh_model="nonlinear"; the main-paper default remains
+        the original linear EH mapping.
+        """
+        x = float(max(eh_input_eff, 0.0))
+        e_max = float(max(self.eh_robust_e_max, 0.0))
+        if e_max <= 0.0:
+            return 0.0
+        omega = self._stable_sigmoid(-self.eh_robust_a * self.eh_robust_b)
+        y = self._stable_sigmoid(self.eh_robust_a * (x - self.eh_robust_b))
+        denom = max(1.0 - omega, 1.0e-12)
+        raw = e_max * (y - omega) / denom
+        return float(np.clip(raw, 0.0, e_max))
+
+    def _compute_eh_metric(self, eh_input_eff: float) -> Dict[str, float | str]:
+        linear_proxy = float(eh_input_eff)
+        raw_nonlinear = self._compute_nonlinear_eh_raw(linear_proxy)
+        scaled_nonlinear = float(raw_nonlinear * self.eh_robust_scale)
+        if self.eh_model == "linear":
+            eh_metric = linear_proxy
+        elif self.eh_model == "logistic":
+            eh_metric = float(
+                logistic_eh_metric(
+                    linear_proxy,
+                    M=self.eh_nl_M,
+                    a=self.eh_nl_a,
+                    b=self.eh_nl_b,
+                )
+            )
+        else:
+            eh_metric = scaled_nonlinear
+        sat_threshold = 0.99 * max(self.eh_robust_e_max, 1.0e-12)
+        near_zero_threshold = max(1.0e-12, 1.0e-4 * max(self.eh_robust_e_max, 1.0e-12))
+        return {
+            "eh_model": self.eh_model,
+            "eh_input_eff": float(linear_proxy),
+            "eh_metric_linear_proxy": float(linear_proxy),
+            "eh_metric_raw_nonlinear": float(raw_nonlinear),
+            "eh_metric": float(eh_metric),
+            "eh_saturation_fraction": float(raw_nonlinear >= sat_threshold),
+            "eh_near_zero_fraction": float(raw_nonlinear <= near_zero_threshold),
+            "eh_scale": float(self.eh_robust_scale),
+        }
 
     def _update_channel(self) -> None:
         mis_rho = float(np.clip(self.temporal_misalign_rho, 0.0, 0.995))
@@ -397,30 +468,24 @@ class MultiTxUwSliptEnv(gym.Env):
         snr = max(info_signal / max(noise_power, 1.0e-6), 1.0e-6)
         qos_rate = float(self._mode_gain(mode_exec, self.mode_se_gain) * info_share * np.log2(1.0 + snr))
         eh_input_eff = float(self._mode_gain(mode_exec, self.mode_eh_gain) * eh_share * eh_input)
-        eh_metric = self._compute_eh_metric(eh_input_eff)
+        eh_diag = self._compute_eh_metric(eh_input_eff)
+        eh_metric = float(eh_diag["eh_metric"])
         return {
             "info_share": float(info_share),
             "eh_share": float(eh_share),
             "qos_rate": float(qos_rate),
-            "eh_input_eff": float(eh_input_eff),
-            "eh_metric_linear_proxy": float(eh_input_eff),
             "eh_metric": float(eh_metric),
+            "eh_model": str(eh_diag["eh_model"]),
+            "eh_input_eff": float(eh_diag["eh_input_eff"]),
+            "eh_metric_linear_proxy": float(eh_diag["eh_metric_linear_proxy"]),
+            "eh_metric_raw_nonlinear": float(eh_diag["eh_metric_raw_nonlinear"]),
+            "eh_saturation_fraction": float(eh_diag["eh_saturation_fraction"]),
+            "eh_near_zero_fraction": float(eh_diag["eh_near_zero_fraction"]),
+            "eh_scale": float(eh_diag["eh_scale"]),
             "reward_id_term": float(self.se_weight * qos_rate),
             "reward_eh_term": float(self.eh_weight * eh_metric),
             "total_reward_no_penalty": float(self.se_weight * qos_rate + self.eh_weight * eh_metric),
         }
-
-    def _compute_eh_metric(self, eh_input_eff: float) -> float:
-        if self.eh_model == "linear":
-            return float(eh_input_eff)
-        return float(
-            logistic_eh_metric(
-                float(eh_input_eff),
-                M=self.eh_nl_M,
-                a=self.eh_nl_a,
-                b=self.eh_nl_b,
-            )
-        )
 
     def _thermal_coupling_term(self, temps: np.ndarray) -> np.ndarray:
         return thermal_coupling_term_np(
@@ -492,8 +557,9 @@ class MultiTxUwSliptEnv(gym.Env):
 
         qos_rate = float(mode_se * info_share * np.log2(1.0 + snr))
         eh_input_eff = float(mode_eh * eh_share * eh_input)
-        eh_metric_linear_proxy = float(eh_input_eff)
-        eh_metric = self._compute_eh_metric(eh_input_eff)
+        eh_diag = self._compute_eh_metric(eh_input_eff)
+        eh_metric = float(eh_diag["eh_metric"])
+        eh_metric_linear_proxy = float(eh_diag["eh_metric_linear_proxy"])
         id_term = self.se_weight * qos_rate
         eh_term = self.eh_weight * eh_metric
 
@@ -555,6 +621,10 @@ class MultiTxUwSliptEnv(gym.Env):
             "eh_nl_a": float(self.eh_nl_a),
             "eh_nl_b": float(self.eh_nl_b),
             "eh_calibration_hash": str(self.eh_calibration_hash),
+            "eh_metric_raw_nonlinear": float(eh_diag["eh_metric_raw_nonlinear"]),
+            "eh_saturation_fraction": float(eh_diag["eh_saturation_fraction"]),
+            "eh_near_zero_fraction": float(eh_diag["eh_near_zero_fraction"]),
+            "eh_scale": float(eh_diag["eh_scale"]),
             "reward_se_term": float(id_term),
             "reward_eh_term": float(eh_term),
             "reward_id_term": float(id_term),
