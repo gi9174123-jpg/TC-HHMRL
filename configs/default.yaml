@@ -17,12 +17,12 @@ physics:
   eh_nl_b: 0.0005043011020860283
   eh_calibration_hash: 9282780b68b41465ed0568ff03816c355c3003e73fc68800b82a46760f01794a
   eh_calibration_r_sat: 0.85
-  thermal_model: coupled
-  safety_projection_version: coupled_thermal_cap_v1
+  thermal_model: independent
+  safety_projection_version: independent_thermal_cap_v1
   thermal_coupling_matrix:
-    - [0.0, 0.015, 0.0075]
-    - [0.015, 0.0, 0.015]
-    - [0.0075, 0.015, 0.0]
+    - [0.0, 0.0, 0.0]
+    - [0.0, 0.0, 0.0]
+    - [0.0, 0.0, 0.0]
 
 env:
   episode_len: 80

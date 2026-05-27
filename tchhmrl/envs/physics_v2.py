@@ -10,14 +10,16 @@ import numpy as np
 
 DEFAULT_PHYSICS_VERSION = "physics_v2"
 DEFAULT_EH_MODEL = "logistic"
-DEFAULT_THERMAL_MODEL = "coupled"
-DEFAULT_SAFETY_PROJECTION_VERSION = "coupled_thermal_cap_v1"
+DEFAULT_THERMAL_MODEL = "independent"
+COUPLED_SAFETY_PROJECTION_VERSION = "coupled_thermal_cap_v1"
+INDEPENDENT_SAFETY_PROJECTION_VERSION = "independent_thermal_cap_v1"
+DEFAULT_SAFETY_PROJECTION_VERSION = INDEPENDENT_SAFETY_PROJECTION_VERSION
 
 DEFAULT_THERMAL_COUPLING_MATRIX = np.asarray(
     [
-        [0.0, 0.015, 0.0075],
-        [0.015, 0.0, 0.015],
-        [0.0075, 0.015, 0.0],
+        [0.0, 0.0, 0.0],
+        [0.0, 0.0, 0.0],
+        [0.0, 0.0, 0.0],
     ],
     dtype=np.float32,
 )
@@ -50,6 +52,22 @@ def coupling_matrix_hash(matrix: Any) -> str:
     mat = np.asarray(matrix, dtype=np.float32)
     payload = {"thermal_coupling_matrix": [[float(x) for x in row] for row in mat.tolist()]}
     return _stable_hash(payload)
+
+
+def normalize_safety_projection_version(thermal_model: str, version: Any) -> str:
+    model = str(thermal_model).lower()
+    raw = "" if version is None else str(version).strip()
+    if model == "independent" and raw in {
+        "",
+        DEFAULT_SAFETY_PROJECTION_VERSION,
+        COUPLED_SAFETY_PROJECTION_VERSION,
+    }:
+        return INDEPENDENT_SAFETY_PROJECTION_VERSION
+    if model == "coupled" and raw in {"", DEFAULT_SAFETY_PROJECTION_VERSION}:
+        return COUPLED_SAFETY_PROJECTION_VERSION
+    if raw:
+        return raw
+    return DEFAULT_SAFETY_PROJECTION_VERSION
 
 
 def eh_calibration_hash(params: Mapping[str, Any]) -> str:

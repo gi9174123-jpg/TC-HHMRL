@@ -15,6 +15,7 @@ from tchhmrl.envs.physics_v2 import (
     coupling_matrix_hash,
     eh_calibration_hash,
     logistic_eh_metric,
+    normalize_safety_projection_version,
     thermal_coupling_term_np,
     validate_coupling_matrix,
 )
@@ -68,8 +69,9 @@ class MultiTxUwSliptEnv(gym.Env):
         self.thermal_model = str(physics_cfg.get("thermal_model", DEFAULT_THERMAL_MODEL)).lower()
         if self.thermal_model not in {"independent", "coupled"}:
             raise ValueError(f"unsupported physics.thermal_model={self.thermal_model}")
-        self.safety_projection_version = str(
-            physics_cfg.get("safety_projection_version", DEFAULT_SAFETY_PROJECTION_VERSION)
+        self.safety_projection_version = normalize_safety_projection_version(
+            self.thermal_model,
+            physics_cfg.get("safety_projection_version", DEFAULT_SAFETY_PROJECTION_VERSION),
         )
         coupling_matrix = physics_cfg.get("thermal_coupling_matrix", DEFAULT_THERMAL_COUPLING_MATRIX.tolist())
         self.thermal_coupling_matrix = validate_coupling_matrix(coupling_matrix, n_tx=3)
@@ -565,8 +567,8 @@ class MultiTxUwSliptEnv(gym.Env):
 
         thermal_coeff = self._tx_vector(self.thermal_led_coeff, self.thermal_ld_coeff)
         temps_before_update = self.temps.copy()
-        thermal_coupling_term = self._thermal_coupling_term(temps_before_update)
-        thermal_base = (1.0 - self.gamma) * temps_before_update + self.gamma * self.amb_temp + thermal_coupling_term
+        thermal_source_term = self._thermal_coupling_term(temps_before_update)
+        thermal_base = (1.0 - self.gamma) * temps_before_update + self.gamma * self.amb_temp + thermal_source_term
         thermal_drive = self.delta * thermal_coeff * (currents**2)
         self.temps = (thermal_base + thermal_drive).astype(np.float32)
 
@@ -668,12 +670,13 @@ class MultiTxUwSliptEnv(gym.Env):
             "temps": self.temps.copy(),
             "thermal_model": self.thermal_model,
             "thermal_coupling_matrix_hash": self.thermal_coupling_matrix_hash,
-            "thermal_coupling_term_tx0": float(thermal_coupling_term[0]) if self.n_tx > 0 else 0.0,
-            "thermal_coupling_term_tx1": float(thermal_coupling_term[1]) if self.n_tx > 1 else 0.0,
-            "thermal_coupling_term_tx2": float(thermal_coupling_term[2]) if self.n_tx > 2 else 0.0,
-            "thermal_base_coupled_tx0": float(thermal_base[0]) if self.n_tx > 0 else 0.0,
-            "thermal_base_coupled_tx1": float(thermal_base[1]) if self.n_tx > 1 else 0.0,
-            "thermal_base_coupled_tx2": float(thermal_base[2]) if self.n_tx > 2 else 0.0,
+            "thermal_source_model": self.thermal_model,
+            "thermal_source_term_tx0": float(thermal_source_term[0]) if self.n_tx > 0 else 0.0,
+            "thermal_source_term_tx1": float(thermal_source_term[1]) if self.n_tx > 1 else 0.0,
+            "thermal_source_term_tx2": float(thermal_source_term[2]) if self.n_tx > 2 else 0.0,
+            "thermal_base_tx0": float(thermal_base[0]) if self.n_tx > 0 else 0.0,
+            "thermal_base_tx1": float(thermal_base[1]) if self.n_tx > 1 else 0.0,
+            "thermal_base_tx2": float(thermal_base[2]) if self.n_tx > 2 else 0.0,
             "gamma": float(self.gamma),
             "delta": float(self.delta),
             "attenuation_eff": float(self.attenuation_eff),
@@ -691,4 +694,15 @@ class MultiTxUwSliptEnv(gym.Env):
             "physics_version": self.physics_version,
             "safety_projection_version": self.safety_projection_version,
         }
+        if self.thermal_model == "coupled":
+            info.update(
+                {
+                    "thermal_coupling_term_tx0": float(thermal_source_term[0]) if self.n_tx > 0 else 0.0,
+                    "thermal_coupling_term_tx1": float(thermal_source_term[1]) if self.n_tx > 1 else 0.0,
+                    "thermal_coupling_term_tx2": float(thermal_source_term[2]) if self.n_tx > 2 else 0.0,
+                    "thermal_base_coupled_tx0": float(thermal_base[0]) if self.n_tx > 0 else 0.0,
+                    "thermal_base_coupled_tx1": float(thermal_base[1]) if self.n_tx > 1 else 0.0,
+                    "thermal_base_coupled_tx2": float(thermal_base[2]) if self.n_tx > 2 else 0.0,
+                }
+            )
         return obs, reward, terminated, truncated, info

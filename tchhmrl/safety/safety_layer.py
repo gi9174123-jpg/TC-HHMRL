@@ -11,6 +11,7 @@ from tchhmrl.envs.physics_v2 import (
     DEFAULT_THERMAL_COUPLING_MATRIX,
     DEFAULT_THERMAL_MODEL,
     coupling_matrix_hash,
+    normalize_safety_projection_version,
     validate_coupling_matrix,
 )
 
@@ -53,8 +54,9 @@ class SafetyLayer:
         self.thermal_model = str(physics_cfg.get("thermal_model", DEFAULT_THERMAL_MODEL)).lower()
         if self.thermal_model not in {"independent", "coupled"}:
             raise ValueError(f"unsupported physics.thermal_model={self.thermal_model}")
-        self.safety_projection_version = str(
-            physics_cfg.get("safety_projection_version", DEFAULT_SAFETY_PROJECTION_VERSION)
+        self.safety_projection_version = normalize_safety_projection_version(
+            self.thermal_model,
+            physics_cfg.get("safety_projection_version", DEFAULT_SAFETY_PROJECTION_VERSION),
         )
         coupling_matrix = physics_cfg.get("thermal_coupling_matrix", DEFAULT_THERMAL_COUPLING_MATRIX.tolist())
         self.thermal_coupling_matrix = validate_coupling_matrix(coupling_matrix, n_tx=len(safety_cfg["current_max"]))
@@ -337,7 +339,7 @@ class SafetyLayer:
         rho, tau = self._project_mode_params_np(mode, rho_raw, tau_raw)
 
         temps = np.asarray(temps, dtype=np.float32)
-        thermal_base, thermal_coupling_term = self._thermal_base_np(temps, float(amb_temp), float(gamma))
+        thermal_base, thermal_source_term = self._thermal_base_np(temps, float(amb_temp), float(gamma))
         T_pred = thermal_base + delta * self.tx_thermal_coeff * (currents**2)
         thermal_cap_current = self.current_max.astype(np.float32)
         thermal_cap_scale = np.ones_like(currents, dtype=np.float32)
@@ -350,7 +352,7 @@ class SafetyLayer:
             cutoff_scale = _sigmoid_np(self.cutoff_alpha * (self.thermal_cutoff - T_pred))
             thermal_scale = (soft_scale * cutoff_scale).astype(np.float32)
         elif self.projection_mode == "thermal_cap":
-            currents, thermal_cap_current, thermal_scale, thermal_base, thermal_coupling_term = self._thermal_cap_np(
+            currents, thermal_cap_current, thermal_scale, thermal_base, thermal_source_term = self._thermal_cap_np(
                 currents=currents,
                 temps=temps,
                 amb_temp=float(amb_temp),
@@ -375,42 +377,44 @@ class SafetyLayer:
         projection_compression_ratio = float(projected_current_total / max(raw_current_total, 1.0e-6))
         thermal_margin = (self.thermal_safe - T_pred).astype(np.float32)
 
-        return (
-            {
-                "boost_combo_exec": int(exec_boost),
-                "mode_exec": int(mode),
-                "upper_idx_exec": int(self.encode_exec(exec_boost, mode)),
-                "currents_exec": currents.astype(np.float32),
-                "rho_exec": float(rho),
-                "tau_exec": float(tau),
-                "t_pred": T_pred.astype(np.float32),
-                "thermal_scale": thermal_scale,
-                "thermal_soft_scale": soft_scale.astype(np.float32),
-                "thermal_cutoff_scale": cutoff_scale.astype(np.float32),
-                "thermal_cap_current": thermal_cap_current.astype(np.float32),
-                "thermal_cap_scale": thermal_cap_scale.astype(np.float32),
-                "thermal_cap_margin_c": float(self.thermal_cap_margin_c),
-                "thermal_coupling_term": thermal_coupling_term.astype(np.float32),
-                "thermal_base_coupled": thermal_base.astype(np.float32),
-                "thermal_pred_temp": T_pred.astype(np.float32),
-                "thermal_pred_margin": thermal_margin.astype(np.float32),
-                "thermal_model": self.thermal_model,
-                "thermal_coupling_matrix_hash": self.thermal_coupling_matrix_hash,
-                "safety_projection_version": self.safety_projection_version,
-                "thermal_margin": thermal_margin,
-                "thermal_margin_min": float(np.min(thermal_margin)),
-                "action_decode_mode": self.action_decode_mode,
-                "raw_current_frac": current_frac.astype(np.float32),
-                "rho_raw_decoded": float(rho_raw),
-                "tau_raw_decoded": float(tau_raw),
-                "raw_current_total": raw_current_total,
-                "masked_current_total": masked_current_total,
-                "bus_projected_current_total": bus_projected_current_total,
-                "projected_current_total": projected_current_total,
-                "projection_compression_ratio": projection_compression_ratio,
-            },
-            mem,
-        )
+        out = {
+            "boost_combo_exec": int(exec_boost),
+            "mode_exec": int(mode),
+            "upper_idx_exec": int(self.encode_exec(exec_boost, mode)),
+            "currents_exec": currents.astype(np.float32),
+            "rho_exec": float(rho),
+            "tau_exec": float(tau),
+            "t_pred": T_pred.astype(np.float32),
+            "thermal_scale": thermal_scale,
+            "thermal_soft_scale": soft_scale.astype(np.float32),
+            "thermal_cutoff_scale": cutoff_scale.astype(np.float32),
+            "thermal_cap_current": thermal_cap_current.astype(np.float32),
+            "thermal_cap_scale": thermal_cap_scale.astype(np.float32),
+            "thermal_cap_margin_c": float(self.thermal_cap_margin_c),
+            "thermal_source_model": self.thermal_model,
+            "thermal_source_term": thermal_source_term.astype(np.float32),
+            "thermal_base": thermal_base.astype(np.float32),
+            "thermal_pred_temp": T_pred.astype(np.float32),
+            "thermal_pred_margin": thermal_margin.astype(np.float32),
+            "thermal_model": self.thermal_model,
+            "thermal_coupling_matrix_hash": self.thermal_coupling_matrix_hash,
+            "safety_projection_version": self.safety_projection_version,
+            "thermal_margin": thermal_margin,
+            "thermal_margin_min": float(np.min(thermal_margin)),
+            "action_decode_mode": self.action_decode_mode,
+            "raw_current_frac": current_frac.astype(np.float32),
+            "rho_raw_decoded": float(rho_raw),
+            "tau_raw_decoded": float(tau_raw),
+            "raw_current_total": raw_current_total,
+            "masked_current_total": masked_current_total,
+            "bus_projected_current_total": bus_projected_current_total,
+            "projected_current_total": projected_current_total,
+            "projection_compression_ratio": projection_compression_ratio,
+        }
+        if self.thermal_model == "coupled":
+            out["thermal_coupling_term"] = thermal_source_term.astype(np.float32)
+            out["thermal_base_coupled"] = thermal_base.astype(np.float32)
+        return out, mem
 
     def project_torch(
         self,
@@ -481,7 +485,7 @@ class SafetyLayer:
             dtype=lower_raw.dtype,
             device=device,
         ).view(1, -1)
-        thermal_base, thermal_coupling_term = self._thermal_base_torch(temps, amb_temp, gamma)
+        thermal_base, thermal_source_term = self._thermal_base_torch(temps, amb_temp, gamma)
         T_pred = thermal_base + delta * thermal_coeff * (currents**2)
         thermal_cap_current = current_max.expand_as(currents)
         thermal_cap_scale = torch.ones_like(currents)
@@ -493,7 +497,7 @@ class SafetyLayer:
             cutoff_scale = torch.sigmoid(self.cutoff_alpha * (self.thermal_cutoff - T_pred))
             thermal_scale = soft_scale * cutoff_scale
         elif self.projection_mode == "thermal_cap":
-            currents, thermal_cap_current, thermal_scale, thermal_base, thermal_coupling_term = self._thermal_cap_torch(
+            currents, thermal_cap_current, thermal_scale, thermal_base, thermal_source_term = self._thermal_cap_torch(
                 currents=currents,
                 temps=temps,
                 amb_temp=amb_temp,
@@ -524,7 +528,7 @@ class SafetyLayer:
         projection_compression_ratio = projected_current_total / torch.clamp(raw_current_total, min=1.0e-6)
         thermal_margin = self.thermal_safe - T_pred
 
-        return {
+        out = {
             "boost_combo_exec": boost_combo,
             "mode_exec": torch.clamp(mode.long().view(-1), 0, 2),
             "upper_idx_exec": torch.clamp(boost_combo.long().view(-1), 0, 3) * 3 + torch.clamp(mode.long().view(-1), 0, 2),
@@ -543,10 +547,14 @@ class SafetyLayer:
                 dtype=lower_raw.dtype,
                 device=device,
             ),
-            "thermal_coupling_term": thermal_coupling_term,
-            "thermal_base_coupled": thermal_base,
+            "thermal_source_model": self.thermal_model,
+            "thermal_source_term": thermal_source_term,
+            "thermal_base": thermal_base,
             "thermal_pred_temp": T_pred,
             "thermal_pred_margin": thermal_margin,
+            "thermal_model": self.thermal_model,
+            "thermal_coupling_matrix_hash": self.thermal_coupling_matrix_hash,
+            "safety_projection_version": self.safety_projection_version,
             "thermal_margin": thermal_margin,
             "thermal_margin_min": thermal_margin.min(dim=1).values,
             "raw_current_frac": current_frac,
@@ -558,6 +566,10 @@ class SafetyLayer:
             "projected_current_total": projected_current_total,
             "projection_compression_ratio": projection_compression_ratio,
         }
+        if self.thermal_model == "coupled":
+            out["thermal_coupling_term"] = thermal_source_term
+            out["thermal_base_coupled"] = thermal_base
+        return out
 
     def _dalal_correct_currents_np(
         self,

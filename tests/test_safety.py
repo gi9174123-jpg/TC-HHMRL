@@ -473,6 +473,13 @@ def test_thermal_coupling_zero_equals_independent_and_direction():
     assert np.allclose(coupling_zero, 0.0, atol=1.0e-7)
 
     cfg_dir = copy.deepcopy(load_cfg("configs/default.yaml"))
+    cfg_dir["physics"]["thermal_model"] = "coupled"
+    cfg_dir["physics"]["safety_projection_version"] = "coupled_thermal_cap_v1"
+    cfg_dir["physics"]["thermal_coupling_matrix"] = [
+        [0.0, 0.015, 0.0075],
+        [0.015, 0.0, 0.015],
+        [0.0075, 0.015, 0.0],
+    ]
     safety_dir = SafetyLayer(cfg_dir)
     _, coupling = safety_dir._thermal_base_np(np.asarray([50.0, 40.0, 40.0], dtype=np.float32), 35.0, 0.06)
     assert coupling[1] > 0.0
@@ -491,8 +498,11 @@ def test_thermal_pred_temp_and_margin_logged():
         delta=4.0,
         mem={"current_boost": 3, "dwell_count": 3},
     )
-    for key in ["thermal_coupling_term", "thermal_base_coupled", "thermal_pred_temp", "thermal_pred_margin"]:
+    for key in ["thermal_source_term", "thermal_base", "thermal_pred_temp", "thermal_pred_margin"]:
         assert key in out
         assert np.asarray(out[key]).shape == (3,)
+    assert "thermal_coupling_term" not in out
+    assert "thermal_base_coupled" not in out
+    assert np.allclose(out["thermal_source_term"], 0.0, atol=1.0e-7)
     assert np.allclose(out["thermal_pred_temp"], out["t_pred"], atol=1.0e-7)
     assert np.allclose(out["thermal_pred_margin"], out["thermal_margin"], atol=1.0e-7)

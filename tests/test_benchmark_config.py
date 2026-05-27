@@ -24,8 +24,8 @@ def test_default_safety_uses_corrected_action_mapping_and_main_projection():
 
     assert cfg["physics"]["physics_version"] == "physics_v2"
     assert cfg["physics"]["eh_model"] == "logistic"
-    assert cfg["physics"]["thermal_model"] == "coupled"
-    assert cfg["physics"]["safety_projection_version"] == "coupled_thermal_cap_v1"
+    assert cfg["physics"]["thermal_model"] == "independent"
+    assert cfg["physics"]["safety_projection_version"] == "independent_thermal_cap_v1"
     assert cfg["safety"]["projection_mode"] == "thermal_cap"
     assert cfg["safety"]["action_decode_mode"] == "tanh_affine"
     assert float(cfg["safety"]["smooth_relaxed_margin_c"]) == 1.0

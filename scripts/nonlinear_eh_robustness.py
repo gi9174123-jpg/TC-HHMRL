@@ -20,6 +20,7 @@ from scripts.profile_online_latency import _choose_checkpoint, _load_yaml
 from tchhmrl.agents.hierarchical_agent import HierarchicalAgent
 from tchhmrl.envs.task_contract import build_task_summary_v2
 from tchhmrl.envs.uw_slipt_env import MultiTxUwSliptEnv
+from tchhmrl.envs.physics_v2 import INDEPENDENT_SAFETY_PROJECTION_VERSION, normalize_safety_projection_version
 from tchhmrl.utils.config import resolve_device
 
 
@@ -42,6 +43,14 @@ def _configure_eh(cfg: Dict[str, Any], *, eh_model: str, eh_scale: float | None 
     out["env"].setdefault("eh_nonlinear", {})
     if eh_scale is not None:
         out["env"]["eh_nonlinear"]["scale"] = float(eh_scale)
+    out.setdefault("physics", {})
+    out["physics"]["thermal_model"] = "independent"
+    out["physics"]["safety_projection_version"] = normalize_safety_projection_version(
+        "independent",
+        out["physics"].get("safety_projection_version", INDEPENDENT_SAFETY_PROJECTION_VERSION),
+    )
+    if str(eh_model).strip().lower() == "nonlinear":
+        out["physics"]["eh_model"] = "linear"
     return out
 
 

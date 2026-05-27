@@ -37,6 +37,7 @@ from tchhmrl.envs.task_contract import (
 )
 from tchhmrl.envs.task_sampler import TaskSampler, validate_site_bank
 from tchhmrl.envs.uw_slipt_env import MultiTxUwSliptEnv
+from tchhmrl.envs.physics_v2 import INDEPENDENT_SAFETY_PROJECTION_VERSION, normalize_safety_projection_version
 from tchhmrl.meta.meta_trainer import MetaTrainer
 from tchhmrl.safety.safety_layer import SafetyLayer, raw_from_frac01
 from tchhmrl.utils.config import apply_cli_overrides, load_cfg, resolve_device
@@ -97,6 +98,27 @@ def formal_metadata_snapshot(cfg: Dict, *, pre_alignment: bool | None = None, ta
         **alignment_snapshot(cfg, pre_alignment=pre_alignment, task_source=task_source),
         **physics_snapshot_from_cfg(cfg),
     }
+
+
+def effective_eh_model_from_cfg(cfg: Dict) -> str:
+    env_eh = cfg.get("env", {}).get("eh_model", None)
+    if env_eh not in (None, ""):
+        return str(env_eh).strip().lower()
+    return str(cfg.get("physics", {}).get("eh_model", "")).strip().lower()
+
+
+def is_supplementary_independent_protocol(cfg: Dict) -> bool:
+    physics_cfg = cfg.get("physics", {})
+    env_cfg = cfg.get("env", {})
+    effective_eh = effective_eh_model_from_cfg(cfg)
+    scale = env_cfg.get("eh_nonlinear", {}).get("scale", None)
+    return (
+        effective_eh in {"linear", "nonlinear"}
+        and str(physics_cfg.get("thermal_model", "")).strip().lower() == "independent"
+        and str(physics_cfg.get("safety_projection_version", "")).strip()
+        == INDEPENDENT_SAFETY_PROJECTION_VERSION
+        and (effective_eh != "nonlinear" or scale not in (None, ""))
+    )
 
 
 def sync_site_bank_with_cfg(cfg: Dict) -> None:
@@ -260,6 +282,14 @@ def apply_baseline_overrides(cfg: Dict, baseline: str) -> None:
         cfg.setdefault("agent", {})["z_dim"] = 0
         cfg.setdefault("meta", {})["explicit_inner_outer"] = False
         cfg["meta"]["query_updates_enabled"] = False
+        cfg["baseline_metadata"] = {
+            "baseline_family": "sac_lagrangian",
+            "uses_task_oracle": False,
+            "uses_learned_policy": True,
+            "uses_same_safety_projection": True,
+            "safety_protocol": f"common_{cfg.get('safety', {}).get('projection_mode', 'thermal_cap')}_projection",
+            "comparison_role": "learning_baseline",
+        }
         return
     if baseline == "sac_dalal_safe":
         cfg.setdefault("context", {})["enabled"] = False
@@ -765,8 +795,17 @@ def validate_training_config(cfg: Dict, scenario: str, *, strict_thermal: bool =
         "pre_alignment": bool(alignment_cfg["pre_alignment"]),
         "site_bank_valid": len(site_bank_issues) == 0,
         "site_bank_issues": site_bank_issues,
+        "env_eh_model": str(env_cfg.get("eh_model", "")),
+        "effective_eh_model": effective_eh_model_from_cfg(cfg),
+        "env_eh_nonlinear_scale": env_cfg.get("eh_nonlinear", {}).get("scale", None),
         **physics_cfg,
     }
+    official_physics_ok = bool(
+        checks["eh_model"] == "logistic"
+        and checks["thermal_model"] == "independent"
+        and checks["safety_projection_version"] == INDEPENDENT_SAFETY_PROJECTION_VERSION
+    )
+    supplementary_physics_ok = bool(is_supplementary_independent_protocol(cfg))
     checks["all_passed"] = bool(
         checks["dual_lrs_match"]
         and checks["dual_lr_match"]
@@ -778,12 +817,12 @@ def validate_training_config(cfg: Dict, scenario: str, *, strict_thermal: bool =
         and checks["task_summary_version"] == "site_v2"
         and (checks["pre_alignment"] is False)
         and checks["physics_version"] == "physics_v2"
-        and checks["eh_model"] == "logistic"
-        and checks["thermal_model"] == "coupled"
-        and checks["safety_projection_version"] == "coupled_thermal_cap_v1"
+        and (official_physics_ok or supplementary_physics_ok)
         and bool(checks["thermal_coupling_matrix_hash"])
         and bool(checks["eh_calibration_hash"])
     )
+    checks["official_physics_ok"] = official_physics_ok
+    checks["supplementary_independent_physics_ok"] = supplementary_physics_ok
 
     if not checks["all_passed"]:
         raise ValueError(f"Precheck failed for scenario={scenario}: {json.dumps(checks, ensure_ascii=False)}")
@@ -992,7 +1031,7 @@ def select_checkpoint(
 
 
 def _safe_projection_aux(safe: Dict) -> Dict[str, object]:
-    return {
+    out = {
         "t_pred": safe.get("t_pred"),
         "thermal_scale": safe.get("thermal_scale"),
         "thermal_soft_scale": safe.get("thermal_soft_scale"),
@@ -1000,8 +1039,9 @@ def _safe_projection_aux(safe: Dict) -> Dict[str, object]:
         "thermal_cap_current": safe.get("thermal_cap_current"),
         "thermal_cap_scale": safe.get("thermal_cap_scale"),
         "thermal_cap_margin_c": safe.get("thermal_cap_margin_c"),
-        "thermal_coupling_term": safe.get("thermal_coupling_term"),
-        "thermal_base_coupled": safe.get("thermal_base_coupled"),
+        "thermal_source_model": safe.get("thermal_source_model"),
+        "thermal_source_term": safe.get("thermal_source_term"),
+        "thermal_base": safe.get("thermal_base"),
         "thermal_pred_temp": safe.get("thermal_pred_temp"),
         "thermal_pred_margin": safe.get("thermal_pred_margin"),
         "thermal_model": safe.get("thermal_model"),
@@ -1018,6 +1058,11 @@ def _safe_projection_aux(safe: Dict) -> Dict[str, object]:
         "projected_current_total": safe.get("projected_current_total"),
         "projection_compression_ratio": safe.get("projection_compression_ratio"),
     }
+    if "thermal_coupling_term" in safe:
+        out["thermal_coupling_term"] = safe.get("thermal_coupling_term")
+    if "thermal_base_coupled" in safe:
+        out["thermal_base_coupled"] = safe.get("thermal_base_coupled")
+    return out
 
 
 def _projection_scalar(aux: Dict, key: str, default: float = float("nan")) -> float:
@@ -1042,10 +1087,17 @@ def _projection_vector(aux: Dict, key: str, n: int = 3) -> np.ndarray:
 
 def _add_projection_diagnostics(row: Dict, aux: Dict, currents_exec: np.ndarray) -> None:
     projected_default = float(np.sum(np.asarray(currents_exec, dtype=np.float32)))
-    row["action_decode_mode"] = str(aux.get("action_decode_mode", ""))
-    row["thermal_model"] = str(aux.get("thermal_model", ""))
-    row["thermal_coupling_matrix_hash"] = str(aux.get("thermal_coupling_matrix_hash", ""))
-    row["safety_projection_version"] = str(aux.get("safety_projection_version", ""))
+    row["action_decode_mode"] = str(aux.get("action_decode_mode", row.get("action_decode_mode", "")))
+    row["thermal_model"] = str(aux.get("thermal_model", row.get("thermal_model", "")))
+    row["thermal_source_model"] = str(
+        aux.get("thermal_source_model", aux.get("thermal_model", row.get("thermal_source_model", row.get("thermal_model", ""))))
+    )
+    row["thermal_coupling_matrix_hash"] = str(
+        aux.get("thermal_coupling_matrix_hash", row.get("thermal_coupling_matrix_hash", ""))
+    )
+    row["safety_projection_version"] = str(
+        aux.get("safety_projection_version", row.get("safety_projection_version", ""))
+    )
     row["raw_current_total"] = _projection_scalar(aux, "raw_current_total")
     row["masked_current_total"] = _projection_scalar(aux, "masked_current_total")
     row["bus_projected_current_total"] = _projection_scalar(aux, "bus_projected_current_total")
@@ -1067,11 +1119,20 @@ def _add_projection_diagnostics(row: Dict, aux: Dict, currents_exec: np.ndarray)
         ("thermal_cap_current", "thermal_cap_current"),
         ("thermal_cap_scale", "thermal_cap_scale"),
         ("t_pred", "t_pred"),
-        ("thermal_coupling_term", "thermal_coupling_term"),
-        ("thermal_base_coupled", "thermal_base_coupled"),
+        ("thermal_source_term", "thermal_source_term"),
+        ("thermal_base", "thermal_base"),
         ("thermal_pred_temp", "thermal_pred_temp"),
         ("thermal_pred_margin", "thermal_pred_margin"),
     ]:
+        arr = _projection_vector(aux, key)
+        for tx_idx, val in enumerate(arr.tolist()):
+            row[f"{prefix}_tx{tx_idx}"] = float(val)
+    for prefix, key in [
+        ("thermal_coupling_term", "thermal_coupling_term"),
+        ("thermal_base_coupled", "thermal_base_coupled"),
+    ]:
+        if key not in aux:
+            continue
         arr = _projection_vector(aux, key)
         for tx_idx, val in enumerate(arr.tolist()):
             row[f"{prefix}_tx{tx_idx}"] = float(val)
@@ -1085,6 +1146,17 @@ def _add_eh_diagnostics(row: Dict, info: Dict) -> None:
     row["eh_saturation_fraction"] = float(info.get("eh_saturation_fraction", 0.0))
     row["eh_near_zero_fraction"] = float(info.get("eh_near_zero_fraction", 0.0))
     row["eh_scale"] = float(info.get("eh_scale", 1.0))
+
+
+def _add_env_thermal_diagnostics(row: Dict, info: Dict, n: int = 3) -> None:
+    row["thermal_source_model_env"] = str(info.get("thermal_source_model", info.get("thermal_model", "")))
+    for tx_idx in range(n):
+        row[f"thermal_source_term_env_tx{tx_idx}"] = float(info.get(f"thermal_source_term_tx{tx_idx}", 0.0))
+        row[f"thermal_base_env_tx{tx_idx}"] = float(info.get(f"thermal_base_tx{tx_idx}", float("nan")))
+        if f"thermal_coupling_term_tx{tx_idx}" in info:
+            row[f"thermal_coupling_term_env_tx{tx_idx}"] = float(info[f"thermal_coupling_term_tx{tx_idx}"])
+        if f"thermal_base_coupled_tx{tx_idx}" in info:
+            row[f"thermal_base_coupled_env_tx{tx_idx}"] = float(info[f"thermal_base_coupled_tx{tx_idx}"])
 
 
 def collect_env_data(
@@ -1203,6 +1275,7 @@ def collect_env_data(
                 for tx_idx, current_val in enumerate(currents_exec.tolist()):
                     row[f"current_tx{tx_idx}"] = float(current_val)
                 _add_eh_diagnostics(row, info)
+                _add_env_thermal_diagnostics(row, info)
                 _add_projection_diagnostics(row, aux, currents_exec)
 
                 trainer.agent.episode.add(
@@ -2412,6 +2485,7 @@ def collect_env_data_heuristic(
                 for tx_idx, current_val in enumerate(currents_exec.tolist()):
                     row[f"current_tx{tx_idx}"] = float(current_val)
                 _add_eh_diagnostics(row, info)
+                _add_env_thermal_diagnostics(row, info)
                 _add_projection_diagnostics(row, aux, currents_exec)
                 rows.append(row)
                 obs = next_obs
@@ -2522,6 +2596,7 @@ def collect_env_data_plain_hierarchical_baseline(
                 for tx_idx, current_val in enumerate(currents_exec.tolist()):
                     row[f"current_tx{tx_idx}"] = float(current_val)
                 _add_eh_diagnostics(row, info)
+                _add_env_thermal_diagnostics(row, info)
                 _add_projection_diagnostics(row, aux, currents_exec)
                 rows.append(row)
                 obs = next_obs
@@ -3516,8 +3591,9 @@ def run_one_scenario(
             physics_eh_model = str(cfg.get("physics", {}).get("eh_model", ""))
             eh_model_cfg = str(cfg.get("env", {}).get("eh_model", physics_eh_model))
             eh_nonlinear_cfg = dict(cfg.get("env", {}).get("eh_nonlinear", {}) or {})
+            formal_meta = formal_metadata_snapshot(cfg)
             formal_record_probe = {
-                **formal_metadata_snapshot(cfg),
+                **formal_meta,
                 "projection_mode": projection_mode,
                 "action_decode_mode": action_decode_mode,
                 "eh_model": eh_model_cfg,
@@ -3552,6 +3628,8 @@ def run_one_scenario(
                     "env_thermal_cutoff": float(cfg["env"]["thermal_cutoff"]),
                     "safety_thermal_safe": float(cfg["safety"]["thermal_safe"]),
                     "safety_thermal_cutoff": float(cfg["safety"]["thermal_cutoff"]),
+                    **formal_meta,
+                    "physics_eh_model": physics_eh_model,
                     "projection_mode": projection_mode,
                     "action_decode_mode": action_decode_mode,
                     "eh_model": eh_model_cfg,
@@ -3601,7 +3679,6 @@ def run_one_scenario(
                     "thermal_cap_margin_c": pilot_meta.get("thermal_cap_margin_c"),
                     "formally_comparable": formally_comparable,
                     "formal_ranking_comparable": bool(is_formal_ranking_record(formal_record_probe)),
-                    **formal_metadata_snapshot(cfg),
                     "eval_reward": float(ev["reward"]),
                     "eval_se": float(ev["se"]),
                     "eval_eh": float(ev["eh"]),
@@ -3762,7 +3839,7 @@ def run_one_scenario(
                 "exact_reproduction": False,
                 "external_baseline": True,
                 "comparison_role": "model_based_optimizer",
-                "description": "One-step model-informed optimizer baseline using current task parameters and the same coupled-aware safety projection.",
+                "description": "One-step model-informed optimizer baseline using current task parameters and the same configured safety projection.",
             }
         elif variant == "hybrid":
             is_smooth_relaxed = ablation == "smooth_relaxed"
@@ -3928,13 +4005,37 @@ def run_benchmark(
     include_variants: bool = True,
     eh_model: str | None = None,
     eh_scale: float | None = None,
+    thermal_model: str | None = None,
+    safety_projection_version: str | None = None,
+    physics_eh_model: str | None = None,
 ) -> Path:
     base_cfg = apply_cli_overrides(load_cfg(cfg_path), device=device)
+    if thermal_model is not None:
+        thermal_model = str(thermal_model).strip().lower()
+        if thermal_model not in {"independent", "coupled"}:
+            raise ValueError(f"--thermal-model must be independent or coupled, got {thermal_model!r}")
+        base_cfg.setdefault("physics", {})["thermal_model"] = thermal_model
+    if safety_projection_version is not None:
+        base_cfg.setdefault("physics", {})["safety_projection_version"] = str(safety_projection_version).strip()
+    elif thermal_model == "independent":
+        base_cfg.setdefault("physics", {})["safety_projection_version"] = INDEPENDENT_SAFETY_PROJECTION_VERSION
+    if "physics" in base_cfg and "thermal_model" in base_cfg["physics"]:
+        base_cfg["physics"]["safety_projection_version"] = normalize_safety_projection_version(
+            base_cfg["physics"]["thermal_model"],
+            base_cfg["physics"].get("safety_projection_version"),
+        )
+    if physics_eh_model is not None:
+        physics_eh_model = str(physics_eh_model).strip().lower()
+        if physics_eh_model not in {"linear", "logistic"}:
+            raise ValueError(f"--physics-eh-model must be linear or logistic, got {physics_eh_model!r}")
+        base_cfg.setdefault("physics", {})["eh_model"] = physics_eh_model
     if eh_model is not None:
         eh_model = str(eh_model).strip().lower()
         if eh_model not in {"linear", "nonlinear"}:
             raise ValueError(f"--eh-model must be linear or nonlinear, got {eh_model!r}")
         base_cfg.setdefault("env", {})["eh_model"] = eh_model
+        if eh_model == "nonlinear" and physics_eh_model is None:
+            base_cfg.setdefault("physics", {})["eh_model"] = "linear"
     if eh_scale is not None:
         base_cfg.setdefault("env", {}).setdefault("eh_nonlinear", {})["scale"] = float(eh_scale)
     final_eh_model_raw = base_cfg.get("env", {}).get("eh_model", None)
@@ -3981,7 +4082,11 @@ def run_benchmark(
         p = out_root / s / "run_summary.json"
         if p.exists():
             with p.open("r", encoding="utf-8") as f:
-                all_run_summaries.extend(filter_formally_comparable_records(json.load(f), strict=True))
+                scenario_rows = json.load(f)
+                if is_supplementary_independent_protocol(base_cfg):
+                    all_run_summaries.extend(dict(row) for row in scenario_rows)
+                else:
+                    all_run_summaries.extend(filter_formally_comparable_records(scenario_rows, strict=True))
     run_summary_path = out_root / "run_summary.json"
     with run_summary_path.open("w", encoding="utf-8") as f:
         json.dump(all_run_summaries, f, ensure_ascii=False, indent=2)
@@ -4023,6 +4128,8 @@ def run_benchmark(
         "cfg_path": cfg_path,
         "alignment": alignment_snapshot(base_cfg),
         "physics": physics_snapshot_from_cfg(base_cfg),
+        "effective_eh_model": effective_eh_model_from_cfg(base_cfg),
+        "supplementary_independent_protocol": bool(is_supplementary_independent_protocol(base_cfg)),
         "eh_override_model": str(base_cfg.get("env", {}).get("eh_model", "")),
         "eh_nonlinear_override": dict(base_cfg.get("env", {}).get("eh_nonlinear", {}) or {}),
         "task_distribution_scope": "base_config_snapshot",
@@ -4157,6 +4264,26 @@ def parse_args() -> argparse.Namespace:
         default=None,
         help="Fixed global nonlinear-EH scale for supplementary robustness checks.",
     )
+    parser.add_argument(
+        "--thermal-model",
+        type=str,
+        choices=["independent", "coupled"],
+        default=None,
+        help="Supplementary robustness override for physics.thermal_model.",
+    )
+    parser.add_argument(
+        "--safety-projection-version",
+        type=str,
+        default=None,
+        help="Override physics.safety_projection_version for supplementary robustness checks.",
+    )
+    parser.add_argument(
+        "--physics-eh-model",
+        type=str,
+        choices=["linear", "logistic"],
+        default=None,
+        help="Override physics.eh_model metadata; env.eh_model controls the actual supplementary EH branch.",
+    )
     return parser.parse_args()
 
 
@@ -4183,6 +4310,9 @@ def main() -> None:
         include_variants=(not args.baselines_only),
         eh_model=args.eh_model,
         eh_scale=args.eh_scale,
+        thermal_model=args.thermal_model,
+        safety_projection_version=args.safety_projection_version,
+        physics_eh_model=args.physics_eh_model,
     )
 
 
