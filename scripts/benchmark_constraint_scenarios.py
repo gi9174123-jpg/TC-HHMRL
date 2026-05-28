@@ -350,6 +350,54 @@ def apply_baseline_overrides(cfg: Dict, baseline: str) -> None:
         }
         cfg["agent"]["batch_size"] = 64
         return
+    if baseline == "shin2024_adapted_codebook":
+        cfg.setdefault("context", {})["enabled"] = False
+        cfg.setdefault("agent", {})["z_dim"] = 0
+        cfg.setdefault("meta", {})["explicit_inner_outer"] = False
+        cfg["meta"]["query_updates_enabled"] = False
+        cfg["meta"]["dual_enabled"] = False
+        cfg["meta"]["dual_lr"] = 0.0
+        cfg["meta"]["dual_lrs"] = [0.0] * len(cfg["meta"].get("dual_names", []))
+        cfg.setdefault("upper_dqn", {})
+        cfg["upper_dqn"]["lr"] = 1.0e-4
+        cfg["upper_dqn"]["epsilon_start"] = 0.01
+        cfg["upper_dqn"]["epsilon_final"] = 0.01
+        cfg["upper_dqn"]["replay_size"] = 2000
+        current_template_levels = [0.35, 0.50, 0.65]
+        cfg.setdefault("lower_ddpg", {})
+        cfg["lower_ddpg"].update(
+            {
+                "action_contract": "rho_tau_codebook_current",
+                "upper_contract": "boost_current_template",
+                "learned_action_dim": 2,
+                "current_template_levels": current_template_levels,
+                "replay_size": int(1.0e6),
+                "batch_size": 64,
+                "actor_lr": 1.0e-4,
+                "critic_lr": 3.0e-4,
+                "gamma": 0.99,
+                "target_tau": 0.2,
+                "noise_std": 0.10,
+                "grad_clip": 5.0,
+            }
+        )
+        cfg["baseline_metadata"] = {
+            "baseline_family": "shin2024_adapted_codebook",
+            "exact_reproduction": False,
+            "original_algorithm_structure": "hierarchical_dqn_ddpg",
+            "upper_action_contract": "boost_combo_current_template",
+            "lower_action_contract": "rho_tau_only",
+            "fixed_mode_exec": 2,
+            "fixed_mode_name": "HY",
+            "current_template_levels": current_template_levels,
+            "learned_current_allocation": False,
+            "meta_learning": False,
+            "shared_lagrangian": False,
+            "safety_protocol": f"common_{cfg.get('safety', {}).get('projection_mode', 'thermal_cap')}_projection_for_evaluation",
+            "comparison_role": "prior_study_inspired_adapted_baseline",
+        }
+        cfg["agent"]["batch_size"] = 64
+        return
     if baseline == "dalal2018_safe":
         cfg.setdefault("safety", {})["projection_mode"] = "dalal_safe"
         return
@@ -1259,6 +1307,12 @@ def collect_env_data(
                     "mode_exec": float(info.get("mode_exec", action.get("mode_exec", 0))),
                     "boost_combo_exec": float(info.get("boost_combo_exec", action.get("boost_combo_exec", 0))),
                     "upper_idx_exec": float(info.get("upper_idx_exec", action.get("upper_idx_exec", 0))),
+                    "upper_idx_raw": float(aux.get("upper_idx_raw", action.get("upper_idx", 0))),
+                    "upper_idx_train": float(aux.get("upper_idx_train", info.get("upper_idx_exec", action.get("upper_idx_exec", 0)))),
+                    "upper_idx_safety_raw": float(aux.get("upper_idx_safety_raw", aux.get("upper_idx_raw", action.get("upper_idx", 0)))),
+                    "current_template_level_exec": float(
+                        aux.get("current_template_level_exec", info.get("mode_exec", action.get("mode_exec", 0)))
+                    ),
                     "cost": float(info["cost"]),
                     "cost_qos": float(info.get("cost_qos", 0.0)),
                     "cost_temp_anchor": float(info.get("cost_temp_anchor", 0.0)),
@@ -1628,8 +1682,11 @@ class SacLagrangianBaseline:
         return {
             "upper_idx_raw_next": float(upper_idx_next_raw),
             "upper_idx_exec_next": float(self.safety.encode_exec(boost_next, mode_next)),
+            "upper_idx_train_next": float(self.safety.encode_exec(boost_next, mode_next)),
+            "upper_idx_safety_raw_next": float(upper_idx_next_raw),
             "boost_combo_exec_next": float(boost_next),
             "mode_exec_next": float(mode_next),
+            "current_template_level_exec_next": float(mode_next),
             "next_exec_map": next_exec_map.astype(np.float32),
         }
 
@@ -1675,6 +1732,7 @@ class SacLagrangianBaseline:
         macro_start_z = None
         macro_upper_idx_raw = 0.0
         macro_upper_idx_exec = 0.0
+        macro_upper_idx_train = 0.0
         macro_reward = 0.0
         macro_steps = 0
 
@@ -1696,6 +1754,8 @@ class SacLagrangianBaseline:
                 "next_obs": next_obs.astype(np.float32),
                 "upper_idx_raw": float(aux["upper_idx_raw"]),
                 "upper_idx_exec": float(aux["upper_idx_exec"]),
+                "upper_idx_train": float(aux.get("upper_idx_train", aux["upper_idx_exec"])),
+                "upper_idx_safety_raw": float(aux.get("upper_idx_safety_raw", aux["upper_idx_raw"])),
                 "reward": penalized_reward,
                 "reward_raw": float(reward),
                 "done": float(done),
@@ -1704,6 +1764,7 @@ class SacLagrangianBaseline:
                 "act_raw": aux["act_raw"].astype(np.float32),
                 "boost_combo_exec": float(aux["boost_combo_exec"]),
                 "mode_exec": float(aux["mode_exec"]),
+                "current_template_level_exec": float(aux.get("current_template_level_exec", aux["mode_exec"])),
                 "temps": temps_before.astype(np.float32),
                 "next_temps": info["temps"].astype(np.float32),
                 "amb_temp": float(info["amb_temp"]),
@@ -1724,6 +1785,7 @@ class SacLagrangianBaseline:
                 macro_start_z = self._empty_latent()
                 macro_upper_idx_raw = float(aux["upper_idx_raw"])
                 macro_upper_idx_exec = float(aux["upper_idx_exec"])
+                macro_upper_idx_train = float(aux.get("upper_idx_train", aux["upper_idx_exec"]))
                 macro_reward = 0.0
                 macro_steps = 0
 
@@ -1737,8 +1799,13 @@ class SacLagrangianBaseline:
                     next_macro_info = {
                         "upper_idx_raw_next": float(aux["upper_idx_raw"]),
                         "upper_idx_exec_next": float(aux["upper_idx_exec"]),
+                        "upper_idx_train_next": float(aux.get("upper_idx_train", aux["upper_idx_exec"])),
+                        "upper_idx_safety_raw_next": float(aux.get("upper_idx_safety_raw", aux["upper_idx_raw"])),
                         "boost_combo_exec_next": float(aux["boost_combo_exec"]),
                         "mode_exec_next": float(aux["mode_exec"]),
+                        "current_template_level_exec_next": float(
+                            aux.get("current_template_level_exec", aux["mode_exec"])
+                        ),
                         "next_exec_map": np.arange(int(self.cfg["agent"]["n_upper_actions"]), dtype=np.float32),
                     }
                 else:
@@ -1752,6 +1819,7 @@ class SacLagrangianBaseline:
                         "next_obs": next_obs.astype(np.float32),
                         "upper_idx_raw": macro_upper_idx_raw,
                         "upper_idx_exec": macro_upper_idx_exec,
+                        "upper_idx_train": macro_upper_idx_train,
                         "reward": float(macro_reward),
                         "done": float(macro_done),
                         "z": macro_start_z.astype(np.float32),
@@ -1904,7 +1972,7 @@ class SacLagrangianBaseline:
 
 
 class Shin2024MatchedBaseline(SacLagrangianBaseline):
-    """Matched hierarchical DQN-DDPG baseline under the current benchmark semantics."""
+    """Shin-inspired hierarchical DQN-DDPG baselines under the common benchmark protocol."""
 
     def __init__(self, cfg: Dict):
         self.cfg = copy.deepcopy(cfg)
@@ -1967,11 +2035,39 @@ class Shin2024MatchedBaseline(SacLagrangianBaseline):
         self.safety_mem = {"current_boost": 0, "dwell_count": self.cfg["safety"]["min_dwell_steps"]}
         self.upper_mem = {"upper_idx": 0, "hold_left": 0}
         self.upper_plan = None
+        self.upper_action_contract = str(
+            self.cfg.get("baseline_metadata", {}).get(
+                "upper_action_contract",
+                self.cfg.get("lower_ddpg", {}).get("upper_contract", "boost_mode"),
+            )
+        ).lower()
 
     @staticmethod
     def _force_hy_index(raw_idx: int) -> int:
         raw_idx = int(np.clip(raw_idx, 0, 11))
         return int((raw_idx // 3) * 3 + 2)
+
+    @staticmethod
+    def _codebook_level(raw_idx: int) -> int:
+        raw_idx = int(np.clip(raw_idx, 0, 11))
+        return int(raw_idx % 3)
+
+    @staticmethod
+    def _codebook_hy_index(raw_idx: int) -> int:
+        raw_idx = int(np.clip(raw_idx, 0, 11))
+        return int((raw_idx // 3) * 3 + 2)
+
+    @staticmethod
+    def _codebook_train_index(boost_combo: int, current_level: int) -> int:
+        boost_combo = int(np.clip(boost_combo, 0, 3))
+        current_level = int(np.clip(current_level, 0, 2))
+        return int(boost_combo * 3 + current_level)
+
+    def _uses_codebook_current(self) -> bool:
+        return (
+            self.upper_action_contract == "boost_combo_current_template"
+            or str(self.cfg.get("lower_ddpg", {}).get("action_contract", "")) == "rho_tau_codebook_current"
+        )
 
     def _hy_exec_map(self) -> np.ndarray:
         exec_map = np.zeros(int(self.cfg["agent"]["n_upper_actions"]), dtype=np.int64)
@@ -1981,10 +2077,25 @@ class Shin2024MatchedBaseline(SacLagrangianBaseline):
             exec_map[raw_idx] = self.safety.encode_exec(boost_exec, 2)
         return exec_map
 
+    def _codebook_exec_map(self) -> np.ndarray:
+        exec_map = np.zeros(int(self.cfg["agent"]["n_upper_actions"]), dtype=np.int64)
+        for raw_idx in range(exec_map.shape[0]):
+            hy_idx = self._codebook_hy_index(raw_idx)
+            current_level = self._codebook_level(raw_idx)
+            boost_exec, _ = self.safety.preview_exec(hy_idx, mem=self.safety_mem)
+            exec_map[raw_idx] = self._codebook_train_index(boost_exec, current_level)
+        return exec_map
+
+    def _upper_exec_map(self) -> np.ndarray:
+        if self._uses_codebook_current():
+            return self._codebook_exec_map()
+        return self._hy_exec_map()
+
     def act(self, obs: np.ndarray, env: MultiTxUwSliptEnv, eval_mode: bool = False) -> tuple[Dict, Dict]:
         z = self._empty_latent()
         macro_new = self.upper_mem["hold_left"] <= 0
-        exec_map = self._hy_exec_map()
+        use_codebook = self._uses_codebook_current()
+        exec_map = self._upper_exec_map()
         if macro_new:
             if self.upper_plan is not None:
                 upper_idx_raw = int(self.upper_plan)
@@ -1997,20 +2108,29 @@ class Shin2024MatchedBaseline(SacLagrangianBaseline):
                     eval_mode=eval_mode,
                     exec_map=exec_map,
                 )
-            upper_idx_raw = self._force_hy_index(upper_idx_raw)
+            upper_idx_raw = int(np.clip(upper_idx_raw, 0, 11))
+            if not use_codebook:
+                upper_idx_raw = self._force_hy_index(upper_idx_raw)
             self.upper_mem["upper_idx"] = int(upper_idx_raw)
             self.upper_mem["hold_left"] = max(1, self.upper_hold_steps)
         else:
-            upper_idx_raw = self._force_hy_index(int(self.upper_mem["upper_idx"]))
+            upper_idx_raw = int(np.clip(int(self.upper_mem["upper_idx"]), 0, 11))
+            if not use_codebook:
+                upper_idx_raw = self._force_hy_index(upper_idx_raw)
         self.upper_mem["hold_left"] = max(0, int(self.upper_mem["hold_left"]) - 1)
 
         temps_before = env.temps.copy().astype(np.float32)
-        boost_preview, _ = self.safety.preview_exec(upper_idx_raw, self.safety_mem)
+        current_template_level = self._codebook_level(upper_idx_raw) if use_codebook else 2
+        upper_idx_safety_raw = self._codebook_hy_index(upper_idx_raw) if use_codebook else upper_idx_raw
+        boost_preview, _ = self.safety.preview_exec(upper_idx_safety_raw, self.safety_mem)
         upper_idx_exec = self.safety.encode_exec(boost_preview, 2)
-        lower_raw = self.lower.select_action(obs, z, upper_idx=upper_idx_exec, eval_mode=eval_mode)
+        upper_idx_train = (
+            self._codebook_train_index(boost_preview, current_template_level) if use_codebook else upper_idx_exec
+        )
+        lower_raw = self.lower.select_action(obs, z, upper_idx=upper_idx_train, eval_mode=eval_mode)
 
         safe, self.safety_mem = self.safety.project_np(
-            upper_idx_raw,
+            upper_idx_safety_raw,
             lower_raw,
             temps=temps_before,
             amb_temp=env.amb_temp,
@@ -2019,7 +2139,7 @@ class Shin2024MatchedBaseline(SacLagrangianBaseline):
             mem=self.safety_mem,
         )
         if int(safe["mode_exec"]) != 2:
-            raise RuntimeError("shin2024_matched contract violated: executed mode must be HY")
+            raise RuntimeError("Shin-inspired baseline contract violated: executed mode must be HY")
         action = {
             "upper_idx": int(upper_idx_raw),
             "upper_idx_exec": int(safe["upper_idx_exec"]),
@@ -2033,8 +2153,11 @@ class Shin2024MatchedBaseline(SacLagrangianBaseline):
             "z": z,
             "upper_idx_raw": int(upper_idx_raw),
             "upper_idx_exec": int(safe["upper_idx_exec"]),
+            "upper_idx_train": int(upper_idx_train),
+            "upper_idx_safety_raw": int(upper_idx_safety_raw),
             "boost_combo_exec": int(safe["boost_combo_exec"]),
             "mode_exec": int(safe["mode_exec"]),
+            "current_template_level_exec": int(current_template_level),
             "act_raw": lower_raw.astype(np.float32),
             "act_exec": np.concatenate(
                 [safe["currents_exec"], np.asarray([safe["rho_exec"], safe["tau_exec"]], dtype=np.float32)]
@@ -2046,7 +2169,8 @@ class Shin2024MatchedBaseline(SacLagrangianBaseline):
         return action, aux
 
     def preview_next_macro(self, next_obs: np.ndarray, eval_mode: bool = False, commit_plan: bool = False) -> Dict[str, float]:
-        next_exec_map = self._hy_exec_map()
+        use_codebook = self._uses_codebook_current()
+        next_exec_map = self._upper_exec_map()
         macro_new_next = self.upper_mem["hold_left"] <= 0
         if macro_new_next:
             upper_idx_next_raw = int(
@@ -2058,17 +2182,31 @@ class Shin2024MatchedBaseline(SacLagrangianBaseline):
                     exec_map=next_exec_map,
                 )
             )
-            upper_idx_next_raw = self._force_hy_index(upper_idx_next_raw)
+            upper_idx_next_raw = int(np.clip(upper_idx_next_raw, 0, 11))
+            if not use_codebook:
+                upper_idx_next_raw = self._force_hy_index(upper_idx_next_raw)
             if commit_plan:
                 self.upper_plan = upper_idx_next_raw
         else:
-            upper_idx_next_raw = self._force_hy_index(int(self.upper_mem["upper_idx"]))
-        boost_next, _ = self.safety.preview_exec(upper_idx_next_raw, self.safety_mem)
+            upper_idx_next_raw = int(np.clip(int(self.upper_mem["upper_idx"]), 0, 11))
+            if not use_codebook:
+                upper_idx_next_raw = self._force_hy_index(upper_idx_next_raw)
+        current_template_level_next = self._codebook_level(upper_idx_next_raw) if use_codebook else 2
+        upper_idx_safety_next = self._codebook_hy_index(upper_idx_next_raw) if use_codebook else upper_idx_next_raw
+        boost_next, _ = self.safety.preview_exec(upper_idx_safety_next, self.safety_mem)
+        upper_idx_train_next = (
+            self._codebook_train_index(boost_next, current_template_level_next)
+            if use_codebook
+            else self.safety.encode_exec(boost_next, 2)
+        )
         return {
             "upper_idx_raw_next": float(upper_idx_next_raw),
             "upper_idx_exec_next": float(self.safety.encode_exec(boost_next, 2)),
+            "upper_idx_train_next": float(upper_idx_train_next),
+            "upper_idx_safety_raw_next": float(upper_idx_safety_next),
             "boost_combo_exec_next": float(boost_next),
             "mode_exec_next": 2.0,
+            "current_template_level_exec_next": float(current_template_level_next),
             "next_exec_map": next_exec_map.astype(np.float32),
         }
 
@@ -2469,6 +2607,16 @@ def collect_env_data_heuristic(
                     "mode_exec": float(info.get("mode_exec", action.get("mode_exec", 0))),
                     "boost_combo_exec": float(info.get("boost_combo_exec", action.get("boost_combo_exec", 0))),
                     "upper_idx_exec": float(info.get("upper_idx_exec", action.get("upper_idx_exec", 0))),
+                    "upper_idx_raw": float(aux.get("upper_idx_raw", action.get("upper_idx", 0))),
+                    "upper_idx_train": float(
+                        aux.get("upper_idx_train", info.get("upper_idx_exec", action.get("upper_idx_exec", 0)))
+                    ),
+                    "upper_idx_safety_raw": float(
+                        aux.get("upper_idx_safety_raw", aux.get("upper_idx_raw", action.get("upper_idx", 0)))
+                    ),
+                    "current_template_level_exec": float(
+                        aux.get("current_template_level_exec", info.get("mode_exec", action.get("mode_exec", 0)))
+                    ),
                     "cost": float(info["cost"]),
                     "cost_qos": float(info.get("cost_qos", 0.0)),
                     "cost_temp_anchor": float(info.get("cost_temp_anchor", 0.0)),
@@ -2580,6 +2728,16 @@ def collect_env_data_plain_hierarchical_baseline(
                     "mode_exec": float(info.get("mode_exec", action.get("mode_exec", 0))),
                     "boost_combo_exec": float(info.get("boost_combo_exec", action.get("boost_combo_exec", 0))),
                     "upper_idx_exec": float(info.get("upper_idx_exec", action.get("upper_idx_exec", 0))),
+                    "upper_idx_raw": float(aux.get("upper_idx_raw", action.get("upper_idx", 0))),
+                    "upper_idx_train": float(
+                        aux.get("upper_idx_train", info.get("upper_idx_exec", action.get("upper_idx_exec", 0)))
+                    ),
+                    "upper_idx_safety_raw": float(
+                        aux.get("upper_idx_safety_raw", aux.get("upper_idx_raw", action.get("upper_idx", 0)))
+                    ),
+                    "current_template_level_exec": float(
+                        aux.get("current_template_level_exec", info.get("mode_exec", action.get("mode_exec", 0)))
+                    ),
                     "cost": float(info["cost"]),
                     "cost_qos": float(info.get("cost_qos", 0.0)),
                     "cost_temp_anchor": float(info.get("cost_temp_anchor", 0.0)),
@@ -2947,7 +3105,14 @@ STAT_METRIC_FIELDS = {
 }
 
 MAIN_BENCHMARK_SCENARIOS = ("moderate_practical", "hard_stress", "channel_harsh")
-STRUCTURAL_VARIANT_ORDER = ("hybrid", "single_led", "single_ld", "shin2024_matched", "mpc_lite_oracle")
+STRUCTURAL_VARIANT_ORDER = (
+    "hybrid",
+    "single_led",
+    "single_ld",
+    "shin2024_adapted_codebook",
+    "shin2024_matched",
+    "mpc_lite_oracle",
+)
 HARD_TARGETED_VARIANT_ORDER = (
     "hybrid",
     "hybrid_wo_meta",
@@ -2955,6 +3120,7 @@ HARD_TARGETED_VARIANT_ORDER = (
     "hybrid_hard_clip",
     "heuristic_safe",
     "sac_lagrangian",
+    "shin2024_adapted_codebook",
     "shin2024_matched",
     "sac_dalal_safe",
     "dalal2018_safe",
@@ -2965,6 +3131,7 @@ THERMAL_VARIANT_ORDER = (
     "hybrid_wo_lagrangian",
     "hybrid_hard_clip",
     "sac_lagrangian",
+    "shin2024_adapted_codebook",
     "shin2024_matched",
     "sac_dalal_safe",
     "dalal2018_safe",
@@ -3289,6 +3456,7 @@ def run_one_scenario(
             "heuristic_safe",
             "sac_lagrangian",
             "sac_dalal_safe",
+            "shin2024_adapted_codebook",
             "shin2024_matched",
             "dalal2018_safe",
             "mpc_lite_oracle",
@@ -3301,8 +3469,8 @@ def run_one_scenario(
         elif baseline in {"sac_lagrangian", "sac_dalal_safe"}:
             runner = "sac_lagrangian"
             baseline_override = baseline
-        elif baseline == "shin2024_matched":
-            runner = "shin2024_matched"
+        elif baseline in {"shin2024_matched", "shin2024_adapted_codebook"}:
+            runner = baseline
             baseline_override = baseline
         elif baseline in {"mpc_lite_oracle", "mpc_lite"}:
             runner = "mpc_lite"
@@ -3425,7 +3593,7 @@ def run_one_scenario(
 
             if runner == "sac_lagrangian":
                 trainer = SacLagrangianBaseline(cfg)
-            elif runner == "shin2024_matched":
+            elif runner in {"shin2024_matched", "shin2024_adapted_codebook"}:
                 trainer = Shin2024MatchedBaseline(cfg)
             elif runner == "mpc_lite":
                 trainer = MpcLiteOracleBaseline(cfg)
@@ -3467,7 +3635,7 @@ def run_one_scenario(
                 )
                 if ckpt_pick.get("selected_path"):
                     trainer.agent.load(ckpt_pick["selected_path"])
-            elif runner in {"sac_lagrangian", "shin2024_matched"}:
+            elif runner in {"sac_lagrangian", "shin2024_matched", "shin2024_adapted_codebook"}:
                 train_csv = trainer.train(meta_iters=meta_iters)
 
                 run_df = pd.read_csv(train_csv)
@@ -3530,7 +3698,7 @@ def run_one_scenario(
                     tasks=env_task_subset,
                     episodes_per_task=env_eps,
                 )
-            elif runner in {"sac_lagrangian", "shin2024_matched"}:
+            elif runner in {"sac_lagrangian", "shin2024_matched", "shin2024_adapted_codebook"}:
                 ev = evaluate_plain_hierarchical_baseline_on_tasks(
                     trainer=trainer,
                     cfg=cfg,
@@ -3668,8 +3836,15 @@ def run_one_scenario(
                     "safety_protocol": str(baseline_meta.get("safety_protocol", "")),
                     "comparison_role": str(pilot_meta.get("comparison_role", baseline_meta.get("comparison_role", ""))),
                     "lower_learned_action_dim": baseline_meta.get("lower_learned_action_dim"),
+                    "original_algorithm_structure": str(baseline_meta.get("original_algorithm_structure", "")),
+                    "upper_action_contract": str(baseline_meta.get("upper_action_contract", "")),
+                    "lower_action_contract": str(baseline_meta.get("lower_action_contract", "")),
                     "fixed_mode_exec": baseline_meta.get("fixed_mode_exec"),
                     "fixed_mode_name": str(baseline_meta.get("fixed_mode_name", "")),
+                    "current_template_levels": baseline_meta.get("current_template_levels"),
+                    "learned_current_allocation": baseline_meta.get("learned_current_allocation"),
+                    "meta_learning": baseline_meta.get("meta_learning"),
+                    "shared_lagrangian": baseline_meta.get("shared_lagrangian"),
                     "fixed_current_template": str(baseline_meta.get("fixed_current_template", "")),
                     "fixed_current_fraction": baseline_meta.get("fixed_current_fraction"),
                     "projection_variant": str(pilot_meta.get("projection_variant", "")),
@@ -3805,6 +3980,26 @@ def run_one_scenario(
                     if is_sac_dalal
                     else "Literature-style SAC-Lagrangian baseline on the fixed heterogeneous hybrid structure, without context latent z or inner/outer meta adaptation"
                 ),
+            }
+        elif runner == "shin2024_adapted_codebook":
+            variant_definitions[label] = {
+                "runner": "shin2024_adapted_codebook",
+                "base_variant": variant,
+                "ablation": ablation,
+                "tx_device": ["LED", "LD", "LD"],
+                "tx_enabled": [1.0, 1.0, 1.0],
+                "baseline_family": "shin2024_adapted_codebook",
+                "exact_reproduction": False,
+                "original_algorithm_structure": "hierarchical_dqn_ddpg",
+                "upper_action_contract": "boost_combo_current_template",
+                "lower_action_contract": "rho_tau_only",
+                "fixed_mode_exec": 2,
+                "fixed_mode_name": "HY",
+                "current_template_levels": [0.35, 0.50, 0.65],
+                "learned_current_allocation": False,
+                "safety_protocol": f"{common_projection_protocol}_for_evaluation",
+                "comparison_role": "prior_study_inspired_adapted_baseline",
+                "description": "Shin 2024-adapted hierarchical DQN-DDPG baseline: upper DQN selects boost/current-template codebook entries, lower DDPG learns only rho/tau, and execution is fixed to HY under the shared safety projection.",
             }
         elif runner == "shin2024_matched":
             variant_definitions[label] = {
@@ -4235,6 +4430,7 @@ def parse_args() -> argparse.Namespace:
             "heuristic_safe",
             "sac_lagrangian",
             "sac_dalal_safe",
+            "shin2024_adapted_codebook",
             "shin2024_matched",
             "dalal2018_safe",
             "mpc_lite_oracle",

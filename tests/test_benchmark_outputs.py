@@ -268,21 +268,30 @@ def test_benchmark_supports_shin2024_and_dalal_baselines(tmp_path: Path):
         shared_init=False,
         variants=["hybrid"],
         ablations=["full"],
-        baselines=["shin2024_matched", "dalal2018_safe", "sac_dalal_safe"],
+        baselines=["shin2024_matched", "shin2024_adapted_codebook", "dalal2018_safe", "sac_dalal_safe"],
     )
     assert report_path.exists()
 
     rows = json.loads((out_dir / "thermal_rebalanced" / "run_summary.json").read_text(encoding="utf-8"))
     labels = {row["variant"] for row in rows}
-    assert labels == {"hybrid", "shin2024_matched", "dalal2018_safe", "sac_dalal_safe"}
+    assert labels == {
+        "hybrid",
+        "shin2024_matched",
+        "shin2024_adapted_codebook",
+        "dalal2018_safe",
+        "sac_dalal_safe",
+    }
 
     shin_rows = [row for row in rows if row["variant"] == "shin2024_matched"]
+    shin_codebook_rows = [row for row in rows if row["variant"] == "shin2024_adapted_codebook"]
     dalal_rows = [row for row in rows if row["variant"] == "dalal2018_safe"]
     sac_dalal_rows = [row for row in rows if row["variant"] == "sac_dalal_safe"]
     assert len(shin_rows) == 1
+    assert len(shin_codebook_rows) == 1
     assert len(dalal_rows) == 1
     assert len(sac_dalal_rows) == 1
     assert shin_rows[0]["runner"] == "shin2024_matched"
+    assert shin_codebook_rows[0]["runner"] == "shin2024_adapted_codebook"
     assert dalal_rows[0]["runner"] == "trainer"
     assert sac_dalal_rows[0]["runner"] == "sac_lagrangian"
     assert shin_rows[0]["baseline_family"] == "shin2024_matched"
@@ -291,6 +300,12 @@ def test_benchmark_supports_shin2024_and_dalal_baselines(tmp_path: Path):
     assert shin_rows[0]["lower_learned_action_dim"] == 2
     assert shin_rows[0]["fixed_mode_exec"] == 2
     assert shin_rows[0]["fixed_current_template"] == "tanh_affine_fraction"
+    assert shin_codebook_rows[0]["baseline_family"] == "shin2024_adapted_codebook"
+    assert shin_codebook_rows[0]["exact_reproduction"] is False
+    assert shin_codebook_rows[0]["upper_action_contract"] == "boost_combo_current_template"
+    assert shin_codebook_rows[0]["lower_action_contract"] == "rho_tau_only"
+    assert shin_codebook_rows[0]["fixed_mode_exec"] == 2
+    assert shin_codebook_rows[0]["learned_current_allocation"] is False
     assert sac_dalal_rows[0]["baseline_family"] == "sac_dalal_safe"
     assert sac_dalal_rows[0]["exact_reproduction"] is False
     assert sac_dalal_rows[0]["external_baseline"] is True
@@ -298,6 +313,7 @@ def test_benchmark_supports_shin2024_and_dalal_baselines(tmp_path: Path):
     assert sac_dalal_rows[0]["comparison_role"] == "external_safety_layer_baseline"
 
     shin_cfg = yaml.safe_load(Path(shin_rows[0]["resolved_config"]).read_text(encoding="utf-8"))
+    shin_codebook_cfg = yaml.safe_load(Path(shin_codebook_rows[0]["resolved_config"]).read_text(encoding="utf-8"))
     dalal_cfg = yaml.safe_load(Path(dalal_rows[0]["resolved_config"]).read_text(encoding="utf-8"))
     sac_dalal_cfg = yaml.safe_load(Path(sac_dalal_rows[0]["resolved_config"]).read_text(encoding="utf-8"))
     assert int(shin_cfg["agent"]["z_dim"]) == 0
@@ -306,6 +322,12 @@ def test_benchmark_supports_shin2024_and_dalal_baselines(tmp_path: Path):
     assert shin_cfg["safety"]["action_decode_mode"] == "tanh_affine"
     assert shin_cfg["lower_ddpg"]["action_contract"] == "rho_tau_fixed_current"
     assert int(shin_cfg["lower_ddpg"]["learned_action_dim"]) == 2
+    assert int(shin_codebook_cfg["agent"]["z_dim"]) == 0
+    assert bool(shin_codebook_cfg["context"]["enabled"]) is False
+    assert shin_codebook_cfg["lower_ddpg"]["action_contract"] == "rho_tau_codebook_current"
+    assert shin_codebook_cfg["lower_ddpg"]["upper_contract"] == "boost_current_template"
+    assert shin_codebook_cfg["lower_ddpg"]["current_template_levels"] == [0.35, 0.50, 0.65]
+    assert int(shin_codebook_cfg["lower_ddpg"]["learned_action_dim"]) == 2
     assert dalal_cfg["safety"]["projection_mode"] == "dalal_safe"
     assert int(sac_dalal_cfg["agent"]["z_dim"]) == 0
     assert bool(sac_dalal_cfg["context"]["enabled"]) is False
@@ -316,9 +338,14 @@ def test_benchmark_supports_shin2024_and_dalal_baselines(tmp_path: Path):
 
     env_df = pd.read_csv(out_dir / "thermal_rebalanced" / "env.csv")
     shin_env = env_df[env_df["variant"] == "shin2024_matched"]
+    shin_codebook_env = env_df[env_df["variant"] == "shin2024_adapted_codebook"]
     assert not shin_env.empty
+    assert not shin_codebook_env.empty
     assert set(shin_env["mode_exec"].astype(int).unique()) == {2}
     assert all((shin_env["upper_idx_exec"].astype(int) % 3) == 2)
+    assert set(shin_codebook_env["mode_exec"].astype(int).unique()) == {2}
+    assert all((shin_codebook_env["upper_idx_exec"].astype(int) % 3) == 2)
+    assert all(shin_codebook_env["upper_idx_train"].astype(int) % 3 == shin_codebook_env["current_template_level_exec"].astype(int))
 
     report = json.loads(report_path.read_text(encoding="utf-8"))
     stats = report.get("stats_artifacts", {})

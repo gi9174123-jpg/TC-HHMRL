@@ -40,6 +40,7 @@ COLORS = {
     'hybrid_hard_clip': '#d62728',
     'heuristic_safe': '#8c564b',
     'sac_lagrangian': '#9467bd',
+    'shin2024_adapted_codebook': '#17becf',
     'shin2024_matched': '#17becf',
     'sac_dalal_safe': '#bcbd22',
     'dalal2018_safe': '#bcbd22',
@@ -54,6 +55,7 @@ LABELS = {
     'hybrid_hard_clip': 'Hard Clip',
     'heuristic_safe': 'Heuristic Safe',
     'sac_lagrangian': 'SAC-Lagrangian',
+    'shin2024_adapted_codebook': 'Shin 2024 Adapted',
     'shin2024_matched': 'Shin 2024',
     'sac_dalal_safe': 'SAC + Dalal Safe',
     'dalal2018_safe': 'Dalal 2018',
@@ -263,7 +265,12 @@ FIG3_RUN_SUMMARY = pick_first_existing(
     ]
 )
 bench_stats = grouped_stats_from_run_summary(FIG3_RUN_SUMMARY)
-methods_fig3_pref = ['hybrid', 'single_led', 'single_ld', 'shin2024_matched']
+shin_fig3 = (
+    'shin2024_adapted_codebook'
+    if all((s, 'shin2024_adapted_codebook') in bench_stats for s in SCENARIOS)
+    else 'shin2024_matched'
+)
+methods_fig3_pref = ['hybrid', 'single_led', 'single_ld', shin_fig3]
 methods_fig3 = [m for m in methods_fig3_pref if all((s, m) in bench_stats for s in SCENARIOS)]
 if not methods_fig3:
     raise RuntimeError('No formally comparable methods available for Fig. 3')
@@ -350,7 +357,8 @@ FIG4_RUN_SUMMARY = pick_first_existing(
     ]
 )
 hard_stats = grouped_stats_from_run_summary(FIG4_RUN_SUMMARY)
-methods_fig4_pref = ['hybrid', 'hybrid_wo_meta', 'hybrid_wo_lagrangian', 'hybrid_hard_clip', 'heuristic_safe', 'sac_lagrangian', 'shin2024_matched', 'sac_dalal_safe']
+shin_fig4 = 'shin2024_adapted_codebook' if ('hard_stress', 'shin2024_adapted_codebook') in hard_stats else 'shin2024_matched'
+methods_fig4_pref = ['hybrid', 'hybrid_wo_meta', 'hybrid_wo_lagrangian', 'hybrid_hard_clip', 'heuristic_safe', 'sac_lagrangian', shin_fig4, 'sac_dalal_safe']
 methods_fig4 = [m for m in methods_fig4_pref if ('hard_stress', m) in hard_stats]
 if not methods_fig4:
     raise RuntimeError('No formally comparable methods available for Fig. 4')
@@ -436,7 +444,11 @@ savefig(fig, 'Fig5_hard_stress_training_dynamics')
 # Fig. 6
 THERM_ROOT, THERM_SCENARIO = detect_thermal_source()
 therm_run = load_formal_run_summary(THERM_ROOT / 'run_summary.json')
-therm_methods_pref = ['hybrid', 'hybrid_wo_lagrangian', 'hybrid_hard_clip', 'sac_lagrangian', 'shin2024_matched', 'dalal2018_safe']
+has_shin_adapted_thermal = any(
+    row['variant'] == 'shin2024_adapted_codebook' and row['scenario'] == THERM_SCENARIO for row in therm_run
+)
+shin_thermal = 'shin2024_adapted_codebook' if has_shin_adapted_thermal else 'shin2024_matched'
+therm_methods_pref = ['hybrid', 'hybrid_wo_lagrangian', 'hybrid_hard_clip', 'sac_lagrangian', shin_thermal, 'dalal2018_safe']
 therm_methods = [m for m in therm_methods_pref if any(row['variant'] == m and row['scenario'] == THERM_SCENARIO for row in therm_run)]
 if not therm_methods:
     raise RuntimeError('No formally comparable methods available for thermal figures')

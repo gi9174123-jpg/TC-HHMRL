@@ -3,6 +3,7 @@ from __future__ import annotations
 import copy
 
 import numpy as np
+import torch
 
 from scripts.benchmark_constraint_scenarios import (
     Shin2024MatchedBaseline,
@@ -15,7 +16,9 @@ from scripts.benchmark_constraint_scenarios import (
     sample_fixed_tasks,
     validate_training_config,
 )
+from tchhmrl.agents.ddpg_lower import LowerDDPG
 from tchhmrl.envs.uw_slipt_env import MultiTxUwSliptEnv
+from tchhmrl.safety.safety_layer import SafetyLayer
 from tchhmrl.utils.config import load_cfg
 
 
@@ -259,6 +262,70 @@ def test_shin2024_matched_action_contract_forces_hy_and_fixed_currents(tmp_path)
     _, _, _, _, info = env.step(action)
     assert int(info["mode_exec"]) == 2
     assert int(info["upper_idx_exec"]) % 3 == 2
+
+
+def test_shin2024_adapted_codebook_uses_upper_current_template_and_hy(tmp_path):
+    cfg = load_cfg("configs/default.yaml")
+    cfg = apply_common_settings(
+        copy.deepcopy(cfg),
+        meta_iters=1,
+        out_dir=tmp_path,
+        run_name="shin_codebook_contract",
+        seed=101,
+        fast_mode=True,
+        use_curriculum=False,
+    )
+    cfg["agent"]["hidden_dim"] = 32
+    cfg["env"]["episode_len"] = 4
+    apply_scenario(cfg, "thermal_rebalanced")
+    apply_variant(cfg, "hybrid")
+    apply_ablation(cfg, "full")
+    apply_baseline_overrides(cfg, "shin2024_adapted_codebook")
+
+    assert cfg["lower_ddpg"]["action_contract"] == "rho_tau_codebook_current"
+    assert cfg["lower_ddpg"]["upper_contract"] == "boost_current_template"
+    assert int(cfg["lower_ddpg"]["learned_action_dim"]) == 2
+    assert cfg["lower_ddpg"]["current_template_levels"] == [0.35, 0.50, 0.65]
+    assert cfg["baseline_metadata"]["baseline_family"] == "shin2024_adapted_codebook"
+    assert cfg["baseline_metadata"]["upper_action_contract"] == "boost_combo_current_template"
+    assert cfg["baseline_metadata"]["lower_action_contract"] == "rho_tau_only"
+    assert cfg["baseline_metadata"]["fixed_mode_name"] == "HY"
+    assert cfg["baseline_metadata"]["learned_current_allocation"] is False
+
+    trainer = Shin2024MatchedBaseline(cfg)
+    assert trainer.lower.action_contract == "rho_tau_codebook_current"
+    assert trainer.lower.upper_contract == "boost_current_template"
+    assert trainer.lower.learned_act_dim == 2
+
+    task = sample_fixed_tasks(cfg, seed=101, n_tasks=1, seed_offset=21_000)[0]
+    env = MultiTxUwSliptEnv(cfg, overrides=task.to_env_overrides())
+    obs, _ = env.reset(seed=101)
+
+    trainer.upper_plan = 3  # boost combo 1, low current template; safety execution remains HY.
+    action, aux = trainer.act(obs, env, eval_mode=True)
+
+    assert int(action["mode_exec"]) == 2
+    assert int(action["upper_idx_exec"]) % 3 == 2
+    assert int(aux["upper_idx_raw"]) == 3
+    assert int(aux["upper_idx_train"]) == 3
+    assert int(aux["upper_idx_safety_raw"]) == 5
+    assert int(aux["current_template_level_exec"]) == 0
+    assert np.asarray(aux["act_raw"]).shape == (5,)
+    assert np.allclose(np.asarray(aux["act_raw"])[:3], -0.30, atol=1.0e-6)
+
+    _, _, _, _, info = env.step(action)
+    assert int(info["mode_exec"]) == 2
+    assert int(info["upper_idx_exec"]) % 3 == 2
+
+
+def test_lower_ddpg_rejects_inconsistent_codebook_contracts():
+    cfg = load_cfg("configs/default.yaml")
+    cfg = copy.deepcopy(cfg)
+    apply_baseline_overrides(cfg, "shin2024_adapted_codebook")
+    cfg["lower_ddpg"]["upper_contract"] = "boost_mode"
+
+    with np.testing.assert_raises(ValueError):
+        LowerDDPG(cfg, SafetyLayer(cfg), device=torch.device("cpu"))
 
 
 def test_baseline_dalal_switches_projection_mode():

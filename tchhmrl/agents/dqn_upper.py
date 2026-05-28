@@ -66,7 +66,10 @@ class UpperDQN:
         obs = torch.tensor(batch["obs"], dtype=torch.float32, device=self.device)
         z = torch.tensor(batch["z"], dtype=torch.float32, device=self.device)
         act = torch.tensor(
-            batch.get("upper_idx_exec", batch.get("upper_idx", np.zeros_like(batch["reward"]))),
+            batch.get(
+                "upper_idx_train",
+                batch.get("upper_idx_exec", batch.get("upper_idx", np.zeros_like(batch["reward"]))),
+            ),
             dtype=torch.long,
             device=self.device,
         )
