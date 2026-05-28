@@ -371,12 +371,19 @@ def apply_baseline_overrides(cfg: Dict, baseline: str) -> None:
         cfg["upper_dqn"]["epsilon_start"] = 0.01
         cfg["upper_dqn"]["epsilon_final"] = 0.01
         cfg["upper_dqn"]["replay_size"] = 2000
-        current_template_codeword_names = ["low_safe", "balanced", "high_performance"]
-        current_template_codewords = [
-            [0.40, 0.25, 0.25],
-            [0.55, 0.45, 0.45],
-            [0.70, 0.65, 0.65],
-        ]
+        shin_cfg = cfg.setdefault("baselines", {}).setdefault("shin2024_adapted_codebook", {})
+        current_template_codeword_names = list(
+            shin_cfg.get("current_template_codeword_names", ["low_safe", "balanced", "high_performance"])
+        )
+        current_template_codewords = shin_cfg.get(
+            "current_template_codewords",
+            [
+                [0.40, 0.25, 0.25],
+                [0.55, 0.45, 0.45],
+                [0.70, 0.65, 0.65],
+            ],
+        )
+        current_template_codewords = np.round(np.asarray(current_template_codewords, dtype=float).reshape(3, 3), 6).tolist()
         cfg.setdefault("lower_ddpg", {})
         cfg["lower_ddpg"].update(
             {
@@ -489,7 +496,8 @@ def apply_baseline_overrides(cfg: Dict, baseline: str) -> None:
         cfg["meta"]["dual_enabled"] = False
         cfg["meta"]["dual_lr"] = 0.0
         cfg["meta"]["dual_lrs"] = [0.0] * len(cfg["meta"].get("dual_names", []))
-        cfg.setdefault("baselines", {}).setdefault("javadi_ppo_dimming", {})
+        javadi_cfg = cfg.setdefault("baselines", {}).setdefault("javadi_ppo_dimming", {})
+        dimming_type = str(javadi_cfg.get("dimming_type", "source_wise_dimming"))
         cfg["baseline_metadata"] = {
             "baseline_family": "javadi_ppo_dimming",
             "paper_inspired": True,
@@ -497,6 +505,7 @@ def apply_baseline_overrides(cfg: Dict, baseline: str) -> None:
             "policy_family": "PPO",
             "source_selection_rl": True,
             "joint_dimming": True,
+            "dimming_type": dimming_type,
             "fixed_mode_exec": 2,
             "fixed_mode_name": "HY",
             "meta_learning": False,
@@ -518,6 +527,11 @@ def apply_baseline_overrides(cfg: Dict, baseline: str) -> None:
         cfg["meta"]["dual_enabled"] = False
         cfg["meta"]["dual_lr"] = 0.0
         cfg["meta"]["dual_lrs"] = [0.0] * len(cfg["meta"].get("dual_names", []))
+        deeprat_cfg = cfg.setdefault("baselines", {}).setdefault("deeprat_assignment_power", {})
+        assignment_action_dim = int(deeprat_cfg.get("assignment_action_dim", 4))
+        if assignment_action_dim != 4:
+            raise ValueError("deeprat_assignment_power requires baselines.deeprat_assignment_power.assignment_action_dim=4")
+        cfg["agent"]["n_upper_actions"] = assignment_action_dim
         cfg.setdefault("upper_dqn", {})
         cfg.setdefault("lower_ddpg", {})
         cfg["lower_ddpg"].update(
@@ -537,7 +551,6 @@ def apply_baseline_overrides(cfg: Dict, baseline: str) -> None:
                 "grad_clip": 5.0,
             }
         )
-        cfg.setdefault("baselines", {}).setdefault("deeprat_assignment_power", {})
         cfg["baseline_metadata"] = {
             "baseline_family": "deeprat_assignment_power",
             "paper_inspired": True,
@@ -546,6 +559,7 @@ def apply_baseline_overrides(cfg: Dict, baseline: str) -> None:
             "lower_action_contract": "current_allocation_only",
             "action_contract": "source_assignment__current_allocation_only",
             "selected_action_contract": "source_assignment__current_allocation_only",
+            "discrete_assignment_dim": assignment_action_dim,
             "fixed_mode_exec": 2,
             "fixed_mode_name": "HY",
             "comparison_role": "hierarchical_assignment_power_rl",
@@ -1384,6 +1398,8 @@ def _add_baseline_aux_diagnostics(row: Dict, aux: Dict) -> None:
         "mpc_grid_score",
         "predicted_qos_rate",
         "predicted_eh_metric",
+        "predicted_snr",
+        "predicted_bus_utilization",
         "qos_threshold",
         "eh_threshold",
         "source_subset_id",
@@ -1397,12 +1413,15 @@ def _add_baseline_aux_diagnostics(row: Dict, aux: Dict) -> None:
     string_keys = [
         "selected_template",
         "selected_uysal_policy",
+        "selected_uysal_controller",
+        "selected_uysal_subpolicy",
         "uysal_policy_rule",
         "eh_threshold_source",
         "fixed_current_template_name",
         "candidate_state_protocol",
         "selected_action_contract",
         "receiver_ratio_rule",
+        "dimming_type",
     ]
     for key in numeric_keys:
         if key in aux:
@@ -4207,9 +4226,11 @@ def run_one_scenario(
                     "policy_family": baseline_meta.get("policy_family"),
                     "policy_selection_rule": str(baseline_meta.get("policy_selection_rule", "")),
                     "domain_match": str(baseline_meta.get("domain_match", "")),
+                    "dimming_type": str(baseline_meta.get("dimming_type", "")),
                     "receiver_ratio_rule": str(baseline_meta.get("receiver_ratio_rule", "")),
                     "parameterized_action": baseline_meta.get("parameterized_action"),
                     "discrete_action_dim": baseline_meta.get("discrete_action_dim"),
+                    "discrete_assignment_dim": baseline_meta.get("discrete_assignment_dim"),
                     "continuous_parameter_dim": baseline_meta.get("continuous_parameter_dim"),
                     "learned_current_allocation": baseline_meta.get("learned_current_allocation"),
                     "meta_learning": baseline_meta.get("meta_learning"),
@@ -4238,6 +4259,30 @@ def run_one_scenario(
                     "tx_enabled_fraction_mean": float(env_df["tx_enabled_fraction"].mean())
                     if "tx_enabled_fraction" in env_df
                     else float("nan"),
+                    "uysal_ts_fraction": float((env_df["selected_uysal_subpolicy"] == "uysal_ts").mean())
+                    if "selected_uysal_subpolicy" in env_df and not env_df.empty
+                    else None,
+                    "uysal_ps_fraction": float((env_df["selected_uysal_subpolicy"] == "uysal_ps").mean())
+                    if "selected_uysal_subpolicy" in env_df and not env_df.empty
+                    else None,
+                    "uysal_tsps_fraction": float((env_df["selected_uysal_subpolicy"] == "uysal_tsps").mean())
+                    if "selected_uysal_subpolicy" in env_df and not env_df.empty
+                    else None,
+                    "mean_predicted_eh_metric": float(env_df["predicted_eh_metric"].mean())
+                    if "predicted_eh_metric" in env_df and not env_df.empty
+                    else None,
+                    "mean_eh_threshold": float(env_df["eh_threshold"].mean())
+                    if "eh_threshold" in env_df and not env_df.empty
+                    else None,
+                    "mean_predicted_qos_rate": float(env_df["predicted_qos_rate"].mean())
+                    if "predicted_qos_rate" in env_df and not env_df.empty
+                    else None,
+                    "mean_predicted_snr": float(env_df["predicted_snr"].mean())
+                    if "predicted_snr" in env_df and not env_df.empty
+                    else None,
+                    "mean_predicted_bus_utilization": float(env_df["predicted_bus_utilization"].mean())
+                    if "predicted_bus_utilization" in env_df and not env_df.empty
+                    else None,
                 }
             )
 

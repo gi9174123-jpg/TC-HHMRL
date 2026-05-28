@@ -19,9 +19,13 @@ class DeepRATAssignmentPowerBaseline(BasePaperBaseline):
 
     def __init__(self, cfg: Dict):
         super().__init__(cfg)
+        opts = cfg.get("baselines", {}).get("deeprat_assignment_power", {})
+        self.assignment_action_dim = int(opts.get("assignment_action_dim", 4))
+        if self.assignment_action_dim != 4:
+            raise ValueError("DeepRAT assignment-power adapted baseline requires exactly 4 assignment actions")
+        self.cfg["agent"]["n_upper_actions"] = self.assignment_action_dim
         self.upper = UpperDQN(self.cfg, self.device)
         self.lower = LowerDDPG(self.cfg, self.safety, self.device)
-        opts = cfg.get("baselines", {}).get("deeprat_assignment_power", {})
         self.replay = ReplayBuffer(int(opts.get("replay_size", cfg.get("lower_ddpg", {}).get("replay_size", 100000))))
         self.upper_replay = ReplayBuffer(int(opts.get("upper_replay_size", cfg.get("upper_dqn", {}).get("replay_size", 2000))))
         self.batch_size = int(opts.get("batch_size", cfg.get("lower_ddpg", {}).get("batch_size", 64)))
@@ -31,18 +35,24 @@ class DeepRATAssignmentPowerBaseline(BasePaperBaseline):
         self.action_contract = "source_assignment_current_allocation_only"
 
     def _hy_exec_map(self) -> np.ndarray:
-        exec_map = np.zeros(12, dtype=np.int64)
-        for raw_idx in range(12):
-            hy_idx = int((int(np.clip(raw_idx, 0, 11)) // 3) * 3 + 2)
+        exec_map = np.zeros(4, dtype=np.int64)
+        for assignment_idx in range(4):
+            hy_idx = int(assignment_idx * 3 + 2)
             boost_exec, _ = self.safety.preview_exec(hy_idx, mem=self.safety_mem)
-            exec_map[raw_idx] = self.safety.encode_exec(boost_exec, 2)
+            exec_map[assignment_idx] = int(boost_exec)
         return exec_map
 
     def act(self, obs: np.ndarray, env: MultiTxUwSliptEnv, eval_mode: bool = False) -> tuple[Dict, Dict]:
         z = self._empty_latent()
         exec_map = self._hy_exec_map()
-        raw_idx = self.upper.select_action(obs.astype(np.float32), z, t=self.global_step, eval_mode=eval_mode, exec_map=exec_map)
-        boost_combo = int(np.clip(raw_idx, 0, 11)) // 3
+        assignment_idx = self.upper.select_action(
+            obs.astype(np.float32),
+            z,
+            t=self.global_step,
+            eval_mode=eval_mode,
+            exec_map=exec_map,
+        )
+        boost_combo = int(np.clip(assignment_idx, 0, 3))
         upper_raw = int(boost_combo * 3 + 2)
         boost_preview, _ = self.safety.preview_exec(upper_raw, self.safety_mem)
         upper_idx_exec = self.safety.encode_exec(boost_preview, 2)
@@ -55,9 +65,10 @@ class DeepRATAssignmentPowerBaseline(BasePaperBaseline):
             lower_raw,
             safe,
             aux_extra={
-                "upper_idx_train": int(upper_idx_exec),
+                "upper_idx_train": int(boost_combo),
                 "upper_idx_safety_raw": int(upper_raw),
                 "source_assignment": int(boost_combo),
+                "assignment_idx_train": int(boost_combo),
                 "receiver_ratio_rule": "fixed_balanced_not_deeprat_core",
                 "selected_action_contract": self.action_contract,
                 "temps_before": env.temps.copy().astype(np.float32),

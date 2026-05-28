@@ -112,7 +112,9 @@ class UysalPolicyOptimizer(BasePaperBaseline):
             lower_raw,
             safe,
             aux_extra={
-                "selected_uysal_policy": selected_policy,
+                "selected_uysal_policy": "uysal_ads",
+                "selected_uysal_controller": "uysal_ads",
+                "selected_uysal_subpolicy": selected_policy,
                 "uysal_policy_rule": "ads_threshold_scheduler",
                 "qos_threshold": float(env.qos_min_rate),
                 "eh_threshold": float(self.eh_min_target),

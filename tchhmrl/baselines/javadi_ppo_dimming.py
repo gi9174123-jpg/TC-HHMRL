@@ -67,6 +67,7 @@ class JavadiPPODimmingBaseline(BasePaperBaseline):
         opts = cfg.get("baselines", {}).get("javadi_ppo_dimming", {})
         obs_dim = int(cfg["agent"]["obs_dim"])
         hidden_dim = int(opts.get("hidden_dim", cfg["agent"].get("hidden_dim", 128)))
+        self.dimming_type = str(opts.get("dimming_type", "source_wise_dimming"))
         self.policy = JavadiActorCritic(obs_dim, hidden_dim).to(self.device)
         self.optim = torch.optim.Adam(self.policy.parameters(), lr=float(opts.get("lr", 3.0e-4)))
         self.clip_ratio = float(opts.get("clip_ratio", 0.2))
@@ -95,6 +96,7 @@ class JavadiPPODimmingBaseline(BasePaperBaseline):
                 "joint_dimming_scale_tx0": float((lower_raw[0] + 1.0) * 0.5),
                 "joint_dimming_scale_tx1": float((lower_raw[1] + 1.0) * 0.5),
                 "joint_dimming_scale_tx2": float((lower_raw[2] + 1.0) * 0.5),
+                "dimming_type": self.dimming_type,
                 "ppo_log_prob": float(logp.item()),
                 "ppo_value": float(value.item()),
                 "selected_action_contract": self.action_contract,

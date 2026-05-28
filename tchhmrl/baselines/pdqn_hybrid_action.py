@@ -143,13 +143,19 @@ class PDQNHybridActionBaseline(BasePaperBaseline):
         torch.nn.utils.clip_grad_norm_(self.q_net.parameters(), 5.0)
         self.q_optim.step()
 
-        params_all = self.param_net(obs)
-        q_all = self.q_net.all_q(obs, params_all)
-        param_loss = -q_all.max(dim=1)[0].mean()
-        self.param_optim.zero_grad()
-        param_loss.backward()
-        torch.nn.utils.clip_grad_norm_(self.param_net.parameters(), 5.0)
-        self.param_optim.step()
+        for p in self.q_net.parameters():
+            p.requires_grad_(False)
+        try:
+            params_all = self.param_net(obs)
+            q_all = self.q_net.all_q(obs, params_all)
+            param_loss = -q_all.max(dim=1)[0].mean()
+            self.param_optim.zero_grad()
+            param_loss.backward()
+            torch.nn.utils.clip_grad_norm_(self.param_net.parameters(), 5.0)
+            self.param_optim.step()
+        finally:
+            for p in self.q_net.parameters():
+                p.requires_grad_(True)
         self._soft_update(self.param_net, self.param_tgt)
         self._soft_update(self.q_net, self.q_tgt)
         return {"pdqn_q_loss": float(q_loss.item()), "pdqn_param_loss": float(param_loss.item())}

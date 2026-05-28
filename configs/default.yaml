@@ -157,12 +157,14 @@ baselines:
     tau_grid: [0.15, 0.50, 0.85]
   javadi_ppo_dimming:
     hidden_dim: 128
+    dimming_type: source_wise_dimming
     lr: 3.0e-4
     clip_ratio: 0.2
     ppo_epochs: 2
     entropy_coef: 0.005
     value_coef: 0.5
   deeprat_assignment_power:
+    assignment_action_dim: 4
     replay_size: 1000000
     upper_replay_size: 2000
     batch_size: 64

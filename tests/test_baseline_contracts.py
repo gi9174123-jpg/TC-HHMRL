@@ -72,6 +72,8 @@ def test_uysal_policy_optimizer_is_threshold_rule_not_oracle(tmp_path):
     assert set(policy.subpolicy_names) == {"uysal_ts", "uysal_ps", "uysal_tsps", "uysal_ads"}
     assert cfg["baseline_metadata"]["uses_learned_policy"] is False
     assert cfg["baseline_metadata"]["policy_selection_rule"] == "predefined_ads_threshold_not_oracle_best_of_four"
+    assert aux["selected_uysal_controller"] == "uysal_ads"
+    assert aux["selected_uysal_subpolicy"] in {"uysal_ts", "uysal_ps", "uysal_tsps"}
     assert aux["uysal_policy_rule"] == "ads_threshold_scheduler"
     assert aux["eh_threshold_source"] == "baselines.uysal_policy_optimizer.eh_min_target"
     assert int(action["mode_exec"]) in {0, 1, 2}
@@ -104,6 +106,10 @@ def test_mpc_grid_uses_structured_templates_and_preserves_state_rng(tmp_path):
     assert int(aux["candidate_count"]) == 300
     assert aux["selected_template"] in policy.current_templates
     assert "online_latency_ms" in aux
+    assert "predicted_qos_rate" in aux
+    assert "predicted_eh_metric" in aux
+    assert "predicted_snr" in aux
+    assert "predicted_bus_utilization" in aux
     assert int(action["upper_idx_exec"]) == int(action["boost_combo_exec"]) * 3 + int(action["mode_exec"])
 
 
@@ -117,6 +123,7 @@ def test_javadi_ppo_dimming_contract(tmp_path):
     assert cfg["baseline_metadata"]["policy_family"] == "PPO"
     assert cfg["baseline_metadata"]["source_selection_rl"] is True
     assert cfg["baseline_metadata"]["joint_dimming"] is True
+    assert cfg["baseline_metadata"]["dimming_type"] == "source_wise_dimming"
     assert cfg["baseline_metadata"]["domain_match"] == "owc_slipt_not_underwater"
     assert int(action["mode_exec"]) == 2
     assert "source_subset_id" in aux
@@ -127,6 +134,9 @@ def test_deeprat_assignment_power_contract(tmp_path):
     cfg = _cfg_for_baseline(tmp_path, "deeprat_assignment_power")
     policy = DeepRATAssignmentPowerBaseline(cfg)
 
+    assert int(cfg["agent"]["n_upper_actions"]) == 4
+    assert policy.upper.n_actions == 4
+    assert cfg["baseline_metadata"]["discrete_assignment_dim"] == 4
     assert policy.lower.action_contract == "current_allocation_only"
     assert policy.lower.upper_contract == "source_assignment"
     assert policy.lower.learned_act_dim == 3
