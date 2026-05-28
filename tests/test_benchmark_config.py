@@ -283,18 +283,28 @@ def test_shin2024_adapted_codebook_uses_upper_current_template_and_hy(tmp_path):
     apply_baseline_overrides(cfg, "shin2024_adapted_codebook")
 
     assert cfg["lower_ddpg"]["action_contract"] == "rho_tau_codebook_current"
-    assert cfg["lower_ddpg"]["upper_contract"] == "boost_current_template"
+    assert cfg["lower_ddpg"]["upper_contract"] == "boost_intensity_codeword"
     assert int(cfg["lower_ddpg"]["learned_action_dim"]) == 2
-    assert cfg["lower_ddpg"]["current_template_levels"] == [0.35, 0.50, 0.65]
+    assert cfg["lower_ddpg"]["current_template_codeword_names"] == ["low_safe", "balanced", "high_performance"]
+    assert cfg["lower_ddpg"]["current_template_codewords"] == [
+        [0.40, 0.25, 0.25],
+        [0.55, 0.45, 0.45],
+        [0.70, 0.65, 0.65],
+    ]
     assert cfg["baseline_metadata"]["baseline_family"] == "shin2024_adapted_codebook"
-    assert cfg["baseline_metadata"]["upper_action_contract"] == "boost_combo_current_template"
+    assert cfg["baseline_metadata"]["paper_inspired"] is True
+    assert cfg["baseline_metadata"]["upper_action_contract"] == "boost_combo_intensity_codeword"
     assert cfg["baseline_metadata"]["lower_action_contract"] == "rho_tau_only"
     assert cfg["baseline_metadata"]["fixed_mode_name"] == "HY"
     assert cfg["baseline_metadata"]["learned_current_allocation"] is False
+    assert (
+        cfg["baseline_metadata"]["mapped_original_control"]
+        == "beam_divergence_angle_to_source_intensity_codeword"
+    )
 
     trainer = Shin2024MatchedBaseline(cfg)
     assert trainer.lower.action_contract == "rho_tau_codebook_current"
-    assert trainer.lower.upper_contract == "boost_current_template"
+    assert trainer.lower.upper_contract == "boost_intensity_codeword"
     assert trainer.lower.learned_act_dim == 2
 
     task = sample_fixed_tasks(cfg, seed=101, n_tasks=1, seed_offset=21_000)[0]
@@ -311,7 +321,7 @@ def test_shin2024_adapted_codebook_uses_upper_current_template_and_hy(tmp_path):
     assert int(aux["upper_idx_safety_raw"]) == 5
     assert int(aux["current_template_level_exec"]) == 0
     assert np.asarray(aux["act_raw"]).shape == (5,)
-    assert np.allclose(np.asarray(aux["act_raw"])[:3], -0.30, atol=1.0e-6)
+    assert np.allclose(np.asarray(aux["act_raw"])[:3], [-0.20, -0.50, -0.50], atol=1.0e-6)
 
     _, _, _, _, info = env.step(action)
     assert int(info["mode_exec"]) == 2

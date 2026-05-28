@@ -21,6 +21,14 @@ import yaml
 from tchhmrl.agents.dqn_upper import UpperDQN
 from tchhmrl.agents.ddpg_lower import LowerDDPG
 from tchhmrl.agents.sac_lower import LowerSAC
+from tchhmrl.baselines import (
+    DeepRATAssignmentPowerBaseline,
+    JavadiPPODimmingBaseline,
+    MpcGridBaseline,
+    PDQNHybridActionBaseline,
+    UysalPolicyOptimizer,
+)
+from tchhmrl.baselines.common import BasePaperBaseline, PolicyEpisodeStats
 from tchhmrl.buffers.replay_buffer import ReplayBuffer
 from tchhmrl.constraints.dual_layer import DualLayer
 from tchhmrl.envs.task_contract import (
@@ -363,14 +371,20 @@ def apply_baseline_overrides(cfg: Dict, baseline: str) -> None:
         cfg["upper_dqn"]["epsilon_start"] = 0.01
         cfg["upper_dqn"]["epsilon_final"] = 0.01
         cfg["upper_dqn"]["replay_size"] = 2000
-        current_template_levels = [0.35, 0.50, 0.65]
+        current_template_codeword_names = ["low_safe", "balanced", "high_performance"]
+        current_template_codewords = [
+            [0.40, 0.25, 0.25],
+            [0.55, 0.45, 0.45],
+            [0.70, 0.65, 0.65],
+        ]
         cfg.setdefault("lower_ddpg", {})
         cfg["lower_ddpg"].update(
             {
                 "action_contract": "rho_tau_codebook_current",
-                "upper_contract": "boost_current_template",
+                "upper_contract": "boost_intensity_codeword",
                 "learned_action_dim": 2,
-                "current_template_levels": current_template_levels,
+                "current_template_codeword_names": current_template_codeword_names,
+                "current_template_codewords": current_template_codewords,
                 "replay_size": int(1.0e6),
                 "batch_size": 64,
                 "actor_lr": 1.0e-4,
@@ -383,20 +397,193 @@ def apply_baseline_overrides(cfg: Dict, baseline: str) -> None:
         )
         cfg["baseline_metadata"] = {
             "baseline_family": "shin2024_adapted_codebook",
+            "paper_inspired": True,
             "exact_reproduction": False,
             "original_algorithm_structure": "hierarchical_dqn_ddpg",
-            "upper_action_contract": "boost_combo_current_template",
+            "upper_action_contract": "boost_combo_intensity_codeword",
             "lower_action_contract": "rho_tau_only",
+            "action_contract": "boost_combo_intensity_codeword__rho_tau_only",
+            "selected_action_contract": "boost_combo_intensity_codeword__rho_tau_only",
             "fixed_mode_exec": 2,
             "fixed_mode_name": "HY",
-            "current_template_levels": current_template_levels,
+            "current_template_codeword_names": current_template_codeword_names,
+            "current_template_codewords": current_template_codewords,
+            "source_aware_current_codewords": True,
+            "mapped_original_control": "beam_divergence_angle_to_source_intensity_codeword",
             "learned_current_allocation": False,
             "meta_learning": False,
             "shared_lagrangian": False,
+            "uses_learned_policy": True,
+            "uses_same_safety_projection": True,
             "safety_protocol": f"common_{cfg.get('safety', {}).get('projection_mode', 'thermal_cap')}_projection_for_evaluation",
             "comparison_role": "prior_study_inspired_adapted_baseline",
         }
         cfg["agent"]["batch_size"] = 64
+        return
+    if baseline == "uysal_policy_optimizer":
+        cfg.setdefault("context", {})["enabled"] = False
+        cfg.setdefault("agent", {})["z_dim"] = 0
+        cfg.setdefault("meta", {})["explicit_inner_outer"] = False
+        cfg["meta"]["query_updates_enabled"] = False
+        cfg["meta"]["dual_enabled"] = False
+        cfg["meta"]["dual_lr"] = 0.0
+        cfg["meta"]["dual_lrs"] = [0.0] * len(cfg["meta"].get("dual_names", []))
+        cfg.setdefault("baselines", {}).setdefault("uysal_policy_optimizer", {})
+        cfg["baselines"]["uysal_policy_optimizer"].setdefault("eh_min_target", 0.02)
+        cfg["baseline_metadata"] = {
+            "baseline_family": "uysal_policy_optimizer",
+            "paper_inspired": True,
+            "exact_reproduction": False,
+            "uses_learned_policy": False,
+            "uses_same_safety_projection": True,
+            "optimized_variables": "slipt_policy_mode_rho_tau",
+            "fixed_current_template": True,
+            "learned_current_allocation": False,
+            "meta_learning": False,
+            "shared_lagrangian": False,
+            "action_contract": "uysal_ads_threshold_receiver_policy",
+            "selected_action_contract": "uysal_ads_threshold_receiver_policy",
+            "policy_family": ["uysal_ts", "uysal_ps", "uysal_tsps", "uysal_ads"],
+            "policy_selection_rule": "predefined_ads_threshold_not_oracle_best_of_four",
+            "comparison_role": "underwater_slipt_policy_optimizer",
+            "safety_protocol": f"common_{cfg.get('safety', {}).get('projection_mode', 'thermal_cap')}_projection_for_hardware_feasibility",
+        }
+        return
+    if baseline == "mpc_grid":
+        cfg.setdefault("context", {})["enabled"] = False
+        cfg.setdefault("agent", {})["z_dim"] = 0
+        cfg.setdefault("meta", {})["explicit_inner_outer"] = False
+        cfg["meta"]["query_updates_enabled"] = False
+        cfg["meta"]["dual_enabled"] = False
+        cfg["meta"]["dual_lr"] = 0.0
+        cfg["meta"]["dual_lrs"] = [0.0] * len(cfg["meta"].get("dual_names", []))
+        cfg.setdefault("baselines", {}).setdefault("mpc_grid", {})
+        mpc_cfg = cfg["baselines"]["mpc_grid"]
+        n_templates = len(mpc_cfg.get("current_templates", {})) or 5
+        n_rho = len(mpc_cfg.get("rho_grid", [0.15, 0.50, 0.85]))
+        n_tau = len(mpc_cfg.get("tau_grid", [0.15, 0.50, 0.85]))
+        candidate_count = int(4 * n_templates * (n_rho + n_tau + n_rho * n_tau))
+        cfg["baseline_metadata"] = {
+            "baseline_family": "mpc_grid",
+            "paper_inspired": True,
+            "exact_reproduction": False,
+            "uses_learned_policy": False,
+            "uses_same_safety_projection": True,
+            "comparison_role": "model_based_optimizer",
+            "action_contract": "boost_mode_structured_current_template_receiver_grid",
+            "selected_action_contract": "boost_mode_structured_current_template_receiver_grid",
+            "candidate_count": candidate_count,
+            "current_templates": "source_aware_feasible_operating_templates",
+            "candidate_state_protocol": "deterministic_expected_one_step_no_rng_mutation",
+            "oracle_future_disturbances": False,
+            "meta_learning": False,
+            "shared_lagrangian": False,
+            "safety_protocol": f"common_{cfg.get('safety', {}).get('projection_mode', 'thermal_cap')}_projection_for_hardware_feasibility",
+        }
+        return
+    if baseline == "javadi_ppo_dimming":
+        cfg.setdefault("context", {})["enabled"] = False
+        cfg.setdefault("agent", {})["z_dim"] = 0
+        cfg.setdefault("meta", {})["explicit_inner_outer"] = False
+        cfg["meta"]["query_updates_enabled"] = False
+        cfg["meta"]["dual_enabled"] = False
+        cfg["meta"]["dual_lr"] = 0.0
+        cfg["meta"]["dual_lrs"] = [0.0] * len(cfg["meta"].get("dual_names", []))
+        cfg.setdefault("baselines", {}).setdefault("javadi_ppo_dimming", {})
+        cfg["baseline_metadata"] = {
+            "baseline_family": "javadi_ppo_dimming",
+            "paper_inspired": True,
+            "exact_reproduction": False,
+            "policy_family": "PPO",
+            "source_selection_rl": True,
+            "joint_dimming": True,
+            "fixed_mode_exec": 2,
+            "fixed_mode_name": "HY",
+            "meta_learning": False,
+            "shared_lagrangian": False,
+            "uses_learned_policy": True,
+            "uses_same_safety_projection": True,
+            "domain_match": "owc_slipt_not_underwater",
+            "action_contract": "ppo_active_source_joint_dimming_hy",
+            "selected_action_contract": "ppo_active_source_joint_dimming_hy",
+            "comparison_role": "owc_slipt_active_source_joint_dimming_rl",
+            "safety_protocol": f"common_{cfg.get('safety', {}).get('projection_mode', 'thermal_cap')}_projection_for_hardware_feasibility",
+        }
+        return
+    if baseline == "deeprat_assignment_power":
+        cfg.setdefault("context", {})["enabled"] = False
+        cfg.setdefault("agent", {})["z_dim"] = 0
+        cfg.setdefault("meta", {})["explicit_inner_outer"] = False
+        cfg["meta"]["query_updates_enabled"] = False
+        cfg["meta"]["dual_enabled"] = False
+        cfg["meta"]["dual_lr"] = 0.0
+        cfg["meta"]["dual_lrs"] = [0.0] * len(cfg["meta"].get("dual_names", []))
+        cfg.setdefault("upper_dqn", {})
+        cfg.setdefault("lower_ddpg", {})
+        cfg["lower_ddpg"].update(
+            {
+                "action_contract": "current_allocation_only",
+                "upper_contract": "source_assignment",
+                "learned_action_dim": 3,
+                "fixed_receiver_rho": 0.5,
+                "fixed_receiver_tau": 0.5,
+                "replay_size": int(1.0e6),
+                "batch_size": 64,
+                "actor_lr": 1.0e-4,
+                "critic_lr": 3.0e-4,
+                "gamma": 0.99,
+                "target_tau": 0.2,
+                "noise_std": 0.10,
+                "grad_clip": 5.0,
+            }
+        )
+        cfg.setdefault("baselines", {}).setdefault("deeprat_assignment_power", {})
+        cfg["baseline_metadata"] = {
+            "baseline_family": "deeprat_assignment_power",
+            "paper_inspired": True,
+            "exact_reproduction": False,
+            "upper_action_contract": "source_assignment",
+            "lower_action_contract": "current_allocation_only",
+            "action_contract": "source_assignment__current_allocation_only",
+            "selected_action_contract": "source_assignment__current_allocation_only",
+            "fixed_mode_exec": 2,
+            "fixed_mode_name": "HY",
+            "comparison_role": "hierarchical_assignment_power_rl",
+            "domain_match": "wireless_resource_allocation_not_slipt",
+            "receiver_ratio_rule": "fixed_balanced_not_deeprat_core",
+            "meta_learning": False,
+            "shared_lagrangian": False,
+            "uses_learned_policy": True,
+            "uses_same_safety_projection": True,
+            "safety_protocol": f"common_{cfg.get('safety', {}).get('projection_mode', 'thermal_cap')}_projection_for_hardware_feasibility",
+        }
+        return
+    if baseline == "pdqn_hybrid_action":
+        cfg.setdefault("context", {})["enabled"] = False
+        cfg.setdefault("agent", {})["z_dim"] = 0
+        cfg.setdefault("meta", {})["explicit_inner_outer"] = False
+        cfg["meta"]["query_updates_enabled"] = False
+        cfg["meta"]["dual_enabled"] = False
+        cfg["meta"]["dual_lr"] = 0.0
+        cfg["meta"]["dual_lrs"] = [0.0] * len(cfg["meta"].get("dual_names", []))
+        cfg.setdefault("baselines", {}).setdefault("pdqn_hybrid_action", {})
+        cfg["baseline_metadata"] = {
+            "baseline_family": "pdqn_hybrid_action",
+            "paper_inspired": True,
+            "exact_reproduction": False,
+            "discrete_action_dim": 12,
+            "continuous_parameter_dim": 5,
+            "parameterized_action": True,
+            "policy_family": "P-DQN",
+            "action_contract": "parameterized_discrete_continuous_q_learning",
+            "selected_action_contract": "parameterized_discrete_continuous_q_learning",
+            "comparison_role": "hybrid_action_rl_baseline",
+            "meta_learning": False,
+            "shared_lagrangian": False,
+            "uses_learned_policy": True,
+            "uses_same_safety_projection": True,
+            "safety_protocol": f"common_{cfg.get('safety', {}).get('projection_mode', 'thermal_cap')}_projection_for_hardware_feasibility",
+        }
         return
     if baseline == "dalal2018_safe":
         cfg.setdefault("safety", {})["projection_mode"] = "dalal_safe"
@@ -1186,6 +1373,45 @@ def _add_projection_diagnostics(row: Dict, aux: Dict, currents_exec: np.ndarray)
             row[f"{prefix}_tx{tx_idx}"] = float(val)
 
 
+def _add_baseline_aux_diagnostics(row: Dict, aux: Dict) -> None:
+    numeric_keys = [
+        "online_latency_ms",
+        "candidate_count",
+        "selected_boost_combo",
+        "selected_mode",
+        "selected_rho",
+        "selected_tau",
+        "mpc_grid_score",
+        "predicted_qos_rate",
+        "predicted_eh_metric",
+        "qos_threshold",
+        "eh_threshold",
+        "source_subset_id",
+        "active_source_number",
+        "joint_dimming_scale_tx0",
+        "joint_dimming_scale_tx1",
+        "joint_dimming_scale_tx2",
+        "pdqn_selected_k",
+        "pdqn_argmax_q",
+    ]
+    string_keys = [
+        "selected_template",
+        "selected_uysal_policy",
+        "uysal_policy_rule",
+        "eh_threshold_source",
+        "fixed_current_template_name",
+        "candidate_state_protocol",
+        "selected_action_contract",
+        "receiver_ratio_rule",
+    ]
+    for key in numeric_keys:
+        if key in aux:
+            row[key] = float(aux[key])
+    for key in string_keys:
+        if key in aux:
+            row[key] = str(aux[key])
+
+
 def _add_eh_diagnostics(row: Dict, info: Dict) -> None:
     row["eh_model"] = str(info.get("eh_model", "linear"))
     row["eh_input_eff"] = float(info.get("eh_input_eff", info.get("eh_metric", 0.0)))
@@ -1331,6 +1557,7 @@ def collect_env_data(
                 _add_eh_diagnostics(row, info)
                 _add_env_thermal_diagnostics(row, info)
                 _add_projection_diagnostics(row, aux, currents_exec)
+                _add_baseline_aux_diagnostics(row, aux)
 
                 trainer.agent.episode.add(
                     {
@@ -2486,6 +2713,34 @@ def evaluate_mpc_lite_on_tasks(
     }
 
 
+def _run_paper_baseline_episode(policy: BasePaperBaseline, env: MultiTxUwSliptEnv) -> PolicyEpisodeStats:
+    return policy._run_episode(env, train=False)
+
+
+def evaluate_paper_baseline_on_tasks(
+    policy: BasePaperBaseline,
+    cfg: Dict,
+    tasks,
+    episodes_per_task: int,
+) -> Dict[str, float]:
+    stats: List[PolicyEpisodeStats] = []
+    for task in tasks:
+        env = MultiTxUwSliptEnv(cfg, overrides=task.to_env_overrides())
+        for _ in range(episodes_per_task):
+            stats.append(_run_paper_baseline_episode(policy, env))
+    return {
+        "reward": float(np.mean([s.reward for s in stats])),
+        "se": float(np.mean([s.se for s in stats])),
+        "eh": float(np.mean([s.eh for s in stats])),
+        "cost": float(np.mean([s.cost for s in stats])),
+        "violation_rate": float(np.mean([s.violation_rate for s in stats])),
+        "len": float(np.mean([s.length for s in stats])),
+        "temp_max": float(np.mean([s.temp_max for s in stats])),
+        "bus_utilization": float(np.mean([s.bus_utilization for s in stats])),
+        "online_latency_ms": float(np.mean([s.online_latency_ms for s in stats])),
+    }
+
+
 def evaluate_plain_hierarchical_baseline_on_tasks(
     trainer: SacLagrangianBaseline,
     cfg: Dict,
@@ -2635,6 +2890,7 @@ def collect_env_data_heuristic(
                 _add_eh_diagnostics(row, info)
                 _add_env_thermal_diagnostics(row, info)
                 _add_projection_diagnostics(row, aux, currents_exec)
+                _add_baseline_aux_diagnostics(row, aux)
                 rows.append(row)
                 obs = next_obs
                 step += 1
@@ -2756,6 +3012,7 @@ def collect_env_data_plain_hierarchical_baseline(
                 _add_eh_diagnostics(row, info)
                 _add_env_thermal_diagnostics(row, info)
                 _add_projection_diagnostics(row, aux, currents_exec)
+                _add_baseline_aux_diagnostics(row, aux)
                 rows.append(row)
                 obs = next_obs
                 step += 1
@@ -2784,6 +3041,26 @@ def collect_env_data_sac_lagrangian(
 
 def collect_env_data_mpc_lite(
     policy: MpcLiteOracleBaseline,
+    cfg: Dict,
+    scenario: str,
+    variant: str,
+    seed: int,
+    tasks,
+    episodes_per_task: int,
+) -> pd.DataFrame:
+    return collect_env_data_plain_hierarchical_baseline(
+        trainer=policy,  # type: ignore[arg-type]
+        cfg=cfg,
+        scenario=scenario,
+        variant=variant,
+        seed=seed,
+        tasks=tasks,
+        episodes_per_task=episodes_per_task,
+    )
+
+
+def collect_env_data_paper_baseline(
+    policy: BasePaperBaseline,
     cfg: Dict,
     scenario: str,
     variant: str,
@@ -3111,6 +3388,11 @@ STRUCTURAL_VARIANT_ORDER = (
     "single_ld",
     "shin2024_adapted_codebook",
     "shin2024_matched",
+    "uysal_policy_optimizer",
+    "mpc_grid",
+    "javadi_ppo_dimming",
+    "deeprat_assignment_power",
+    "pdqn_hybrid_action",
     "mpc_lite_oracle",
 )
 HARD_TARGETED_VARIANT_ORDER = (
@@ -3122,6 +3404,11 @@ HARD_TARGETED_VARIANT_ORDER = (
     "sac_lagrangian",
     "shin2024_adapted_codebook",
     "shin2024_matched",
+    "uysal_policy_optimizer",
+    "mpc_grid",
+    "javadi_ppo_dimming",
+    "deeprat_assignment_power",
+    "pdqn_hybrid_action",
     "sac_dalal_safe",
     "dalal2018_safe",
     "mpc_lite_oracle",
@@ -3133,6 +3420,11 @@ THERMAL_VARIANT_ORDER = (
     "sac_lagrangian",
     "shin2024_adapted_codebook",
     "shin2024_matched",
+    "uysal_policy_optimizer",
+    "mpc_grid",
+    "javadi_ppo_dimming",
+    "deeprat_assignment_power",
+    "pdqn_hybrid_action",
     "sac_dalal_safe",
     "dalal2018_safe",
     "mpc_lite_oracle",
@@ -3461,6 +3753,11 @@ def run_one_scenario(
             "dalal2018_safe",
             "mpc_lite_oracle",
             "mpc_lite",
+            "uysal_policy_optimizer",
+            "mpc_grid",
+            "javadi_ppo_dimming",
+            "deeprat_assignment_power",
+            "pdqn_hybrid_action",
         }:
             raise ValueError(f"Unknown baseline: {baseline}")
         if baseline == "heuristic_safe":
@@ -3474,6 +3771,15 @@ def run_one_scenario(
             baseline_override = baseline
         elif baseline in {"mpc_lite_oracle", "mpc_lite"}:
             runner = "mpc_lite"
+            baseline_override = baseline
+        elif baseline in {
+            "uysal_policy_optimizer",
+            "mpc_grid",
+            "javadi_ppo_dimming",
+            "deeprat_assignment_power",
+            "pdqn_hybrid_action",
+        }:
+            runner = baseline
             baseline_override = baseline
         else:
             runner = "trainer"
@@ -3597,6 +3903,16 @@ def run_one_scenario(
                 trainer = Shin2024MatchedBaseline(cfg)
             elif runner == "mpc_lite":
                 trainer = MpcLiteOracleBaseline(cfg)
+            elif runner == "uysal_policy_optimizer":
+                trainer = UysalPolicyOptimizer(cfg)
+            elif runner == "mpc_grid":
+                trainer = MpcGridBaseline(cfg)
+            elif runner == "javadi_ppo_dimming":
+                trainer = JavadiPPODimmingBaseline(cfg)
+            elif runner == "deeprat_assignment_power":
+                trainer = DeepRATAssignmentPowerBaseline(cfg)
+            elif runner == "pdqn_hybrid_action":
+                trainer = PDQNHybridActionBaseline(cfg)
             else:
                 trainer = MetaTrainer(cfg)
                 if effective_shared_init:
@@ -3671,6 +3987,19 @@ def run_one_scenario(
                 run_df["variant"] = label
                 run_df["seed"] = float(seed)
                 train_all.append(run_df)
+            elif runner in {
+                "uysal_policy_optimizer",
+                "mpc_grid",
+                "javadi_ppo_dimming",
+                "deeprat_assignment_power",
+                "pdqn_hybrid_action",
+            }:
+                train_csv = trainer.train(meta_iters=0 if runner in {"uysal_policy_optimizer", "mpc_grid"} else meta_iters)
+                run_df = pd.read_csv(train_csv)
+                run_df["scenario"] = scenario
+                run_df["variant"] = label
+                run_df["seed"] = float(seed)
+                train_all.append(run_df)
 
             if ckpt_pick.get("selection_rows"):
                 pd.DataFrame(ckpt_pick["selection_rows"]).to_csv(run_dir / "checkpoint_selection.csv", index=False)
@@ -3722,6 +4051,28 @@ def run_one_scenario(
                     episodes_per_task=eval_eps,
                 )
                 env_df = collect_env_data_mpc_lite(
+                    policy=trainer,
+                    cfg=cfg,
+                    scenario=scenario,
+                    variant=label,
+                    seed=seed,
+                    tasks=env_task_subset,
+                    episodes_per_task=env_eps,
+                )
+            elif runner in {
+                "uysal_policy_optimizer",
+                "mpc_grid",
+                "javadi_ppo_dimming",
+                "deeprat_assignment_power",
+                "pdqn_hybrid_action",
+            }:
+                ev = evaluate_paper_baseline_on_tasks(
+                    policy=trainer,
+                    cfg=cfg,
+                    tasks=eval_task_subset,
+                    episodes_per_task=eval_eps,
+                )
+                env_df = collect_env_data_paper_baseline(
                     policy=trainer,
                     cfg=cfg,
                     scenario=scenario,
@@ -3826,6 +4177,8 @@ def run_one_scenario(
                     "ordered_eval_task_batch_hash": ordered_eval_task_hash,
                     "ordered_env_task_batch_hash": ordered_env_task_hash,
                     "baseline_family": str(baseline_meta.get("baseline_family", baseline_override or "")),
+                    "baseline_metadata": baseline_meta,
+                    "paper_inspired": baseline_meta.get("paper_inspired"),
                     "exact_reproduction": baseline_meta.get("exact_reproduction"),
                     "external_baseline": baseline_meta.get("external_baseline"),
                     "uses_task_oracle": baseline_meta.get("uses_task_oracle"),
@@ -3833,8 +4186,14 @@ def run_one_scenario(
                     "uses_same_safety_projection": baseline_meta.get("uses_same_safety_projection"),
                     "mpc_horizon": baseline_meta.get("horizon"),
                     "mpc_candidate_count": baseline_meta.get("candidate_count"),
+                    "candidate_count": baseline_meta.get("candidate_count"),
+                    "online_latency_ms": float(env_df["online_latency_ms"].mean())
+                    if "online_latency_ms" in env_df and not env_df.empty
+                    else baseline_meta.get("online_latency_ms"),
                     "safety_protocol": str(baseline_meta.get("safety_protocol", "")),
                     "comparison_role": str(pilot_meta.get("comparison_role", baseline_meta.get("comparison_role", ""))),
+                    "action_contract": str(baseline_meta.get("action_contract", "")),
+                    "selected_action_contract": str(baseline_meta.get("selected_action_contract", "")),
                     "lower_learned_action_dim": baseline_meta.get("lower_learned_action_dim"),
                     "original_algorithm_structure": str(baseline_meta.get("original_algorithm_structure", "")),
                     "upper_action_contract": str(baseline_meta.get("upper_action_contract", "")),
@@ -3842,6 +4201,16 @@ def run_one_scenario(
                     "fixed_mode_exec": baseline_meta.get("fixed_mode_exec"),
                     "fixed_mode_name": str(baseline_meta.get("fixed_mode_name", "")),
                     "current_template_levels": baseline_meta.get("current_template_levels"),
+                    "current_template_codeword_names": baseline_meta.get("current_template_codeword_names"),
+                    "current_template_codewords": baseline_meta.get("current_template_codewords"),
+                    "mapped_original_control": str(baseline_meta.get("mapped_original_control", "")),
+                    "policy_family": baseline_meta.get("policy_family"),
+                    "policy_selection_rule": str(baseline_meta.get("policy_selection_rule", "")),
+                    "domain_match": str(baseline_meta.get("domain_match", "")),
+                    "receiver_ratio_rule": str(baseline_meta.get("receiver_ratio_rule", "")),
+                    "parameterized_action": baseline_meta.get("parameterized_action"),
+                    "discrete_action_dim": baseline_meta.get("discrete_action_dim"),
+                    "continuous_parameter_dim": baseline_meta.get("continuous_parameter_dim"),
                     "learned_current_allocation": baseline_meta.get("learned_current_allocation"),
                     "meta_learning": baseline_meta.get("meta_learning"),
                     "shared_lagrangian": baseline_meta.get("shared_lagrangian"),
@@ -3989,14 +4358,21 @@ def run_one_scenario(
                 "tx_device": ["LED", "LD", "LD"],
                 "tx_enabled": [1.0, 1.0, 1.0],
                 "baseline_family": "shin2024_adapted_codebook",
+                "paper_inspired": True,
                 "exact_reproduction": False,
                 "original_algorithm_structure": "hierarchical_dqn_ddpg",
-                "upper_action_contract": "boost_combo_current_template",
+                "upper_action_contract": "boost_combo_intensity_codeword",
                 "lower_action_contract": "rho_tau_only",
+                "action_contract": "boost_combo_intensity_codeword__rho_tau_only",
                 "fixed_mode_exec": 2,
                 "fixed_mode_name": "HY",
-                "current_template_levels": [0.35, 0.50, 0.65],
+                "current_template_codeword_names": ["low_safe", "balanced", "high_performance"],
+                "current_template_codewords": [[0.40, 0.25, 0.25], [0.55, 0.45, 0.45], [0.70, 0.65, 0.65]],
+                "mapped_original_control": "beam_divergence_angle_to_source_intensity_codeword",
                 "learned_current_allocation": False,
+                "meta_learning": False,
+                "shared_lagrangian": False,
+                "uses_same_safety_projection": True,
                 "safety_protocol": f"{common_projection_protocol}_for_evaluation",
                 "comparison_role": "prior_study_inspired_adapted_baseline",
                 "description": "Shin 2024-adapted hierarchical DQN-DDPG baseline: upper DQN selects boost/current-template codebook entries, lower DDPG learns only rho/tau, and execution is fixed to HY under the shared safety projection.",
@@ -4035,6 +4411,36 @@ def run_one_scenario(
                 "external_baseline": True,
                 "comparison_role": "model_based_optimizer",
                 "description": "One-step model-informed optimizer baseline using current task parameters and the same configured safety projection.",
+            }
+        elif runner in {
+            "uysal_policy_optimizer",
+            "mpc_grid",
+            "javadi_ppo_dimming",
+            "deeprat_assignment_power",
+            "pdqn_hybrid_action",
+        }:
+            cfg_for_label = apply_common_settings(
+                base_cfg,
+                1,
+                scenario_dir,
+                f"{scenario}_{label}_definition",
+                seeds[0] if seeds else 0,
+                fast_mode=True,
+                use_curriculum=False,
+            )
+            apply_scenario(cfg_for_label, scenario)
+            apply_variant(cfg_for_label, variant)
+            apply_ablation(cfg_for_label, ablation)
+            apply_baseline_overrides(cfg_for_label, str(spec.get("baseline_override", label)))
+            meta = dict(cfg_for_label.get("baseline_metadata", {}))
+            variant_definitions[label] = {
+                "runner": runner,
+                "base_variant": variant,
+                "ablation": ablation,
+                "tx_device": ["LED", "LD", "LD"],
+                "tx_enabled": [1.0, 1.0, 1.0],
+                **meta,
+                "description": f"{label} adapted paper-inspired baseline under the common environment and reward protocol.",
             }
         elif variant == "hybrid":
             is_smooth_relaxed = ablation == "smooth_relaxed"
@@ -4435,6 +4841,11 @@ def parse_args() -> argparse.Namespace:
             "dalal2018_safe",
             "mpc_lite_oracle",
             "mpc_lite",
+            "uysal_policy_optimizer",
+            "mpc_grid",
+            "javadi_ppo_dimming",
+            "deeprat_assignment_power",
+            "pdqn_hybrid_action",
         ],
         help="Optional heuristic/learning baselines to evaluate.",
     )

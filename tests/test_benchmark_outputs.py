@@ -301,11 +301,16 @@ def test_benchmark_supports_shin2024_and_dalal_baselines(tmp_path: Path):
     assert shin_rows[0]["fixed_mode_exec"] == 2
     assert shin_rows[0]["fixed_current_template"] == "tanh_affine_fraction"
     assert shin_codebook_rows[0]["baseline_family"] == "shin2024_adapted_codebook"
+    assert shin_codebook_rows[0]["paper_inspired"] is True
     assert shin_codebook_rows[0]["exact_reproduction"] is False
-    assert shin_codebook_rows[0]["upper_action_contract"] == "boost_combo_current_template"
+    assert shin_codebook_rows[0]["upper_action_contract"] == "boost_combo_intensity_codeword"
     assert shin_codebook_rows[0]["lower_action_contract"] == "rho_tau_only"
     assert shin_codebook_rows[0]["fixed_mode_exec"] == 2
     assert shin_codebook_rows[0]["learned_current_allocation"] is False
+    assert (
+        shin_codebook_rows[0]["mapped_original_control"]
+        == "beam_divergence_angle_to_source_intensity_codeword"
+    )
     assert sac_dalal_rows[0]["baseline_family"] == "sac_dalal_safe"
     assert sac_dalal_rows[0]["exact_reproduction"] is False
     assert sac_dalal_rows[0]["external_baseline"] is True
@@ -325,8 +330,17 @@ def test_benchmark_supports_shin2024_and_dalal_baselines(tmp_path: Path):
     assert int(shin_codebook_cfg["agent"]["z_dim"]) == 0
     assert bool(shin_codebook_cfg["context"]["enabled"]) is False
     assert shin_codebook_cfg["lower_ddpg"]["action_contract"] == "rho_tau_codebook_current"
-    assert shin_codebook_cfg["lower_ddpg"]["upper_contract"] == "boost_current_template"
-    assert shin_codebook_cfg["lower_ddpg"]["current_template_levels"] == [0.35, 0.50, 0.65]
+    assert shin_codebook_cfg["lower_ddpg"]["upper_contract"] == "boost_intensity_codeword"
+    assert shin_codebook_cfg["lower_ddpg"]["current_template_codeword_names"] == [
+        "low_safe",
+        "balanced",
+        "high_performance",
+    ]
+    assert shin_codebook_cfg["lower_ddpg"]["current_template_codewords"] == [
+        [0.40, 0.25, 0.25],
+        [0.55, 0.45, 0.45],
+        [0.70, 0.65, 0.65],
+    ]
     assert int(shin_codebook_cfg["lower_ddpg"]["learned_action_dim"]) == 2
     assert dalal_cfg["safety"]["projection_mode"] == "dalal_safe"
     assert int(sac_dalal_cfg["agent"]["z_dim"]) == 0

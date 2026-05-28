@@ -132,6 +132,54 @@ mpc_lite:
   horizon: 1
   candidate_count: 256
 
+baselines:
+  shin2024_adapted_codebook:
+    current_template_codeword_names: [low_safe, balanced, high_performance]
+    current_template_codewords:
+      - [0.40, 0.25, 0.25]
+      - [0.55, 0.45, 0.45]
+      - [0.70, 0.65, 0.65]
+  uysal_policy_optimizer:
+    fixed_boost_combo: 3
+    fixed_current_template_name: balanced_receiver_policy
+    fixed_current_template: [0.50, 0.40, 0.40]
+    rho_grid: [0.10, 0.30, 0.50, 0.70, 0.90]
+    tau_grid: [0.10, 0.30, 0.50, 0.70, 0.90]
+    eh_min_target: 0.02
+  mpc_grid:
+    current_templates:
+      safe_anchor: [0.55, 0.00, 0.00]
+      balanced_hybrid: [0.45, 0.40, 0.40]
+      ld1_preferred: [0.40, 0.55, 0.20]
+      ld2_preferred: [0.40, 0.20, 0.55]
+      thermal_spread: [0.35, 0.45, 0.45]
+    rho_grid: [0.15, 0.50, 0.85]
+    tau_grid: [0.15, 0.50, 0.85]
+  javadi_ppo_dimming:
+    hidden_dim: 128
+    lr: 3.0e-4
+    clip_ratio: 0.2
+    ppo_epochs: 2
+    entropy_coef: 0.005
+    value_coef: 0.5
+  deeprat_assignment_power:
+    replay_size: 1000000
+    upper_replay_size: 2000
+    batch_size: 64
+    warmup_steps: 100
+    lower_updates_per_step: 1
+  pdqn_hybrid_action:
+    discrete_action_dim: 12
+    continuous_parameter_dim: 5
+    hidden_dim: 128
+    replay_size: 100000
+    batch_size: 64
+    warmup_steps: 100
+    epsilon: 0.05
+    noise_std: 0.10
+    param_lr: 1.0e-4
+    q_lr: 3.0e-4
+
 meta:
   n_tasks_per_iter: 6
   meta_iters: 80

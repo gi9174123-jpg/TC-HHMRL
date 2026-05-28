@@ -12,6 +12,7 @@ from tchhmrl.safety.safety_layer import SafetyLayer, raw_from_frac01
 
 class LowerDDPG:
     _RHO_TAU_CONTRACTS = {"rho_tau_fixed_current", "rho_tau_codebook_current"}
+    _CURRENT_ALLOCATION_CONTRACTS = {"current_allocation_only"}
 
     def __init__(self, cfg: Dict, safety: SafetyLayer, device: torch.device):
         agent_cfg = cfg["agent"]
@@ -26,27 +27,52 @@ class LowerDDPG:
         self.action_contract = str(ddpg_cfg.get("action_contract", "full_lower_action"))
         if self.action_contract in self._RHO_TAU_CONTRACTS:
             self.learned_act_dim = 2
+        elif self.action_contract in self._CURRENT_ALLOCATION_CONTRACTS:
+            self.learned_act_dim = 3
         else:
             self.learned_act_dim = int(ddpg_cfg.get("learned_action_dim", self.act_dim))
         self.fixed_current_fraction = float(ddpg_cfg.get("fixed_current_fraction", 0.5))
         self.fixed_current_fraction = float(np.clip(self.fixed_current_fraction, 1.0e-4, 1.0 - 1.0e-4))
-        current_template_levels = np.asarray(
-            ddpg_cfg.get("current_template_levels", [0.35, 0.50, 0.65]),
-            dtype=np.float32,
-        ).reshape(-1)
-        if current_template_levels.size != 3:
-            if self.action_contract == "rho_tau_codebook_current":
-                raise ValueError("lower_ddpg.current_template_levels must contain exactly 3 levels")
-            current_template_levels = np.asarray([0.35, 0.50, 0.65], dtype=np.float32)
+        self.fixed_receiver_rho = float(np.clip(ddpg_cfg.get("fixed_receiver_rho", 0.5), 1.0e-4, 1.0 - 1.0e-4))
+        self.fixed_receiver_tau = float(np.clip(ddpg_cfg.get("fixed_receiver_tau", 0.5), 1.0e-4, 1.0 - 1.0e-4))
+        if "current_template_codewords" in ddpg_cfg:
+            current_template_levels = np.asarray(ddpg_cfg["current_template_codewords"], dtype=np.float32)
+            if current_template_levels.shape != (3, 3):
+                raise ValueError("lower_ddpg.current_template_codewords must have shape (3, 3)")
+        else:
+            current_template_levels = np.asarray(
+                ddpg_cfg.get("current_template_levels", [0.35, 0.50, 0.65]),
+                dtype=np.float32,
+            ).reshape(-1)
+            if current_template_levels.size != 3:
+                if self.action_contract == "rho_tau_codebook_current":
+                    raise ValueError("lower_ddpg.current_template_levels must contain exactly 3 levels")
+                current_template_levels = np.asarray([0.35, 0.50, 0.65], dtype=np.float32)
+            current_template_levels = np.repeat(current_template_levels.reshape(3, 1), 3, axis=1)
         self.current_template_levels = current_template_levels
         self.current_template_levels = np.clip(self.current_template_levels, 1.0e-4, 1.0 - 1.0e-4)
         self.upper_contract = str(ddpg_cfg.get("upper_contract", "boost_mode")).lower()
-        if self.upper_contract not in {"boost_mode", "boost_current_template"}:
+        if self.upper_contract not in {
+            "boost_mode",
+            "boost_current_template",
+            "boost_intensity_codeword",
+            "source_assignment",
+        }:
             raise ValueError(f"unsupported lower_ddpg.upper_contract={self.upper_contract}")
-        if self.action_contract == "rho_tau_codebook_current" and self.upper_contract != "boost_current_template":
-            raise ValueError("rho_tau_codebook_current requires lower_ddpg.upper_contract=boost_current_template")
-        if self.upper_contract == "boost_current_template" and self.action_contract != "rho_tau_codebook_current":
-            raise ValueError("boost_current_template requires lower_ddpg.action_contract=rho_tau_codebook_current")
+        if self.action_contract == "rho_tau_codebook_current" and self.upper_contract not in {
+            "boost_current_template",
+            "boost_intensity_codeword",
+        }:
+            raise ValueError(
+                "rho_tau_codebook_current requires lower_ddpg.upper_contract=boost_current_template "
+                "or boost_intensity_codeword"
+            )
+        if self.upper_contract in {"boost_current_template", "boost_intensity_codeword"} and self.action_contract != "rho_tau_codebook_current":
+            raise ValueError(
+                "boost current/codeword upper contracts require lower_ddpg.action_contract=rho_tau_codebook_current"
+            )
+        if self.upper_contract == "source_assignment" and self.action_contract != "current_allocation_only":
+            raise ValueError("source_assignment requires lower_ddpg.action_contract=current_allocation_only")
         self.action_decode_mode = str(cfg.get("safety", {}).get("action_decode_mode", "tanh_affine")).lower()
         self._fixed_current_raw = float(
             raw_from_frac01(self.fixed_current_fraction, self.action_decode_mode).reshape(-1)[0]
@@ -54,6 +80,10 @@ class LowerDDPG:
         self._current_template_raw = raw_from_frac01(self.current_template_levels, self.action_decode_mode).astype(
             np.float32
         )
+        self._fixed_receiver_raw = raw_from_frac01(
+            np.asarray([self.fixed_receiver_rho, self.fixed_receiver_tau], dtype=np.float32),
+            self.action_decode_mode,
+        ).astype(np.float32)
         self.upper_ctx_dim = int(agent_cfg.get("lower_upper_ctx_dim", 7))
         self.obs_aug_dim = self.obs_dim + self.upper_ctx_dim
         hidden = int(agent_cfg["hidden_dim"])
@@ -77,7 +107,7 @@ class LowerDDPG:
 
     def _raw_from_template_level_torch(self, current_template_level: torch.Tensor) -> torch.Tensor:
         levels = torch.as_tensor(self.current_template_levels, dtype=torch.float32, device=current_template_level.device)
-        level_idx = torch.clamp(current_template_level.long().view(-1), 0, levels.numel() - 1)
+        level_idx = torch.clamp(current_template_level.long().view(-1), 0, levels.shape[0] - 1)
         frac = levels[level_idx]
         if self.action_decode_mode == "sigmoid_logit":
             frac = torch.clamp(frac, min=1.0e-4, max=1.0 - 1.0e-4)
@@ -89,15 +119,24 @@ class LowerDDPG:
         learned_raw: torch.Tensor,
         current_template_level: torch.Tensor | None = None,
     ) -> torch.Tensor:
-        if self.action_contract not in self._RHO_TAU_CONTRACTS:
+        if self.action_contract not in self._RHO_TAU_CONTRACTS and self.action_contract not in self._CURRENT_ALLOCATION_CONTRACTS:
             return learned_raw
+        if self.action_contract in self._CURRENT_ALLOCATION_CONTRACTS:
+            if learned_raw.shape[1] != 3:
+                raise ValueError(f"{self.action_contract} expects 3 learned current dims, got {learned_raw.shape[1]}")
+            fixed = torch.as_tensor(
+                self._fixed_receiver_raw,
+                dtype=learned_raw.dtype,
+                device=learned_raw.device,
+            ).view(1, 2).expand(learned_raw.shape[0], -1)
+            return torch.cat([learned_raw, fixed], dim=1)
         if learned_raw.shape[1] != 2:
             raise ValueError(f"{self.action_contract} expects 2 learned action dims, got {learned_raw.shape[1]}")
         if self.action_contract == "rho_tau_codebook_current":
             if current_template_level is None:
                 raise ValueError("rho_tau_codebook_current requires current_template_level")
             current_raw = self._raw_from_template_level_torch(current_template_level).to(dtype=learned_raw.dtype)
-            fixed = current_raw.view(-1, 1).expand(-1, 3)
+            fixed = current_raw.view(-1, 3)
         else:
             fixed = torch.full(
                 (learned_raw.shape[0], 3),
@@ -114,8 +153,12 @@ class LowerDDPG:
         current_template_level: float | int | None = None,
     ) -> np.ndarray:
         learned_raw = np.asarray(learned_raw, dtype=np.float32).reshape(-1)
-        if self.action_contract not in self._RHO_TAU_CONTRACTS:
+        if self.action_contract not in self._RHO_TAU_CONTRACTS and self.action_contract not in self._CURRENT_ALLOCATION_CONTRACTS:
             return learned_raw.astype(np.float32)
+        if self.action_contract in self._CURRENT_ALLOCATION_CONTRACTS:
+            if learned_raw.size != 3:
+                raise ValueError(f"{self.action_contract} expects 3 learned current dims, got {learned_raw.size}")
+            return np.concatenate([learned_raw.astype(np.float32), self._fixed_receiver_raw.astype(np.float32)], axis=0)
         if learned_raw.size != 2:
             raise ValueError(f"{self.action_contract} expects 2 learned action dims, got {learned_raw.size}")
         if self.action_contract == "rho_tau_codebook_current":
@@ -123,8 +166,8 @@ class LowerDDPG:
                 if upper_idx is None:
                     raise ValueError("rho_tau_codebook_current requires upper_idx or current_template_level")
                 current_template_level = int(np.clip(int(upper_idx), 0, 11)) % 3
-            level = int(np.clip(int(current_template_level), 0, self._current_template_raw.size - 1))
-            fixed = np.full((3,), float(self._current_template_raw[level]), dtype=np.float32)
+            level = int(np.clip(int(current_template_level), 0, self._current_template_raw.shape[0] - 1))
+            fixed = np.asarray(self._current_template_raw[level], dtype=np.float32).reshape(3)
         else:
             fixed = np.full((3,), self._fixed_current_raw, dtype=np.float32)
         return np.concatenate([fixed, learned_raw.astype(np.float32)], axis=0)
@@ -231,8 +274,12 @@ class LowerDDPG:
             device=self.device,
         )
 
-        selector = current_template_level if self.upper_contract == "boost_current_template" else mode
-        selector_next = current_template_level_next if self.upper_contract == "boost_current_template" else mode_next
+        selector = current_template_level if self.upper_contract in {"boost_current_template", "boost_intensity_codeword"} else mode
+        selector_next = (
+            current_template_level_next
+            if self.upper_contract in {"boost_current_template", "boost_intensity_codeword"}
+            else mode_next
+        )
 
         obs_aug = torch.cat([obs, self._upper_ctx_torch(boost, selector)], dim=1)
         next_obs_aug = torch.cat([next_obs, self._upper_ctx_torch(boost_next, selector_next)], dim=1)
