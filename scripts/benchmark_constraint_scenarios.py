@@ -355,6 +355,8 @@ def apply_baseline_overrides(cfg: Dict, baseline: str) -> None:
             "fixed_mode_name": "HY",
             "fixed_current_template": str(cfg.get("safety", {}).get("action_decode_mode", "tanh_affine")) + "_fraction",
             "fixed_current_fraction": 0.5,
+            "rho_symbol_mapping": "paper_rho_is_id_fraction; env_rho_exec_is_eh_fraction; paper_rho=1-env_rho_exec",
+            "tau_symbol_mapping": "paper_tau_and_env_tau_exec_are_id_time_fraction",
         }
         cfg["agent"]["batch_size"] = 64
         return
@@ -417,6 +419,8 @@ def apply_baseline_overrides(cfg: Dict, baseline: str) -> None:
             "current_template_codewords": current_template_codewords,
             "source_aware_current_codewords": True,
             "mapped_original_control": "beam_divergence_angle_to_source_intensity_codeword",
+            "rho_symbol_mapping": "paper_rho_is_id_fraction; env_rho_exec_is_eh_fraction; paper_rho=1-env_rho_exec",
+            "tau_symbol_mapping": "paper_tau_and_env_tau_exec_are_id_time_fraction",
             "learned_current_allocation": False,
             "meta_learning": False,
             "shared_lagrangian": False,
@@ -452,6 +456,9 @@ def apply_baseline_overrides(cfg: Dict, baseline: str) -> None:
             "selected_action_contract": "uysal_ads_threshold_receiver_policy",
             "policy_family": ["uysal_ts", "uysal_ps", "uysal_tsps", "uysal_ads"],
             "policy_selection_rule": "predefined_ads_threshold_not_oracle_best_of_four",
+            "ads_mapping_note": "uysal_ads_controller_is_threshold_scheduler; original_ads_is_ac_dc_separation",
+            "rho_symbol_mapping": "paper_rho_is_id_fraction; env_rho_exec_is_eh_fraction; paper_rho=1-env_rho_exec",
+            "tau_symbol_mapping": "paper_tau_and_env_tau_exec_are_id_time_fraction",
             "comparison_role": "underwater_slipt_policy_optimizer",
             "safety_protocol": f"common_{cfg.get('safety', {}).get('projection_mode', 'thermal_cap')}_projection_for_hardware_feasibility",
         }
@@ -467,8 +474,8 @@ def apply_baseline_overrides(cfg: Dict, baseline: str) -> None:
         cfg.setdefault("baselines", {}).setdefault("mpc_grid", {})
         mpc_cfg = cfg["baselines"]["mpc_grid"]
         n_templates = len(mpc_cfg.get("current_templates", {})) or 5
-        n_rho = len(mpc_cfg.get("rho_grid", [0.15, 0.50, 0.85]))
-        n_tau = len(mpc_cfg.get("tau_grid", [0.15, 0.50, 0.85]))
+        n_rho = len(mpc_cfg.get("rho_grid", [0.10, 0.30, 0.50, 0.70, 0.90]))
+        n_tau = len(mpc_cfg.get("tau_grid", [0.10, 0.30, 0.50, 0.70, 0.90]))
         candidate_count = int(4 * n_templates * (n_rho + n_tau + n_rho * n_tau))
         cfg["baseline_metadata"] = {
             "baseline_family": "mpc_grid",
@@ -483,6 +490,8 @@ def apply_baseline_overrides(cfg: Dict, baseline: str) -> None:
             "current_templates": "source_aware_feasible_operating_templates",
             "candidate_state_protocol": "deterministic_expected_one_step_no_rng_mutation",
             "oracle_future_disturbances": False,
+            "rho_symbol_mapping": "paper_rho_is_id_fraction; env_rho_exec_is_eh_fraction; paper_rho=1-env_rho_exec",
+            "tau_symbol_mapping": "paper_tau_and_env_tau_exec_are_id_time_fraction",
             "meta_learning": False,
             "shared_lagrangian": False,
             "safety_protocol": f"common_{cfg.get('safety', {}).get('projection_mode', 'thermal_cap')}_projection_for_hardware_feasibility",
@@ -497,7 +506,7 @@ def apply_baseline_overrides(cfg: Dict, baseline: str) -> None:
         cfg["meta"]["dual_lr"] = 0.0
         cfg["meta"]["dual_lrs"] = [0.0] * len(cfg["meta"].get("dual_names", []))
         javadi_cfg = cfg.setdefault("baselines", {}).setdefault("javadi_ppo_dimming", {})
-        dimming_type = str(javadi_cfg.get("dimming_type", "source_wise_dimming"))
+        dimming_type = str(javadi_cfg.get("dimming_type", "common_dimming_scale"))
         cfg["baseline_metadata"] = {
             "baseline_family": "javadi_ppo_dimming",
             "paper_inspired": True,
@@ -506,6 +515,7 @@ def apply_baseline_overrides(cfg: Dict, baseline: str) -> None:
             "source_selection_rl": True,
             "joint_dimming": True,
             "dimming_type": dimming_type,
+            "continuous_policy_dim": 3,
             "fixed_mode_exec": 2,
             "fixed_mode_name": "HY",
             "meta_learning": False,
@@ -513,8 +523,8 @@ def apply_baseline_overrides(cfg: Dict, baseline: str) -> None:
             "uses_learned_policy": True,
             "uses_same_safety_projection": True,
             "domain_match": "owc_slipt_not_underwater",
-            "action_contract": "ppo_active_source_joint_dimming_hy",
-            "selected_action_contract": "ppo_active_source_joint_dimming_hy",
+            "action_contract": "ppo_active_source_common_dimming_hy",
+            "selected_action_contract": "ppo_active_source_common_dimming_hy",
             "comparison_role": "owc_slipt_active_source_joint_dimming_rl",
             "safety_protocol": f"common_{cfg.get('safety', {}).get('projection_mode', 'thermal_cap')}_projection_for_hardware_feasibility",
         }
@@ -1395,6 +1405,10 @@ def _add_baseline_aux_diagnostics(row: Dict, aux: Dict) -> None:
         "selected_mode",
         "selected_rho",
         "selected_tau",
+        "rho_exec",
+        "tau_exec",
+        "paper_rho_equiv",
+        "paper_tau_equiv",
         "mpc_grid_score",
         "predicted_qos_rate",
         "predicted_eh_metric",
@@ -1407,6 +1421,7 @@ def _add_baseline_aux_diagnostics(row: Dict, aux: Dict) -> None:
         "joint_dimming_scale_tx0",
         "joint_dimming_scale_tx1",
         "joint_dimming_scale_tx2",
+        "joint_dimming_scale",
         "pdqn_selected_k",
         "pdqn_argmax_q",
     ]
@@ -1417,6 +1432,7 @@ def _add_baseline_aux_diagnostics(row: Dict, aux: Dict) -> None:
         "selected_uysal_subpolicy",
         "uysal_policy_rule",
         "eh_threshold_source",
+        "rho_symbol_mapping",
         "fixed_current_template_name",
         "candidate_state_protocol",
         "selected_action_contract",
@@ -2404,12 +2420,19 @@ class Shin2024MatchedBaseline(SacLagrangianBaseline):
             "boost_combo_exec": int(safe["boost_combo_exec"]),
             "mode_exec": int(safe["mode_exec"]),
             "current_template_level_exec": int(current_template_level),
+            "rho_exec": float(safe["rho_exec"]),
+            "tau_exec": float(safe["tau_exec"]),
+            "paper_rho_equiv": float(1.0 - float(safe["rho_exec"])),
+            "paper_tau_equiv": float(safe["tau_exec"]),
             "act_raw": lower_raw.astype(np.float32),
             "act_exec": np.concatenate(
                 [safe["currents_exec"], np.asarray([safe["rho_exec"], safe["tau_exec"]], dtype=np.float32)]
             ).astype(np.float32),
             "macro_new": bool(macro_new),
             "hold_left": int(self.upper_mem["hold_left"]),
+            "selected_action_contract": str(
+                self.cfg.get("baseline_metadata", {}).get("selected_action_contract", "")
+            ),
         }
         aux.update(_safe_projection_aux(safe))
         return action, aux
@@ -4223,10 +4246,14 @@ def run_one_scenario(
                     "current_template_codeword_names": baseline_meta.get("current_template_codeword_names"),
                     "current_template_codewords": baseline_meta.get("current_template_codewords"),
                     "mapped_original_control": str(baseline_meta.get("mapped_original_control", "")),
+                    "rho_symbol_mapping": str(baseline_meta.get("rho_symbol_mapping", "")),
+                    "tau_symbol_mapping": str(baseline_meta.get("tau_symbol_mapping", "")),
+                    "ads_mapping_note": str(baseline_meta.get("ads_mapping_note", "")),
                     "policy_family": baseline_meta.get("policy_family"),
                     "policy_selection_rule": str(baseline_meta.get("policy_selection_rule", "")),
                     "domain_match": str(baseline_meta.get("domain_match", "")),
                     "dimming_type": str(baseline_meta.get("dimming_type", "")),
+                    "continuous_policy_dim": baseline_meta.get("continuous_policy_dim"),
                     "receiver_ratio_rule": str(baseline_meta.get("receiver_ratio_rule", "")),
                     "parameterized_action": baseline_meta.get("parameterized_action"),
                     "discrete_action_dim": baseline_meta.get("discrete_action_dim"),
@@ -4267,6 +4294,12 @@ def run_one_scenario(
                     else None,
                     "uysal_tsps_fraction": float((env_df["selected_uysal_subpolicy"] == "uysal_tsps").mean())
                     if "selected_uysal_subpolicy" in env_df and not env_df.empty
+                    else None,
+                    "mean_env_rho_exec": float(env_df["rho_exec"].mean())
+                    if "rho_exec" in env_df and not env_df.empty
+                    else None,
+                    "mean_paper_rho_equiv": float(env_df["paper_rho_equiv"].mean())
+                    if "paper_rho_equiv" in env_df and not env_df.empty
                     else None,
                     "mean_predicted_eh_metric": float(env_df["predicted_eh_metric"].mean())
                     if "predicted_eh_metric" in env_df and not env_df.empty

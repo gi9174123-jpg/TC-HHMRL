@@ -31,8 +31,9 @@ class UysalPolicyOptimizer(BasePaperBaseline):
         self.fixed_boost_combo = int(opts.get("fixed_boost_combo", 3))
         self.current_template_name = str(opts.get("fixed_current_template_name", "balanced_receiver_policy"))
         self.current_template = np.asarray(opts.get("fixed_current_template", [0.50, 0.40, 0.40]), dtype=np.float32)
-        self.rho_grid = np.asarray(opts.get("rho_grid", [0.10, 0.30, 0.50, 0.70, 0.90]), dtype=np.float32)
-        self.tau_grid = np.asarray(opts.get("tau_grid", [0.10, 0.30, 0.50, 0.70, 0.90]), dtype=np.float32)
+        dense_grid = [0.10, 0.20, 0.30, 0.40, 0.50, 0.60, 0.70, 0.80, 0.90]
+        self.rho_grid = np.asarray(opts.get("rho_grid", dense_grid), dtype=np.float32)
+        self.tau_grid = np.asarray(opts.get("tau_grid", dense_grid), dtype=np.float32)
         self.eh_min_target = float(opts.get("eh_min_target", cfg.get("env", {}).get("eh_min_target", 0.02)))
         self.action_contract = "uysal_ads_threshold_receiver_policy"
 
@@ -119,6 +120,7 @@ class UysalPolicyOptimizer(BasePaperBaseline):
                 "qos_threshold": float(env.qos_min_rate),
                 "eh_threshold": float(self.eh_min_target),
                 "eh_threshold_source": "baselines.uysal_policy_optimizer.eh_min_target",
+                "rho_symbol_mapping": "paper_rho_is_id_fraction; env_rho_exec_is_eh_fraction; paper_rho=1-env_rho_exec",
                 "fixed_current_template_name": self.current_template_name,
                 "selected_action_contract": self.action_contract,
                 "online_latency_ms": monotonic_latency_ms(start),

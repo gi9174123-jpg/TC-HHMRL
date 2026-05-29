@@ -34,8 +34,8 @@ class MpcGridBaseline(BasePaperBaseline):
                 },
             )
         )
-        self.rho_grid = np.asarray(opts.get("rho_grid", [0.15, 0.50, 0.85]), dtype=np.float32)
-        self.tau_grid = np.asarray(opts.get("tau_grid", [0.15, 0.50, 0.85]), dtype=np.float32)
+        self.rho_grid = np.asarray(opts.get("rho_grid", [0.10, 0.30, 0.50, 0.70, 0.90]), dtype=np.float32)
+        self.tau_grid = np.asarray(opts.get("tau_grid", [0.10, 0.30, 0.50, 0.70, 0.90]), dtype=np.float32)
         self.action_contract = "boost_mode_structured_current_template_receiver_grid"
         self.candidate_count = self._count_candidates()
 

@@ -60,6 +60,9 @@ def test_shin_adapted_codebook_contract_is_source_aware(tmp_path):
     assert cfg["baseline_metadata"]["fixed_mode_exec"] == 2
     assert cfg["baseline_metadata"]["learned_current_allocation"] is False
     assert cfg["baseline_metadata"]["paper_inspired"] is True
+    assert cfg["baseline_metadata"]["rho_symbol_mapping"] == (
+        "paper_rho_is_id_fraction; env_rho_exec_is_eh_fraction; paper_rho=1-env_rho_exec"
+    )
 
 
 def test_uysal_policy_optimizer_is_threshold_rule_not_oracle(tmp_path):
@@ -76,6 +79,7 @@ def test_uysal_policy_optimizer_is_threshold_rule_not_oracle(tmp_path):
     assert aux["selected_uysal_subpolicy"] in {"uysal_ts", "uysal_ps", "uysal_tsps"}
     assert aux["uysal_policy_rule"] == "ads_threshold_scheduler"
     assert aux["eh_threshold_source"] == "baselines.uysal_policy_optimizer.eh_min_target"
+    assert aux["paper_rho_equiv"] == 1.0 - aux["rho_exec"]
     assert int(action["mode_exec"]) in {0, 1, 2}
 
 
@@ -102,8 +106,8 @@ def test_mpc_grid_uses_structured_templates_and_preserves_state_rng(tmp_path):
 
     action, aux = policy.act(obs, env, eval_mode=True)
     assert cfg["baseline_metadata"]["uses_learned_policy"] is False
-    assert policy.candidate_count == 300
-    assert int(aux["candidate_count"]) == 300
+    assert policy.candidate_count == 700
+    assert int(aux["candidate_count"]) == 700
     assert aux["selected_template"] in policy.current_templates
     assert "online_latency_ms" in aux
     assert "predicted_qos_rate" in aux
@@ -123,11 +127,15 @@ def test_javadi_ppo_dimming_contract(tmp_path):
     assert cfg["baseline_metadata"]["policy_family"] == "PPO"
     assert cfg["baseline_metadata"]["source_selection_rl"] is True
     assert cfg["baseline_metadata"]["joint_dimming"] is True
-    assert cfg["baseline_metadata"]["dimming_type"] == "source_wise_dimming"
+    assert cfg["baseline_metadata"]["dimming_type"] == "common_dimming_scale"
+    assert cfg["baseline_metadata"]["continuous_policy_dim"] == 3
     assert cfg["baseline_metadata"]["domain_match"] == "owc_slipt_not_underwater"
     assert int(action["mode_exec"]) == 2
     assert "source_subset_id" in aux
+    assert "joint_dimming_scale" in aux
     assert "joint_dimming_scale_tx0" in aux
+    assert aux["joint_dimming_scale_tx0"] == aux["joint_dimming_scale_tx1"] == aux["joint_dimming_scale_tx2"]
+    assert np.asarray(aux["ppo_cont_raw"]).shape == (3,)
 
 
 def test_deeprat_assignment_power_contract(tmp_path):

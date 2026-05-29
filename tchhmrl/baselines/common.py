@@ -226,6 +226,10 @@ class BasePaperBaseline:
             "upper_idx_safety_raw": int(upper_raw),
             "boost_combo_exec": int(safe["boost_combo_exec"]),
             "mode_exec": int(safe["mode_exec"]),
+            "rho_exec": float(safe["rho_exec"]),
+            "tau_exec": float(safe["tau_exec"]),
+            "paper_rho_equiv": float(1.0 - float(safe["rho_exec"])),
+            "paper_tau_equiv": float(safe["tau_exec"]),
             "act_raw": np.asarray(lower_raw, dtype=np.float32),
             "act_exec": np.concatenate(
                 [currents, np.asarray([safe["rho_exec"], safe["tau_exec"]], dtype=np.float32)]

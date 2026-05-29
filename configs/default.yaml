@@ -143,8 +143,8 @@ baselines:
     fixed_boost_combo: 3
     fixed_current_template_name: balanced_receiver_policy
     fixed_current_template: [0.50, 0.40, 0.40]
-    rho_grid: [0.10, 0.30, 0.50, 0.70, 0.90]
-    tau_grid: [0.10, 0.30, 0.50, 0.70, 0.90]
+    rho_grid: [0.10, 0.20, 0.30, 0.40, 0.50, 0.60, 0.70, 0.80, 0.90]
+    tau_grid: [0.10, 0.20, 0.30, 0.40, 0.50, 0.60, 0.70, 0.80, 0.90]
     eh_min_target: 0.02
   mpc_grid:
     current_templates:
@@ -153,11 +153,11 @@ baselines:
       ld1_preferred: [0.40, 0.55, 0.20]
       ld2_preferred: [0.40, 0.20, 0.55]
       thermal_spread: [0.35, 0.45, 0.45]
-    rho_grid: [0.15, 0.50, 0.85]
-    tau_grid: [0.15, 0.50, 0.85]
+    rho_grid: [0.10, 0.30, 0.50, 0.70, 0.90]
+    tau_grid: [0.10, 0.30, 0.50, 0.70, 0.90]
   javadi_ppo_dimming:
     hidden_dim: 128
-    dimming_type: source_wise_dimming
+    dimming_type: common_dimming_scale
     lr: 3.0e-4
     clip_ratio: 0.2
     ppo_epochs: 2

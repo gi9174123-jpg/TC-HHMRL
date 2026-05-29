@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import csv
 
+from scripts.meta_adaptation_diagnostics import run_meta_adaptation_diagnostics
 from tchhmrl.meta.meta_trainer import MetaTrainer
 from tchhmrl.utils.config import load_cfg
 
@@ -70,3 +71,53 @@ def test_meta_trainer_no_dual_and_no_context_smoke(tmp_path):
 
     assert rows
     assert float(rows[0]["lambda_qos"]) == 0.0
+
+
+def test_meta_adaptation_diagnostics_outputs_meta_vs_wo_meta_rows(tmp_path):
+    summary = run_meta_adaptation_diagnostics(
+        out_dir=tmp_path,
+        scenario="moderate_practical",
+        seed=13,
+        train_iters=0,
+        n_tasks=1,
+        support_episodes=1,
+        query_episodes=1,
+        episode_len=4,
+        fast_mode=True,
+        device="cpu",
+        make_plots=False,
+    )
+
+    assert summary["diagnostic_contract"]["hybrid_meta"]["support_train_adapts"] is True
+    assert summary["diagnostic_contract"]["hybrid_wo_meta"]["support_train_adapts"] is False
+    assert "query_reward_delta_meta_minus_wo_meta" in summary["comparison"]
+    assert summary["fixed_task_batch_hash"]
+    assert summary["ordered_fixed_task_batch_hash"]
+    assert "meta_query_reward_after_minus_before_support" in summary["comparison"]
+    assert "few_shot_reward_gain_meta_minus_wo_meta" in summary["comparison"]
+    assert "support_reward_mean" in summary["adaptation_summary"]["hybrid_meta"]
+    assert "query_reward_before_support" in summary["adaptation_summary"]["hybrid_meta"]
+    assert "query_reward_after_support" in summary["adaptation_summary"]["hybrid_meta"]
+    assert summary["adaptation_summary"]["hybrid_meta"]["query_has_support_context_fraction"] == 1.0
+    assert summary["adaptation_summary"]["hybrid_wo_meta"]["query_has_support_context_fraction"] == 0.0
+
+    with open(summary["csv_path"], newline="") as f:
+        rows = list(csv.DictReader(f))
+
+    assert {row["variant"] for row in rows} == {"hybrid_meta", "hybrid_wo_meta"}
+    assert {row["phase"] for row in rows} == {"pre_query", "support", "query"}
+    assert all("violation_rate" in row for row in rows)
+    pre_query = [row for row in rows if row["phase"] == "pre_query"]
+    assert pre_query
+    assert pre_query[0]["pre_query_eval_before_support"] == "True"
+    for variant in {"hybrid_meta", "hybrid_wo_meta"}:
+        before = [row for row in rows if row["variant"] == variant and row["phase"] == "pre_query"][0]
+        after = [row for row in rows if row["variant"] == variant and row["phase"] == "query"][0]
+        assert before["episode_seed"] == after["episode_seed"]
+    meta_support = [row for row in rows if row["variant"] == "hybrid_meta" and row["phase"] == "support"]
+    wo_support = [row for row in rows if row["variant"] == "hybrid_wo_meta" and row["phase"] == "support"]
+    assert meta_support[0]["support_train_adapts"] == "True"
+    assert wo_support[0]["support_train_adapts"] == "False"
+    assert int(meta_support[0]["context_history_len_before_query"]) > 0
+    assert int(wo_support[0]["context_history_len_before_query"]) == 0
+    assert "support_parameter_delta_norm" in rows[0]

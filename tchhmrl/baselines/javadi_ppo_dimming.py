@@ -14,7 +14,7 @@ from tchhmrl.models.networks import MLP
 
 
 class JavadiActorCritic(nn.Module):
-    def __init__(self, obs_dim: int, hidden_dim: int, continuous_dim: int = 5, n_sources: int = 4):
+    def __init__(self, obs_dim: int, hidden_dim: int, continuous_dim: int = 3, n_sources: int = 4):
         super().__init__()
         self.backbone = MLP(obs_dim, [hidden_dim, hidden_dim], hidden_dim)
         self.source_logits = nn.Linear(hidden_dim, n_sources)
@@ -67,8 +67,8 @@ class JavadiPPODimmingBaseline(BasePaperBaseline):
         opts = cfg.get("baselines", {}).get("javadi_ppo_dimming", {})
         obs_dim = int(cfg["agent"]["obs_dim"])
         hidden_dim = int(opts.get("hidden_dim", cfg["agent"].get("hidden_dim", 128)))
-        self.dimming_type = str(opts.get("dimming_type", "source_wise_dimming"))
-        self.policy = JavadiActorCritic(obs_dim, hidden_dim).to(self.device)
+        self.dimming_type = str(opts.get("dimming_type", "common_dimming_scale"))
+        self.policy = JavadiActorCritic(obs_dim, hidden_dim, continuous_dim=3).to(self.device)
         self.optim = torch.optim.Adam(self.policy.parameters(), lr=float(opts.get("lr", 3.0e-4)))
         self.clip_ratio = float(opts.get("clip_ratio", 0.2))
         self.ppo_epochs = int(opts.get("ppo_epochs", 2))
@@ -76,7 +76,7 @@ class JavadiPPODimmingBaseline(BasePaperBaseline):
         self.value_coef = float(opts.get("value_coef", 0.5))
         self.gamma = float(opts.get("gamma", cfg["agent"].get("gamma", 0.99)))
         self.buffer: List[Dict[str, object]] = []
-        self.action_contract = "ppo_active_source_joint_dimming_hy"
+        self.action_contract = "ppo_active_source_common_dimming_hy"
 
     def act(self, obs: np.ndarray, env: MultiTxUwSliptEnv, eval_mode: bool = False) -> tuple[Dict, Dict]:
         obs_t = torch.as_tensor(obs.astype(np.float32), dtype=torch.float32, device=self.device).view(1, -1)
@@ -84,8 +84,14 @@ class JavadiPPODimmingBaseline(BasePaperBaseline):
             source, cont, logp, value = self.policy.sample(obs_t, deterministic=eval_mode)
         boost_combo = int(source.item())
         upper_raw = boost_combo * 3 + 2
-        lower_raw = cont.squeeze(0).cpu().numpy().astype(np.float32)
+        policy_raw = cont.squeeze(0).cpu().numpy().astype(np.float32)
+        dimming_raw = float(policy_raw[0])
+        lower_raw = np.asarray(
+            [dimming_raw, dimming_raw, dimming_raw, float(policy_raw[1]), float(policy_raw[2])],
+            dtype=np.float32,
+        )
         safe, _ = self._project_raw_action(env, upper_raw, lower_raw, commit=True)
+        dimming_scale = float((dimming_raw + 1.0) * 0.5)
         action, aux = self._action_from_safe(
             upper_raw,
             lower_raw,
@@ -93,10 +99,12 @@ class JavadiPPODimmingBaseline(BasePaperBaseline):
             aux_extra={
                 "source_subset_id": int(boost_combo),
                 "active_source_number": int(np.sum(env._boost_mask(boost_combo) > 0.5)),
-                "joint_dimming_scale_tx0": float((lower_raw[0] + 1.0) * 0.5),
-                "joint_dimming_scale_tx1": float((lower_raw[1] + 1.0) * 0.5),
-                "joint_dimming_scale_tx2": float((lower_raw[2] + 1.0) * 0.5),
+                "joint_dimming_scale": dimming_scale,
+                "joint_dimming_scale_tx0": dimming_scale,
+                "joint_dimming_scale_tx1": dimming_scale,
+                "joint_dimming_scale_tx2": dimming_scale,
                 "dimming_type": self.dimming_type,
+                "ppo_cont_raw": policy_raw,
                 "ppo_log_prob": float(logp.item()),
                 "ppo_value": float(value.item()),
                 "selected_action_contract": self.action_contract,
@@ -118,7 +126,7 @@ class JavadiPPODimmingBaseline(BasePaperBaseline):
             {
                 "obs": obs.astype(np.float32),
                 "source": int(aux["upper_idx_raw"]) // 3,
-                "cont": np.asarray(aux["act_raw"], dtype=np.float32),
+                "cont": np.asarray(aux["ppo_cont_raw"], dtype=np.float32),
                 "logp": float(aux.get("ppo_log_prob", 0.0)),
                 "value": float(aux.get("ppo_value", 0.0)),
                 "reward": float(reward),
