@@ -8,7 +8,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 from torch.distributions import Categorical, Normal
 
-from tchhmrl.baselines.common import BasePaperBaseline
+from tchhmrl.baselines.common import BasePaperBaseline, expected_step_metrics
 from tchhmrl.envs.uw_slipt_env import MultiTxUwSliptEnv
 from tchhmrl.models.networks import MLP
 
@@ -91,6 +91,7 @@ class JavadiPPODimmingBaseline(BasePaperBaseline):
             dtype=np.float32,
         )
         safe, _ = self._project_raw_action(env, upper_raw, lower_raw, commit=True)
+        predicted = expected_step_metrics(env, safe)
         dimming_scale = float((dimming_raw + 1.0) * 0.5)
         action, aux = self._action_from_safe(
             upper_raw,
@@ -107,6 +108,10 @@ class JavadiPPODimmingBaseline(BasePaperBaseline):
                 "ppo_cont_raw": policy_raw,
                 "ppo_log_prob": float(logp.item()),
                 "ppo_value": float(value.item()),
+                "predicted_qos_rate": float(predicted["qos_rate"]),
+                "predicted_eh_metric": float(predicted["eh_metric"]),
+                "predicted_snr": float(predicted["snr"]),
+                "predicted_bus_utilization": float(predicted["bus_utilization"]),
                 "selected_action_contract": self.action_contract,
             },
         )

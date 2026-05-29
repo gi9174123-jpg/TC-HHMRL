@@ -141,12 +141,19 @@ def test_javadi_ppo_dimming_contract(tmp_path):
     assert "joint_dimming_scale" in aux
     assert "joint_dimming_scale_tx0" in aux
     assert aux["joint_dimming_scale_tx0"] == aux["joint_dimming_scale_tx1"] == aux["joint_dimming_scale_tx2"]
+    assert aux["selected_env_rho"] == aux["rho_exec"]
+    assert aux["selected_paper_rho"] == 1.0 - aux["selected_env_rho"]
+    assert "predicted_qos_rate" in aux
+    assert "predicted_eh_metric" in aux
     assert np.asarray(aux["ppo_cont_raw"]).shape == (3,)
 
 
 def test_deeprat_assignment_power_contract(tmp_path):
     cfg = _cfg_for_baseline(tmp_path, "deeprat_assignment_power")
     policy = DeepRATAssignmentPowerBaseline(cfg)
+    env = MultiTxUwSliptEnv(cfg)
+    obs, _ = env.reset(seed=101)
+    action, aux = policy.act(obs, env, eval_mode=True)
 
     assert int(cfg["agent"]["n_upper_actions"]) == 4
     assert policy.upper.n_actions == 4
@@ -158,6 +165,11 @@ def test_deeprat_assignment_power_contract(tmp_path):
     assert cfg["baseline_metadata"]["assignment_mapping"] == "rat_assignment_to_hybrid_source_boost_assignment"
     assert cfg["baseline_metadata"]["power_allocation_mapping"] == "rat_power_allocation_to_tx_current_allocation"
     assert cfg["baseline_metadata"]["domain_match"] == "wireless_resource_allocation_not_slipt"
+    assert int(action["mode_exec"]) == 2
+    assert aux["selected_env_rho"] == aux["rho_exec"]
+    assert aux["selected_paper_rho"] == 1.0 - aux["selected_env_rho"]
+    assert "predicted_qos_rate" in aux
+    assert "predicted_eh_metric" in aux
 
 
 def test_pdqn_parameterized_action_contract(tmp_path):
@@ -172,6 +184,14 @@ def test_pdqn_parameterized_action_contract(tmp_path):
     assert selected.shape == (2, 5)
     assert torch.equal(action_idx, torch.argmax(q_all, dim=1))
     assert cfg["baseline_metadata"]["parameterized_action"] is True
+
+    env = MultiTxUwSliptEnv(cfg)
+    obs_np, _ = env.reset(seed=101)
+    _, aux = policy.act(obs_np, env, eval_mode=True)
+    assert aux["selected_env_rho"] == aux["rho_exec"]
+    assert aux["selected_paper_rho"] == 1.0 - aux["selected_env_rho"]
+    assert "predicted_qos_rate" in aux
+    assert "predicted_eh_metric" in aux
 
 
 def test_new_baselines_can_run_one_episode_smoke(tmp_path):

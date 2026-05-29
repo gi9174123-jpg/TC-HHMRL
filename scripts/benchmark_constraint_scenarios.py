@@ -28,7 +28,7 @@ from tchhmrl.baselines import (
     PDQNHybridActionBaseline,
     UysalPolicyOptimizer,
 )
-from tchhmrl.baselines.common import BasePaperBaseline, PolicyEpisodeStats
+from tchhmrl.baselines.common import BasePaperBaseline, PolicyEpisodeStats, expected_step_metrics
 from tchhmrl.buffers.replay_buffer import ReplayBuffer
 from tchhmrl.constraints.dual_layer import DualLayer
 from tchhmrl.envs.task_contract import (
@@ -1646,9 +1646,13 @@ def evaluate_on_tasks(
         env = MultiTxUwSliptEnv(cfg, overrides=task.to_env_overrides())
         for _ in range(episodes_per_task):
             stats.append(trainer._run_episode(env, train=False))
+    reward_episode = float(np.mean([s.reward for s in stats]))
+    reward_per_step = float(np.mean([s.reward / max(s.length, 1) for s in stats]))
 
     return {
-        "reward": float(np.mean([s.reward for s in stats])),
+        "reward": reward_per_step,
+        "reward_per_step": reward_per_step,
+        "reward_episode": reward_episode,
         "se": float(np.mean([s.se for s in stats])),
         "eh": float(np.mean([s.eh for s in stats])),
         "cost": float(np.mean([s.cost for s in stats])),
@@ -2410,6 +2414,7 @@ class Shin2024MatchedBaseline(SacLagrangianBaseline):
         )
         if int(safe["mode_exec"]) != 2:
             raise RuntimeError("Shin-inspired baseline contract violated: executed mode must be HY")
+        predicted = expected_step_metrics(env, safe)
         action = {
             "upper_idx": int(upper_idx_raw),
             "upper_idx_exec": int(safe["upper_idx_exec"]),
@@ -2430,8 +2435,18 @@ class Shin2024MatchedBaseline(SacLagrangianBaseline):
             "current_template_level_exec": int(current_template_level),
             "rho_exec": float(safe["rho_exec"]),
             "tau_exec": float(safe["tau_exec"]),
+            "env_rho_exec": float(safe["rho_exec"]),
+            "paper_rho_exec": float(1.0 - float(safe["rho_exec"])),
             "paper_rho_equiv": float(1.0 - float(safe["rho_exec"])),
             "paper_tau_equiv": float(safe["tau_exec"]),
+            "selected_env_rho": float(safe["rho_exec"]),
+            "selected_paper_rho": float(1.0 - float(safe["rho_exec"])),
+            "selected_tau": float(safe["tau_exec"]),
+            "online_latency_ms": 0.0,
+            "predicted_qos_rate": float(predicted["qos_rate"]),
+            "predicted_eh_metric": float(predicted["eh_metric"]),
+            "predicted_snr": float(predicted["snr"]),
+            "predicted_bus_utilization": float(predicted["bus_utilization"]),
             "act_raw": lower_raw.astype(np.float32),
             "act_exec": np.concatenate(
                 [safe["currents_exec"], np.asarray([safe["rho_exec"], safe["tau_exec"]], dtype=np.float32)]
@@ -2686,6 +2701,7 @@ def _run_heuristic_episode(trainer: MetaTrainer, env: MultiTxUwSliptEnv) -> Dict
 
     return {
         "reward": ep_reward / max(ep_len, 1),
+        "reward_episode": ep_reward,
         "se": ep_se / max(ep_len, 1),
         "eh": ep_eh / max(ep_len, 1),
         "cost": ep_cost / max(ep_len, 1),
@@ -2705,8 +2721,12 @@ def evaluate_heuristic_on_tasks(
         env = MultiTxUwSliptEnv(cfg, overrides=task.to_env_overrides())
         for _ in range(episodes_per_task):
             stats.append(_run_heuristic_episode(trainer, env))
+    reward_per_step = float(np.mean([s["reward"] for s in stats]))
+    reward_episode = float(np.mean([s.get("reward_episode", s["reward"] * s["len"]) for s in stats]))
     return {
-        "reward": float(np.mean([s["reward"] for s in stats])),
+        "reward": reward_per_step,
+        "reward_per_step": reward_per_step,
+        "reward_episode": reward_episode,
         "se": float(np.mean([s["se"] for s in stats])),
         "eh": float(np.mean([s["eh"] for s in stats])),
         "cost": float(np.mean([s["cost"] for s in stats])),
@@ -2734,6 +2754,7 @@ def _run_mpc_lite_episode(policy: MpcLiteOracleBaseline, env: MultiTxUwSliptEnv)
         ep_len += 1
     return {
         "reward": ep_reward / max(ep_len, 1),
+        "reward_episode": ep_reward,
         "se": ep_se / max(ep_len, 1),
         "eh": ep_eh / max(ep_len, 1),
         "cost": ep_cost / max(ep_len, 1),
@@ -2753,8 +2774,12 @@ def evaluate_mpc_lite_on_tasks(
         env = MultiTxUwSliptEnv(cfg, overrides=task.to_env_overrides())
         for _ in range(episodes_per_task):
             stats.append(_run_mpc_lite_episode(policy, env))
+    reward_per_step = float(np.mean([s["reward"] for s in stats]))
+    reward_episode = float(np.mean([s.get("reward_episode", s["reward"] * s["len"]) for s in stats]))
     return {
-        "reward": float(np.mean([s["reward"] for s in stats])),
+        "reward": reward_per_step,
+        "reward_per_step": reward_per_step,
+        "reward_episode": reward_episode,
         "se": float(np.mean([s["se"] for s in stats])),
         "eh": float(np.mean([s["eh"] for s in stats])),
         "cost": float(np.mean([s["cost"] for s in stats])),
@@ -2778,8 +2803,12 @@ def evaluate_paper_baseline_on_tasks(
         env = MultiTxUwSliptEnv(cfg, overrides=task.to_env_overrides())
         for _ in range(episodes_per_task):
             stats.append(_run_paper_baseline_episode(policy, env))
+    reward_per_step = float(np.mean([s.reward for s in stats]))
+    reward_episode = float(np.mean([s.reward * s.length for s in stats]))
     return {
-        "reward": float(np.mean([s.reward for s in stats])),
+        "reward": reward_per_step,
+        "reward_per_step": reward_per_step,
+        "reward_episode": reward_episode,
         "se": float(np.mean([s.se for s in stats])),
         "eh": float(np.mean([s.eh for s in stats])),
         "cost": float(np.mean([s.cost for s in stats])),
@@ -2802,8 +2831,12 @@ def evaluate_plain_hierarchical_baseline_on_tasks(
         env = MultiTxUwSliptEnv(cfg, overrides=task.to_env_overrides())
         for _ in range(episodes_per_task):
             stats.append(trainer._run_episode(env, train=False))
+    reward_episode = float(np.mean([s.reward for s in stats]))
+    reward_per_step = float(np.mean([s.reward / max(s.length, 1) for s in stats]))
     return {
-        "reward": float(np.mean([s.reward for s in stats])),
+        "reward": reward_per_step,
+        "reward_per_step": reward_per_step,
+        "reward_episode": reward_episode,
         "se": float(np.mean([s.se for s in stats])),
         "eh": float(np.mean([s.eh for s in stats])),
         "cost": float(np.mean([s.cost for s in stats])),
@@ -4279,7 +4312,10 @@ def run_one_scenario(
                     "thermal_cap_margin_c": pilot_meta.get("thermal_cap_margin_c"),
                     "formally_comparable": formally_comparable,
                     "formal_ranking_comparable": bool(is_formal_ranking_record(formal_record_probe)),
-                    "eval_reward": float(ev["reward"]),
+                    "eval_reward": float(ev.get("reward_per_step", ev["reward"])),
+                    "eval_reward_per_step": float(ev.get("reward_per_step", ev["reward"])),
+                    "eval_reward_episode": float(ev.get("reward_episode", ev["reward"])),
+                    "eval_episode_len": float(ev.get("len", 0.0)),
                     "eval_se": float(ev["se"]),
                     "eval_eh": float(ev["eh"]),
                     "eval_cost": float(ev["cost"]),

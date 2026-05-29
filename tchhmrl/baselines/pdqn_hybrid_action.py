@@ -7,7 +7,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-from tchhmrl.baselines.common import BasePaperBaseline
+from tchhmrl.baselines.common import BasePaperBaseline, expected_step_metrics
 from tchhmrl.buffers.replay_buffer import ReplayBuffer
 from tchhmrl.envs.uw_slipt_env import MultiTxUwSliptEnv
 from tchhmrl.models.networks import MLP
@@ -91,6 +91,7 @@ class PDQNHybridActionBaseline(BasePaperBaseline):
         upper_raw = int(action_idx.item())
         lower_raw = params.squeeze(0).cpu().numpy().astype(np.float32)
         safe, _ = self._project_raw_action(env, upper_raw, lower_raw, commit=True)
+        predicted = expected_step_metrics(env, safe)
         action, aux = self._action_from_safe(
             upper_raw,
             lower_raw,
@@ -98,6 +99,10 @@ class PDQNHybridActionBaseline(BasePaperBaseline):
             aux_extra={
                 "pdqn_selected_k": int(upper_raw),
                 "pdqn_argmax_q": float(torch.max(q_all).item()),
+                "predicted_qos_rate": float(predicted["qos_rate"]),
+                "predicted_eh_metric": float(predicted["eh_metric"]),
+                "predicted_snr": float(predicted["snr"]),
+                "predicted_bus_utilization": float(predicted["bus_utilization"]),
                 "selected_action_contract": self.action_contract,
             },
         )

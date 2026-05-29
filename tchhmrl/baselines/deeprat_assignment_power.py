@@ -7,7 +7,7 @@ import torch
 
 from tchhmrl.agents.ddpg_lower import LowerDDPG
 from tchhmrl.agents.dqn_upper import UpperDQN
-from tchhmrl.baselines.common import BasePaperBaseline
+from tchhmrl.baselines.common import BasePaperBaseline, expected_step_metrics
 from tchhmrl.buffers.replay_buffer import ReplayBuffer
 from tchhmrl.envs.uw_slipt_env import MultiTxUwSliptEnv
 
@@ -60,6 +60,7 @@ class DeepRATAssignmentPowerBaseline(BasePaperBaseline):
         safe, _ = self._project_raw_action(env, upper_raw, lower_raw, commit=True)
         if int(safe["mode_exec"]) != 2:
             raise RuntimeError("DeepRAT assignment-power adapted baseline must execute HY mode")
+        predicted = expected_step_metrics(env, safe)
         action, aux = self._action_from_safe(
             upper_raw,
             lower_raw,
@@ -70,6 +71,10 @@ class DeepRATAssignmentPowerBaseline(BasePaperBaseline):
                 "source_assignment": int(boost_combo),
                 "assignment_idx_train": int(boost_combo),
                 "receiver_ratio_rule": "fixed_balanced_not_deeprat_core",
+                "predicted_qos_rate": float(predicted["qos_rate"]),
+                "predicted_eh_metric": float(predicted["eh_metric"]),
+                "predicted_snr": float(predicted["snr"]),
+                "predicted_bus_utilization": float(predicted["bus_utilization"]),
                 "selected_action_contract": self.action_contract,
                 "temps_before": env.temps.copy().astype(np.float32),
             },

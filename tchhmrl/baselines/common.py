@@ -232,6 +232,9 @@ class BasePaperBaseline:
             "paper_rho_exec": float(1.0 - float(safe["rho_exec"])),
             "paper_rho_equiv": float(1.0 - float(safe["rho_exec"])),
             "paper_tau_equiv": float(safe["tau_exec"]),
+            "selected_env_rho": float(safe["rho_exec"]),
+            "selected_paper_rho": float(1.0 - float(safe["rho_exec"])),
+            "selected_tau": float(safe["tau_exec"]),
             "act_raw": np.asarray(lower_raw, dtype=np.float32),
             "act_exec": np.concatenate(
                 [currents, np.asarray([safe["rho_exec"], safe["tau_exec"]], dtype=np.float32)]
