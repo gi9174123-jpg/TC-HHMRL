@@ -80,6 +80,8 @@ def test_uysal_policy_optimizer_is_threshold_rule_not_oracle(tmp_path):
     assert aux["uysal_policy_rule"] == "ads_threshold_scheduler"
     assert aux["eh_threshold_source"] == "baselines.uysal_policy_optimizer.eh_min_target"
     assert aux["paper_rho_equiv"] == 1.0 - aux["rho_exec"]
+    assert aux["selected_env_rho"] == aux["rho_exec"]
+    assert aux["selected_paper_rho"] == 1.0 - aux["selected_env_rho"]
     assert int(action["mode_exec"]) in {0, 1, 2}
 
 
@@ -114,6 +116,8 @@ def test_mpc_grid_uses_structured_templates_and_preserves_state_rng(tmp_path):
     assert "predicted_eh_metric" in aux
     assert "predicted_snr" in aux
     assert "predicted_bus_utilization" in aux
+    assert aux["selected_env_rho"] == aux["rho_exec"]
+    assert aux["selected_paper_rho"] == 1.0 - aux["selected_env_rho"]
     assert int(action["upper_idx_exec"]) == int(action["boost_combo_exec"]) * 3 + int(action["mode_exec"])
 
 
@@ -128,6 +132,8 @@ def test_javadi_ppo_dimming_contract(tmp_path):
     assert cfg["baseline_metadata"]["source_selection_rl"] is True
     assert cfg["baseline_metadata"]["joint_dimming"] is True
     assert cfg["baseline_metadata"]["dimming_type"] == "common_dimming_scale"
+    assert cfg["baseline_metadata"]["source_subset_contract"] == "anchor_plus_optional_ld_boosts"
+    assert cfg["baseline_metadata"]["active_source_selection_mapping"] == "active_led_selection_to_hybrid_boost_subset"
     assert cfg["baseline_metadata"]["continuous_policy_dim"] == 3
     assert cfg["baseline_metadata"]["domain_match"] == "owc_slipt_not_underwater"
     assert int(action["mode_exec"]) == 2
@@ -149,6 +155,8 @@ def test_deeprat_assignment_power_contract(tmp_path):
     assert policy.lower.upper_contract == "source_assignment"
     assert policy.lower.learned_act_dim == 3
     assert cfg["baseline_metadata"]["receiver_ratio_rule"] == "fixed_balanced_not_deeprat_core"
+    assert cfg["baseline_metadata"]["assignment_mapping"] == "rat_assignment_to_hybrid_source_boost_assignment"
+    assert cfg["baseline_metadata"]["power_allocation_mapping"] == "rat_power_allocation_to_tx_current_allocation"
     assert cfg["baseline_metadata"]["domain_match"] == "wireless_resource_allocation_not_slipt"
 
 

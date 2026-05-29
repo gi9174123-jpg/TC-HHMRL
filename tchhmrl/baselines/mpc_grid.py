@@ -121,6 +121,8 @@ class MpcGridBaseline(BasePaperBaseline):
                 "selected_mode": int(mode),
                 "selected_template": str(template_name),
                 "selected_rho": float(rho),
+                "selected_env_rho": float(safe["rho_exec"]),
+                "selected_paper_rho": float(1.0 - float(safe["rho_exec"])),
                 "selected_tau": float(tau),
                 "mpc_grid_score": float(metrics["reward"]),
                 "predicted_qos_rate": float(metrics["qos_rate"]),

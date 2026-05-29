@@ -228,6 +228,8 @@ class BasePaperBaseline:
             "mode_exec": int(safe["mode_exec"]),
             "rho_exec": float(safe["rho_exec"]),
             "tau_exec": float(safe["tau_exec"]),
+            "env_rho_exec": float(safe["rho_exec"]),
+            "paper_rho_exec": float(1.0 - float(safe["rho_exec"])),
             "paper_rho_equiv": float(1.0 - float(safe["rho_exec"])),
             "paper_tau_equiv": float(safe["tau_exec"]),
             "act_raw": np.asarray(lower_raw, dtype=np.float32),
