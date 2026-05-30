@@ -89,18 +89,37 @@ class UysalPolicyOptimizer(BasePaperBaseline):
                     best = (key, cand)
         return best[1]
 
-    def _ads_select_subpolicy(self, env: MultiTxUwSliptEnv) -> str:
+    def _ads_select_subpolicy(self, env: MultiTxUwSliptEnv) -> tuple[str, Dict[str, float | str]]:
         _, _, _, balanced = self._candidate(env, mode=2, rho=0.5, tau=0.5)
-        if float(balanced["qos_rate"]) < float(env.qos_min_rate):
-            return "uysal_ts"
-        if float(balanced["eh_metric"]) < self.eh_min_target:
-            return "uysal_ps"
-        return "uysal_tsps"
+        qos_rate = float(balanced["qos_rate"])
+        eh_metric = float(balanced["eh_metric"])
+        qos_threshold = float(env.qos_min_rate)
+        eh_threshold = float(self.eh_min_target)
+        qos_deficit = max(qos_threshold - qos_rate, 0.0)
+        eh_deficit = max(eh_threshold - eh_metric, 0.0)
+        if qos_deficit > 0.0:
+            selected_policy = "uysal_ts"
+            decision_reason = "qos_below_threshold_select_ts"
+        elif eh_deficit > 0.0:
+            selected_policy = "uysal_ps"
+            decision_reason = "eh_below_threshold_select_ps"
+        else:
+            selected_policy = "uysal_tsps"
+            decision_reason = "qos_and_eh_satisfied_select_tsps"
+        return selected_policy, {
+            "ads_balanced_predicted_qos_rate": qos_rate,
+            "ads_balanced_predicted_eh_metric": eh_metric,
+            "ads_qos_threshold": qos_threshold,
+            "ads_eh_threshold": eh_threshold,
+            "ads_qos_deficit": float(qos_deficit),
+            "ads_eh_deficit": float(eh_deficit),
+            "ads_decision_reason": decision_reason,
+        }
 
     def act(self, obs: np.ndarray, env: MultiTxUwSliptEnv, eval_mode: bool = False) -> tuple[Dict, Dict]:
         del obs, eval_mode
         start = time.perf_counter()
-        selected_policy = self._ads_select_subpolicy(env)
+        selected_policy, ads_diag = self._ads_select_subpolicy(env)
         if selected_policy == "uysal_ts":
             upper_raw, lower_raw, _, metrics = self._optimize_ts(env)
         elif selected_policy == "uysal_ps":
@@ -120,6 +139,7 @@ class UysalPolicyOptimizer(BasePaperBaseline):
                 "qos_threshold": float(env.qos_min_rate),
                 "eh_threshold": float(self.eh_min_target),
                 "eh_threshold_source": "baselines.uysal_policy_optimizer.eh_min_target",
+                **ads_diag,
                 "rho_symbol_mapping": "paper_rho_is_id_fraction; env_rho_exec_is_eh_fraction; paper_rho=1-env_rho_exec",
                 "selected_env_rho": float(safe["rho_exec"]),
                 "selected_paper_rho": float(1.0 - float(safe["rho_exec"])),

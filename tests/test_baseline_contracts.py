@@ -25,6 +25,15 @@ from tchhmrl.safety.safety_layer import SafetyLayer
 from tchhmrl.utils.config import load_cfg
 
 
+PAPER_EXPLANATION_FIELDS = {
+    "paper_core_mechanism",
+    "adapted_mapping_to_tc_hhmrl",
+    "domain_match",
+    "environment_dependency",
+    "not_exact_reproduction_reason",
+}
+
+
 def _cfg_for_baseline(tmp_path, baseline: str):
     cfg = load_cfg("configs/default.yaml")
     cfg = apply_common_settings(
@@ -63,6 +72,7 @@ def test_shin_adapted_codebook_contract_is_source_aware(tmp_path):
     assert cfg["baseline_metadata"]["rho_symbol_mapping"] == (
         "paper_rho_is_id_fraction; env_rho_exec_is_eh_fraction; paper_rho=1-env_rho_exec"
     )
+    assert PAPER_EXPLANATION_FIELDS.issubset(cfg["baseline_metadata"])
 
 
 def test_uysal_policy_optimizer_is_threshold_rule_not_oracle(tmp_path):
@@ -82,10 +92,22 @@ def test_uysal_policy_optimizer_is_threshold_rule_not_oracle(tmp_path):
     assert aux["selected_uysal_subpolicy"] in {"uysal_ts", "uysal_ps", "uysal_tsps"}
     assert aux["uysal_policy_rule"] == "ads_threshold_scheduler"
     assert aux["eh_threshold_source"] == "baselines.uysal_policy_optimizer.eh_min_target"
+    assert "ads_balanced_predicted_qos_rate" in aux
+    assert "ads_balanced_predicted_eh_metric" in aux
+    assert aux["ads_qos_threshold"] == cfg["env"]["qos_min_rate"]
+    assert aux["ads_eh_threshold"] == 0.002
+    assert aux["ads_qos_deficit"] >= 0.0
+    assert aux["ads_eh_deficit"] >= 0.0
+    assert aux["ads_decision_reason"] in {
+        "qos_below_threshold_select_ts",
+        "eh_below_threshold_select_ps",
+        "qos_and_eh_satisfied_select_tsps",
+    }
     assert aux["paper_rho_equiv"] == 1.0 - aux["rho_exec"]
     assert aux["selected_env_rho"] == aux["rho_exec"]
     assert aux["selected_paper_rho"] == 1.0 - aux["selected_env_rho"]
     assert int(action["mode_exec"]) in {0, 1, 2}
+    assert PAPER_EXPLANATION_FIELDS.issubset(cfg["baseline_metadata"])
 
 
 def test_mpc_grid_uses_structured_templates_and_preserves_state_rng(tmp_path):
@@ -122,6 +144,7 @@ def test_mpc_grid_uses_structured_templates_and_preserves_state_rng(tmp_path):
     assert aux["selected_env_rho"] == aux["rho_exec"]
     assert aux["selected_paper_rho"] == 1.0 - aux["selected_env_rho"]
     assert int(action["upper_idx_exec"]) == int(action["boost_combo_exec"]) * 3 + int(action["mode_exec"])
+    assert PAPER_EXPLANATION_FIELDS.issubset(cfg["baseline_metadata"])
 
 
 def test_javadi_ppo_dimming_contract(tmp_path):
@@ -149,6 +172,7 @@ def test_javadi_ppo_dimming_contract(tmp_path):
     assert "predicted_qos_rate" in aux
     assert "predicted_eh_metric" in aux
     assert np.asarray(aux["ppo_cont_raw"]).shape == (3,)
+    assert PAPER_EXPLANATION_FIELDS.issubset(cfg["baseline_metadata"])
 
 
 def test_deeprat_assignment_power_contract(tmp_path):
@@ -173,6 +197,7 @@ def test_deeprat_assignment_power_contract(tmp_path):
     assert aux["selected_paper_rho"] == 1.0 - aux["selected_env_rho"]
     assert "predicted_qos_rate" in aux
     assert "predicted_eh_metric" in aux
+    assert PAPER_EXPLANATION_FIELDS.issubset(cfg["baseline_metadata"])
 
 
 def test_pdqn_parameterized_action_contract(tmp_path):
@@ -195,6 +220,7 @@ def test_pdqn_parameterized_action_contract(tmp_path):
     assert aux["selected_paper_rho"] == 1.0 - aux["selected_env_rho"]
     assert "predicted_qos_rate" in aux
     assert "predicted_eh_metric" in aux
+    assert PAPER_EXPLANATION_FIELDS.issubset(cfg["baseline_metadata"])
 
 
 def test_new_baselines_can_run_one_episode_smoke(tmp_path):

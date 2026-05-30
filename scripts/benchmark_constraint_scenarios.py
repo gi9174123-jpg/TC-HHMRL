@@ -283,6 +283,85 @@ def apply_ablation(cfg: Dict, ablation: str) -> None:
     raise ValueError(f"Unknown ablation: {ablation}")
 
 
+PAPER_BASELINE_EXPLANATIONS: Dict[str, Dict[str, str]] = {
+    "shin2024_adapted_codebook": {
+        "paper_core_mechanism": (
+            "hierarchical DQN-DDPG for underwater SLIPT: transmitter-side optical control "
+            "and receiver-side TS/PS ratio control for the EH-SE trade-off"
+        ),
+        "adapted_mapping_to_tc_hhmrl": (
+            "beam-divergence control is mapped to boost_combo x source-aware intensity codeword "
+            "on the fixed [LED,LD,LD] transmitter; lower DDPG learns rho/tau only and execution is HY"
+        ),
+        "domain_match": "underwater_slipt_same_domain_adapted_to_fixed_hybrid_tx",
+        "environment_dependency": "performance depends on underwater channel, QoS target, EH scale, and thermal-cap projection",
+        "not_exact_reproduction_reason": (
+            "the original point-to-point beam-divergence control is adapted to the project fixed multi-source "
+            "heterogeneous transmitter and common safety protocol"
+        ),
+    },
+    "uysal_policy_optimizer": {
+        "paper_core_mechanism": (
+            "underwater SLIPT TS, PS, TS-PS and ADS policy family with splitting/switching factors "
+            "optimized for harvested energy subject to communication constraints"
+        ),
+        "adapted_mapping_to_tc_hhmrl": (
+            "fixed feasible transmitter template; receiver-side mode/rho/tau selected by a predefined ADS "
+            "threshold scheduler under the common environment"
+        ),
+        "domain_match": "underwater_slipt_same_domain_adapted_to_fixed_hybrid_tx",
+        "environment_dependency": "ADS subpolicy fractions depend on scenario QoS threshold, EH target, channel state, and EH model scale",
+        "not_exact_reproduction_reason": (
+            "closed-form HE-SE region optimization is adapted to an online threshold scheduler in the project environment"
+        ),
+    },
+    "mpc_grid": {
+        "paper_core_mechanism": "traditional model-based online resource optimization by deterministic candidate search",
+        "adapted_mapping_to_tc_hhmrl": (
+            "enumerates boost/mode/source-aware current templates and mode-aware rho/tau grids, then scores "
+            "deterministic expected one-step reward without advancing the real episode"
+        ),
+        "domain_match": "model_based_optimizer_not_single_paper_exact",
+        "environment_dependency": "selected candidates depend on current observable state, deterministic model, safety projection, and latency budget",
+        "not_exact_reproduction_reason": "implemented as MPC-Grid only; no SCA or convexified subproblem is claimed",
+    },
+    "javadi_ppo_dimming": {
+        "paper_core_mechanism": "OWC-SLIPT active LED selection, joint dimming, and PPO dynamic resource allocation",
+        "adapted_mapping_to_tc_hhmrl": (
+            "active LED selection is mapped to hybrid boost/source subset selection; joint dimming is a common "
+            "current scale for active sources with PPO-learned rho/tau under fixed HY"
+        ),
+        "domain_match": "owc_slipt_not_underwater",
+        "environment_dependency": "performance depends on fixed underwater channel and thermal constraints not present in the original OWC setting",
+        "not_exact_reproduction_reason": "the original multi-LED OWC/RSMA system is adapted to underwater [LED,LD,LD] SLIPT without RSMA",
+    },
+    "deeprat_assignment_power": {
+        "paper_core_mechanism": "hierarchical resource allocation: DQN assignment stage plus DDPG power-allocation stage",
+        "adapted_mapping_to_tc_hhmrl": (
+            "RAT assignment is mapped to 4-way hybrid source assignment; power allocation is mapped to "
+            "three transmitter currents while receiver rho/tau are fixed balanced values"
+        ),
+        "domain_match": "wireless_resource_allocation_not_slipt",
+        "environment_dependency": "performance depends on optical source assignment, current safety projection, and underwater channel state",
+        "not_exact_reproduction_reason": "the original multi-RAT HetNet assignment/power problem is adapted to optical source/current allocation",
+    },
+    "pdqn_hybrid_action": {
+        "paper_core_mechanism": "parameterized discrete-continuous Q-learning for hybrid action spaces",
+        "adapted_mapping_to_tc_hhmrl": (
+            "discrete action is boost_combo x mode and the parameter network outputs [I0,I1,I2,rho,tau] "
+            "for each discrete action"
+        ),
+        "domain_match": "hybrid_action_rl_not_underwater_slipt",
+        "environment_dependency": "performance depends on hybrid action parameterization, safety projection, and task/channel distribution",
+        "not_exact_reproduction_reason": "generic P-DQN is adapted to the project underwater SLIPT action space and reward",
+    },
+}
+
+
+def paper_baseline_explanation(baseline_family: str) -> Dict[str, str]:
+    return dict(PAPER_BASELINE_EXPLANATIONS[str(baseline_family)])
+
+
 def apply_baseline_overrides(cfg: Dict, baseline: str) -> None:
     baseline = str(baseline)
     if baseline == "sac_lagrangian":
@@ -408,6 +487,7 @@ def apply_baseline_overrides(cfg: Dict, baseline: str) -> None:
             "baseline_family": "shin2024_adapted_codebook",
             "paper_inspired": True,
             "exact_reproduction": False,
+            **paper_baseline_explanation("shin2024_adapted_codebook"),
             "original_algorithm_structure": "hierarchical_dqn_ddpg",
             "upper_action_contract": "boost_combo_intensity_codeword",
             "lower_action_contract": "rho_tau_only",
@@ -445,6 +525,7 @@ def apply_baseline_overrides(cfg: Dict, baseline: str) -> None:
             "baseline_family": "uysal_policy_optimizer",
             "paper_inspired": True,
             "exact_reproduction": False,
+            **paper_baseline_explanation("uysal_policy_optimizer"),
             "uses_learned_policy": False,
             "uses_same_safety_projection": True,
             "optimized_variables": "slipt_policy_mode_rho_tau",
@@ -483,6 +564,7 @@ def apply_baseline_overrides(cfg: Dict, baseline: str) -> None:
             "baseline_family": "mpc_grid",
             "paper_inspired": True,
             "exact_reproduction": False,
+            **paper_baseline_explanation("mpc_grid"),
             "uses_learned_policy": False,
             "uses_same_safety_projection": True,
             "comparison_role": "model_based_optimizer",
@@ -513,6 +595,7 @@ def apply_baseline_overrides(cfg: Dict, baseline: str) -> None:
             "baseline_family": "javadi_ppo_dimming",
             "paper_inspired": True,
             "exact_reproduction": False,
+            **paper_baseline_explanation("javadi_ppo_dimming"),
             "policy_family": "PPO",
             "source_selection_rl": True,
             "joint_dimming": True,
@@ -526,7 +609,6 @@ def apply_baseline_overrides(cfg: Dict, baseline: str) -> None:
             "shared_lagrangian": False,
             "uses_learned_policy": True,
             "uses_same_safety_projection": True,
-            "domain_match": "owc_slipt_not_underwater",
             "action_contract": "ppo_active_source_common_dimming_hy",
             "selected_action_contract": "ppo_active_source_common_dimming_hy",
             "comparison_role": "owc_slipt_active_source_joint_dimming_rl",
@@ -569,6 +651,7 @@ def apply_baseline_overrides(cfg: Dict, baseline: str) -> None:
             "baseline_family": "deeprat_assignment_power",
             "paper_inspired": True,
             "exact_reproduction": False,
+            **paper_baseline_explanation("deeprat_assignment_power"),
             "upper_action_contract": "source_assignment",
             "lower_action_contract": "current_allocation_only",
             "action_contract": "source_assignment__current_allocation_only",
@@ -577,7 +660,6 @@ def apply_baseline_overrides(cfg: Dict, baseline: str) -> None:
             "fixed_mode_exec": 2,
             "fixed_mode_name": "HY",
             "comparison_role": "hierarchical_assignment_power_rl",
-            "domain_match": "wireless_resource_allocation_not_slipt",
             "assignment_mapping": "rat_assignment_to_hybrid_source_boost_assignment",
             "power_allocation_mapping": "rat_power_allocation_to_tx_current_allocation",
             "receiver_ratio_rule": "fixed_balanced_not_deeprat_core",
@@ -601,6 +683,7 @@ def apply_baseline_overrides(cfg: Dict, baseline: str) -> None:
             "baseline_family": "pdqn_hybrid_action",
             "paper_inspired": True,
             "exact_reproduction": False,
+            **paper_baseline_explanation("pdqn_hybrid_action"),
             "discrete_action_dim": 12,
             "continuous_parameter_dim": 5,
             "parameterized_action": True,
@@ -1426,6 +1509,12 @@ def _add_baseline_aux_diagnostics(row: Dict, aux: Dict) -> None:
         "predicted_bus_utilization",
         "qos_threshold",
         "eh_threshold",
+        "ads_balanced_predicted_qos_rate",
+        "ads_balanced_predicted_eh_metric",
+        "ads_qos_threshold",
+        "ads_eh_threshold",
+        "ads_qos_deficit",
+        "ads_eh_deficit",
         "source_subset_id",
         "active_source_number",
         "joint_dimming_scale_tx0",
@@ -1441,6 +1530,7 @@ def _add_baseline_aux_diagnostics(row: Dict, aux: Dict) -> None:
         "selected_uysal_controller",
         "selected_uysal_subpolicy",
         "uysal_policy_rule",
+        "ads_decision_reason",
         "eh_threshold_source",
         "rho_symbol_mapping",
         "fixed_current_template_name",
@@ -4294,7 +4384,11 @@ def run_one_scenario(
                     "ads_mapping_note": str(baseline_meta.get("ads_mapping_note", "")),
                     "policy_family": baseline_meta.get("policy_family"),
                     "policy_selection_rule": str(baseline_meta.get("policy_selection_rule", "")),
+                    "paper_core_mechanism": str(baseline_meta.get("paper_core_mechanism", "")),
+                    "adapted_mapping_to_tc_hhmrl": str(baseline_meta.get("adapted_mapping_to_tc_hhmrl", "")),
                     "domain_match": str(baseline_meta.get("domain_match", "")),
+                    "environment_dependency": str(baseline_meta.get("environment_dependency", "")),
+                    "not_exact_reproduction_reason": str(baseline_meta.get("not_exact_reproduction_reason", "")),
                     "dimming_type": str(baseline_meta.get("dimming_type", "")),
                     "continuous_policy_dim": baseline_meta.get("continuous_policy_dim"),
                     "receiver_ratio_rule": str(baseline_meta.get("receiver_ratio_rule", "")),
@@ -4352,6 +4446,24 @@ def run_one_scenario(
                     else None,
                     "mean_eh_threshold": float(env_df["eh_threshold"].mean())
                     if "eh_threshold" in env_df and not env_df.empty
+                    else None,
+                    "mean_ads_balanced_predicted_qos_rate": float(env_df["ads_balanced_predicted_qos_rate"].mean())
+                    if "ads_balanced_predicted_qos_rate" in env_df and not env_df.empty
+                    else None,
+                    "mean_ads_balanced_predicted_eh_metric": float(env_df["ads_balanced_predicted_eh_metric"].mean())
+                    if "ads_balanced_predicted_eh_metric" in env_df and not env_df.empty
+                    else None,
+                    "mean_ads_qos_threshold": float(env_df["ads_qos_threshold"].mean())
+                    if "ads_qos_threshold" in env_df and not env_df.empty
+                    else None,
+                    "mean_ads_eh_threshold": float(env_df["ads_eh_threshold"].mean())
+                    if "ads_eh_threshold" in env_df and not env_df.empty
+                    else None,
+                    "mean_ads_qos_deficit": float(env_df["ads_qos_deficit"].mean())
+                    if "ads_qos_deficit" in env_df and not env_df.empty
+                    else None,
+                    "mean_ads_eh_deficit": float(env_df["ads_eh_deficit"].mean())
+                    if "ads_eh_deficit" in env_df and not env_df.empty
                     else None,
                     "mean_predicted_qos_rate": float(env_df["predicted_qos_rate"].mean())
                     if "predicted_qos_rate" in env_df and not env_df.empty
