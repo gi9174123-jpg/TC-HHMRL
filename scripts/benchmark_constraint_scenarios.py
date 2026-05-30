@@ -440,7 +440,7 @@ def apply_baseline_overrides(cfg: Dict, baseline: str) -> None:
         cfg["meta"]["dual_lr"] = 0.0
         cfg["meta"]["dual_lrs"] = [0.0] * len(cfg["meta"].get("dual_names", []))
         cfg.setdefault("baselines", {}).setdefault("uysal_policy_optimizer", {})
-        cfg["baselines"]["uysal_policy_optimizer"].setdefault("eh_min_target", 0.02)
+        cfg["baselines"]["uysal_policy_optimizer"].setdefault("eh_min_target", 0.002)
         cfg["baseline_metadata"] = {
             "baseline_family": "uysal_policy_optimizer",
             "paper_inspired": True,
@@ -456,6 +456,8 @@ def apply_baseline_overrides(cfg: Dict, baseline: str) -> None:
             "selected_action_contract": "uysal_ads_threshold_receiver_policy",
             "policy_family": ["uysal_ts", "uysal_ps", "uysal_tsps", "uysal_ads"],
             "policy_selection_rule": "predefined_ads_threshold_not_oracle_best_of_four",
+            "eh_threshold_default": float(cfg["baselines"]["uysal_policy_optimizer"]["eh_min_target"]),
+            "eh_threshold_calibration": "fixed_metric_scale_from_smoke_not_reward_optimized",
             "ads_mapping_note": "uysal_ads_controller_is_threshold_scheduler; original_ads_is_ac_dc_separation",
             "rho_symbol_mapping": "paper_rho_is_id_fraction; env_rho_exec_is_eh_fraction; paper_rho=1-env_rho_exec",
             "tau_symbol_mapping": "paper_tau_and_env_tau_exec_are_id_time_fraction",

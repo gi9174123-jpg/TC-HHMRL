@@ -145,7 +145,7 @@ baselines:
     fixed_current_template: [0.50, 0.40, 0.40]
     rho_grid: [0.10, 0.20, 0.30, 0.40, 0.50, 0.60, 0.70, 0.80, 0.90]
     tau_grid: [0.10, 0.20, 0.30, 0.40, 0.50, 0.60, 0.70, 0.80, 0.90]
-    eh_min_target: 0.02
+    eh_min_target: 0.002
   mpc_grid:
     current_templates:
       safe_anchor: [0.55, 0.00, 0.00]

@@ -34,7 +34,7 @@ class UysalPolicyOptimizer(BasePaperBaseline):
         dense_grid = [0.10, 0.20, 0.30, 0.40, 0.50, 0.60, 0.70, 0.80, 0.90]
         self.rho_grid = np.asarray(opts.get("rho_grid", dense_grid), dtype=np.float32)
         self.tau_grid = np.asarray(opts.get("tau_grid", dense_grid), dtype=np.float32)
-        self.eh_min_target = float(opts.get("eh_min_target", cfg.get("env", {}).get("eh_min_target", 0.02)))
+        self.eh_min_target = float(opts.get("eh_min_target", cfg.get("env", {}).get("eh_min_target", 0.002)))
         self.action_contract = "uysal_ads_threshold_receiver_policy"
 
     def _candidate(

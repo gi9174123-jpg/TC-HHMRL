@@ -75,6 +75,9 @@ def test_uysal_policy_optimizer_is_threshold_rule_not_oracle(tmp_path):
     assert set(policy.subpolicy_names) == {"uysal_ts", "uysal_ps", "uysal_tsps", "uysal_ads"}
     assert cfg["baseline_metadata"]["uses_learned_policy"] is False
     assert cfg["baseline_metadata"]["policy_selection_rule"] == "predefined_ads_threshold_not_oracle_best_of_four"
+    assert cfg["baselines"]["uysal_policy_optimizer"]["eh_min_target"] == 0.002
+    assert cfg["baseline_metadata"]["eh_threshold_default"] == 0.002
+    assert cfg["baseline_metadata"]["eh_threshold_calibration"] == "fixed_metric_scale_from_smoke_not_reward_optimized"
     assert aux["selected_uysal_controller"] == "uysal_ads"
     assert aux["selected_uysal_subpolicy"] in {"uysal_ts", "uysal_ps", "uysal_tsps"}
     assert aux["uysal_policy_rule"] == "ads_threshold_scheduler"
