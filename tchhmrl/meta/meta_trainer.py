@@ -328,6 +328,9 @@ class MetaTrainer:
         meta_iters = int(meta_iters or meta_cfg["meta_iters"])
 
         for it in range(1, meta_iters + 1):
+            iter_global_step_start = int(self.agent.global_step)
+            iter_upper_steps_start = int(self.agent.upper.update_steps)
+            iter_lower_steps_start = int(self.agent.lower.update_steps)
             curriculum_stage, sampler_cfg = self._sampler_cfg_for_iter(it, meta_iters)
             self.task_sampler.cfg = sampler_cfg
             tasks = self.task_sampler.sample(int(meta_cfg["n_tasks_per_iter"]))
@@ -460,6 +463,18 @@ class MetaTrainer:
                 "lambda": lambda_val,
                 "curriculum_stage": curriculum_stage,
                 "outer_step_size": float(self.outer_step_size if self.explicit_inner_outer else 0.0),
+                "explicit_inner_outer": bool(self.explicit_inner_outer),
+                "query_updates_enabled": bool(self.query_updates_enabled),
+                "inner_warmup_steps": int(self.inner_warmup_steps),
+                "inner_upper_warmup_steps": int(self.inner_upper_warmup_steps),
+                "lower_batch_size": int(self.agent.batch_size),
+                "upper_batch_size": int(self.agent.upper_batch_size),
+                "global_step": int(self.agent.global_step),
+                "upper_update_steps": int(self.agent.upper.update_steps),
+                "lower_update_steps": int(self.agent.lower.update_steps),
+                "iter_global_step_delta": int(self.agent.global_step - iter_global_step_start),
+                "iter_upper_update_step_delta": int(self.agent.upper.update_steps - iter_upper_steps_start),
+                "iter_lower_update_step_delta": int(self.agent.lower.update_steps - iter_lower_steps_start),
             }
             cost_component_names = list(self.dual.names)
             support_vec_mean = mean_support_cost_vec

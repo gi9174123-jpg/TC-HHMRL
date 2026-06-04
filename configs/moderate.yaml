@@ -80,6 +80,7 @@ agent:
   warmup_steps: 1500
 
 upper_dqn:
+  batch_size: 64
   lr: 2.0e-4
   epsilon_start: 1.0
   epsilon_final: 0.08
@@ -95,8 +96,8 @@ lower_sac:
 
 meta:
   n_tasks_per_iter: 6
-  meta_iters: 80
-  support_episodes: 3
+  meta_iters: 60
+  support_episodes: 5
   query_episodes: 2
   dual_lr: 0.05
   dual_lrs: [0.02, 0.05, 0.05, 0.05]
@@ -107,9 +108,19 @@ meta:
   dual_max_lambdas: [50.0, 50.0, 50.0, 50.0]
   explicit_inner_outer: true
   outer_step_size: 0.15
-  query_updates_enabled: true
+  query_updates_enabled: false
   inner_warmup_steps: 128
   inner_upper_warmup_steps: 64
+  checkpoint_selection:
+    enabled: true
+    mode: heldout_eval
+    eval_tasks: 5
+    eval_eps: 2
+    reward_w: 1.0
+    se_w: 0.0
+    eh_w: 0.0
+    cost_w: 1.0
+    violation_w: 1.0
 
 buffer:
   replay_size: 100000

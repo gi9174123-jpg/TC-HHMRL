@@ -69,13 +69,16 @@ class HierarchicalAgent:
         )
         self.kl_beta = float(ctx_cfg["kl_beta"])
         self.batch_size = int(cfg["agent"]["batch_size"])
+        self.upper_batch_size = int(
+            cfg["agent"].get("upper_batch_size", cfg.get("upper_dqn", {}).get("batch_size", self.batch_size))
+        )
         self.warmup_steps = int(cfg["agent"]["warmup_steps"])
         self.lower_updates_per_step = int(cfg["agent"].get("lower_updates_per_step", 1))
         self.upper_update_every = int(cfg["agent"].get("upper_update_every", 1))
         self.upper_warmup_steps = int(
             cfg["agent"].get(
                 "upper_warmup_steps",
-                max(self.batch_size, self.warmup_steps // max(1, int(cfg["agent"].get("upper_hold_steps", 1)))),
+                max(self.upper_batch_size, self.warmup_steps // max(1, int(cfg["agent"].get("upper_hold_steps", 1)))),
             )
         )
         self.upper_hold_steps = int(cfg["agent"].get("upper_hold_steps", 1))
@@ -517,10 +520,10 @@ class HierarchicalAgent:
             merged.update(self._mean_metrics(ctx_list))
 
         if (
-            len(self.upper_replay) >= max(self.batch_size, self.upper_warmup_steps)
+            len(self.upper_replay) >= max(self.upper_batch_size, self.upper_warmup_steps)
             and self.global_step % max(1, self.upper_update_every) == 0
         ):
-            upper_batch = self.upper_replay.sample(self.batch_size)
+            upper_batch = self.upper_replay.sample(self.upper_batch_size)
             dqn_metrics = self.upper.update(upper_batch)
             merged.update(dqn_metrics)
 

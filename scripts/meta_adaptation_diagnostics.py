@@ -52,6 +52,17 @@ ROW_FIELDS = [
     "support_lower_update_delta",
     "support_upper_update_delta",
     "support_parameter_delta_norm",
+    "support_upper_delta_norm",
+    "support_lower_actor_delta_norm",
+    "support_lower_critic_delta_norm",
+    "support_context_encoder_delta_norm",
+    "support_context_predictor_delta_norm",
+    "support_lower_replay_len_after_support",
+    "support_upper_replay_len_after_support",
+    "query_global_step_delta",
+    "query_lower_update_delta",
+    "query_upper_update_delta",
+    "query_parameter_delta_norm",
     "context_history_len_before_query",
     "query_has_support_context",
     "same_task_protocol",
@@ -77,6 +88,34 @@ def _state_delta_norm(left: object, right: object) -> float:
     return 0.0
 
 
+def _module_delta_summary(base_state: Dict, current_state: Dict) -> Dict[str, float]:
+    lower_base = base_state.get("lower", {})
+    lower_current = current_state.get("lower", {})
+    lower_critic_base = {
+        key: lower_base.get(key, {})
+        for key in ("q1", "q2", "q1_tgt", "q2_tgt")
+    }
+    lower_critic_current = {
+        key: lower_current.get(key, {})
+        for key in ("q1", "q2", "q1_tgt", "q2_tgt")
+    }
+    return {
+        "support_upper_delta_norm": float(
+            _state_delta_norm(base_state.get("upper", {}).get("q", {}), current_state.get("upper", {}).get("q", {}))
+        ),
+        "support_lower_actor_delta_norm": float(
+            _state_delta_norm(lower_base.get("actor", {}), lower_current.get("actor", {}))
+        ),
+        "support_lower_critic_delta_norm": float(_state_delta_norm(lower_critic_base, lower_critic_current)),
+        "support_context_encoder_delta_norm": float(
+            _state_delta_norm(base_state.get("context_encoder", {}), current_state.get("context_encoder", {}))
+        ),
+        "support_context_predictor_delta_norm": float(
+            _state_delta_norm(base_state.get("context_predictor", {}), current_state.get("context_predictor", {}))
+        ),
+    }
+
+
 def _episode_row(
     *,
     scenario: str,
@@ -96,6 +135,17 @@ def _episode_row(
     support_lower_update_delta: int = 0,
     support_upper_update_delta: int = 0,
     support_parameter_delta_norm: float = 0.0,
+    support_upper_delta_norm: float = 0.0,
+    support_lower_actor_delta_norm: float = 0.0,
+    support_lower_critic_delta_norm: float = 0.0,
+    support_context_encoder_delta_norm: float = 0.0,
+    support_context_predictor_delta_norm: float = 0.0,
+    support_lower_replay_len_after_support: int = 0,
+    support_upper_replay_len_after_support: int = 0,
+    query_global_step_delta: int = 0,
+    query_lower_update_delta: int = 0,
+    query_upper_update_delta: int = 0,
+    query_parameter_delta_norm: float = 0.0,
     context_history_len_before_query: int = 0,
     query_has_support_context: bool = False,
 ) -> Dict[str, object]:
@@ -124,6 +174,17 @@ def _episode_row(
         "support_lower_update_delta": int(support_lower_update_delta),
         "support_upper_update_delta": int(support_upper_update_delta),
         "support_parameter_delta_norm": float(support_parameter_delta_norm),
+        "support_upper_delta_norm": float(support_upper_delta_norm),
+        "support_lower_actor_delta_norm": float(support_lower_actor_delta_norm),
+        "support_lower_critic_delta_norm": float(support_lower_critic_delta_norm),
+        "support_context_encoder_delta_norm": float(support_context_encoder_delta_norm),
+        "support_context_predictor_delta_norm": float(support_context_predictor_delta_norm),
+        "support_lower_replay_len_after_support": int(support_lower_replay_len_after_support),
+        "support_upper_replay_len_after_support": int(support_upper_replay_len_after_support),
+        "query_global_step_delta": int(query_global_step_delta),
+        "query_lower_update_delta": int(query_lower_update_delta),
+        "query_upper_update_delta": int(query_upper_update_delta),
+        "query_parameter_delta_norm": float(query_parameter_delta_norm),
         "context_history_len_before_query": int(context_history_len_before_query),
         "query_has_support_context": bool(query_has_support_context),
         "same_task_protocol": True,
@@ -177,6 +238,7 @@ def _collect_variant_rows(
     support_episodes: int,
     query_episodes: int,
     pre_query_episodes: int,
+    support_train_override: bool | None = None,
 ) -> List[Dict[str, object]]:
     base_state = trainer.agent.snapshot_train_state()
     base_dual_state = copy.deepcopy(trainer.dual.state_dict())
@@ -185,7 +247,12 @@ def _collect_variant_rows(
     base_lower_steps = int(trainer.agent.lower.update_steps)
     context_enabled = bool(cfg.get("context", {}).get("enabled", True))
     explicit_inner_outer = bool(cfg.get("meta", {}).get("explicit_inner_outer", False))
-    support_train_adapts = bool(context_enabled and explicit_inner_outer)
+    default_support_train_adapts = bool(context_enabled and explicit_inner_outer)
+    support_train_adapts = (
+        bool(default_support_train_adapts)
+        if support_train_override is None
+        else bool(support_train_override and default_support_train_adapts)
+    )
 
     rows: List[Dict[str, object]] = []
     for task_id, task in enumerate(tasks):
@@ -267,12 +334,20 @@ def _collect_variant_rows(
             "support_lower_update_delta": int(trainer.agent.lower.update_steps - base_lower_steps),
             "support_upper_update_delta": int(trainer.agent.upper.update_steps - base_upper_steps),
             "support_parameter_delta_norm": float(_state_delta_norm(base_state, current_state)),
+            **_module_delta_summary(base_state, current_state),
+            "support_lower_replay_len_after_support": int(len(trainer.agent.replay)),
+            "support_upper_replay_len_after_support": int(len(trainer.agent.upper_replay)),
             "context_history_len_before_query": int(len(trainer.agent.episode)) if context_enabled else 0,
             "query_has_support_context": bool(context_enabled and support_episodes > 0 and len(trainer.agent.episode) > 0),
         }
         for row in rows[task_row_start:]:
             row.update(support_diag)
 
+        query_base_state = trainer.agent.snapshot_train_state()
+        query_base_global_step = int(trainer.agent.global_step)
+        query_base_upper_steps = int(trainer.agent.upper.update_steps)
+        query_base_lower_steps = int(trainer.agent.lower.update_steps)
+        query_row_start = len(rows)
         for ep_idx in range(int(query_episodes)):
             episode_seed = int(seed + task_id * 10_000 + ep_idx)
             env.rng = np.random.default_rng(episode_seed)
@@ -295,6 +370,15 @@ def _collect_variant_rows(
             row.update(support_diag)
             rows.append(row)
             episode_global += 1
+        query_state = trainer.agent.snapshot_train_state()
+        query_diag = {
+            "query_global_step_delta": int(trainer.agent.global_step - query_base_global_step),
+            "query_lower_update_delta": int(trainer.agent.lower.update_steps - query_base_lower_steps),
+            "query_upper_update_delta": int(trainer.agent.upper.update_steps - query_base_upper_steps),
+            "query_parameter_delta_norm": float(_state_delta_norm(query_base_state, query_state)),
+        }
+        for row in rows[query_row_start:]:
+            row.update(query_diag)
 
     trainer.agent.restore_train_state(base_state)
     trainer.dual.load_state_dict(copy.deepcopy(base_dual_state))
@@ -318,18 +402,33 @@ def _summarize_rows(rows: List[Dict[str, object]]) -> Dict[str, object]:
         }
 
     meta_query = phase_summary.get("hybrid_meta_query", {})
+    meta_no_adapt_query = phase_summary.get("hybrid_meta_no_support_adapt_query", {})
     wo_query = phase_summary.get("hybrid_wo_meta_query", {})
     meta_pre_query = phase_summary.get("hybrid_meta_pre_query", {})
+    meta_no_adapt_pre_query = phase_summary.get("hybrid_meta_no_support_adapt_pre_query", {})
     wo_pre_query = phase_summary.get("hybrid_wo_meta_pre_query", {})
     meta_query_reward_gain = float(meta_query.get("reward", 0.0) - meta_pre_query.get("reward", 0.0))
+    meta_no_adapt_query_reward_gain = float(
+        meta_no_adapt_query.get("reward", 0.0) - meta_no_adapt_pre_query.get("reward", 0.0)
+    )
     wo_query_reward_gain = float(wo_query.get("reward", 0.0) - wo_pre_query.get("reward", 0.0))
     comparison = {
         "query_reward_delta_meta_minus_wo_meta": float(meta_query.get("reward", 0.0) - wo_query.get("reward", 0.0)),
+        "query_reward_delta_meta_minus_no_support_adapt": float(
+            meta_query.get("reward", 0.0) - meta_no_adapt_query.get("reward", 0.0)
+        ),
         "query_violation_delta_meta_minus_wo_meta": float(
             meta_query.get("violation_rate", 0.0) - wo_query.get("violation_rate", 0.0)
         ),
+        "query_violation_delta_meta_minus_no_support_adapt": float(
+            meta_query.get("violation_rate", 0.0) - meta_no_adapt_query.get("violation_rate", 0.0)
+        ),
         "query_cost_delta_meta_minus_wo_meta": float(meta_query.get("cost", 0.0) - wo_query.get("cost", 0.0)),
+        "query_cost_delta_meta_minus_no_support_adapt": float(
+            meta_query.get("cost", 0.0) - meta_no_adapt_query.get("cost", 0.0)
+        ),
         "meta_query_reward_after_minus_before_support": meta_query_reward_gain,
+        "meta_no_support_adapt_query_reward_after_minus_before_support": meta_no_adapt_query_reward_gain,
         "meta_query_se_after_minus_before_support": float(meta_query.get("se", 0.0) - meta_pre_query.get("se", 0.0)),
         "meta_query_eh_after_minus_before_support": float(meta_query.get("eh", 0.0) - meta_pre_query.get("eh", 0.0)),
         "meta_query_cost_after_minus_before_support": float(meta_query.get("cost", 0.0) - meta_pre_query.get("cost", 0.0)),
@@ -341,6 +440,9 @@ def _summarize_rows(rows: List[Dict[str, object]]) -> Dict[str, object]:
             wo_query.get("violation_rate", 0.0) - wo_pre_query.get("violation_rate", 0.0)
         ),
         "few_shot_reward_gain_meta_minus_wo_meta": meta_query_reward_gain - wo_query_reward_gain,
+        "few_shot_reward_gain_meta_minus_no_support_adapt": (
+            meta_query_reward_gain - meta_no_adapt_query_reward_gain
+        ),
     }
     adaptation_summary: Dict[str, Dict[str, float]] = {}
     for variant in sorted({str(row["variant"]) for row in rows}):
@@ -366,6 +468,25 @@ def _summarize_rows(rows: List[Dict[str, object]]) -> Dict[str, object]:
             "support_lower_update_delta": _mean(row["support_lower_update_delta"] for row in variant_rows),
             "support_upper_update_delta": _mean(row["support_upper_update_delta"] for row in variant_rows),
             "support_parameter_delta_norm": _mean(row["support_parameter_delta_norm"] for row in variant_rows),
+            "support_upper_delta_norm": _mean(row["support_upper_delta_norm"] for row in variant_rows),
+            "support_lower_actor_delta_norm": _mean(row["support_lower_actor_delta_norm"] for row in variant_rows),
+            "support_lower_critic_delta_norm": _mean(row["support_lower_critic_delta_norm"] for row in variant_rows),
+            "support_context_encoder_delta_norm": _mean(
+                row["support_context_encoder_delta_norm"] for row in variant_rows
+            ),
+            "support_context_predictor_delta_norm": _mean(
+                row["support_context_predictor_delta_norm"] for row in variant_rows
+            ),
+            "support_lower_replay_len_after_support": _mean(
+                row["support_lower_replay_len_after_support"] for row in variant_rows
+            ),
+            "support_upper_replay_len_after_support": _mean(
+                row["support_upper_replay_len_after_support"] for row in variant_rows
+            ),
+            "query_global_step_delta": _mean(row["query_global_step_delta"] for row in variant_rows),
+            "query_lower_update_delta": _mean(row["query_lower_update_delta"] for row in variant_rows),
+            "query_upper_update_delta": _mean(row["query_upper_update_delta"] for row in variant_rows),
+            "query_parameter_delta_norm": _mean(row["query_parameter_delta_norm"] for row in variant_rows),
             "context_history_len_before_query": _mean(row["context_history_len_before_query"] for row in variant_rows),
             "query_has_support_context_fraction": _mean(float(row["query_has_support_context"]) for row in variant_rows),
         }
@@ -380,7 +501,18 @@ def _summarize_rows(rows: List[Dict[str, object]]) -> Dict[str, object]:
                 "pre_query_eval_before_support": True,
                 "support_train_adapts": True,
                 "query_eval_after_support": True,
+                "query_train_updates": False,
                 "matched_pre_post_eval_episode_seeds": True,
+            },
+            "hybrid_meta_no_support_adapt": {
+                "context_enabled": True,
+                "explicit_inner_outer": True,
+                "pre_query_eval_before_support": True,
+                "support_train_adapts": False,
+                "query_eval_after_support": True,
+                "query_train_updates": False,
+                "matched_pre_post_eval_episode_seeds": True,
+                "same_checkpoint_as": "hybrid_meta",
             },
             "hybrid_wo_meta": {
                 "context_enabled": False,
@@ -388,6 +520,7 @@ def _summarize_rows(rows: List[Dict[str, object]]) -> Dict[str, object]:
                 "pre_query_eval_before_support": True,
                 "support_train_adapts": False,
                 "query_eval_after_support": True,
+                "query_train_updates": False,
                 "matched_pre_post_eval_episode_seeds": True,
             },
         },
@@ -432,7 +565,7 @@ def run_meta_adaptation_diagnostics(
     seed: int = 101,
     train_iters: int = 1,
     n_tasks: int = 3,
-    support_episodes: int = 3,
+    support_episodes: int = 5,
     query_episodes: int = 2,
     pre_query_episodes: int | None = None,
     episode_len: int | None = None,
@@ -462,42 +595,83 @@ def run_meta_adaptation_diagnostics(
     fixed_task_batch_hash = task_batch_hash(tasks)
     ordered_fixed_task_batch_hash = ordered_task_batch_hash(tasks)
 
-    variants = [
-        ("hybrid_meta", None),
-        ("hybrid_wo_meta", "wo_meta"),
-    ]
     rows: List[Dict[str, object]] = []
-    for variant, ablation in variants:
-        cfg = _prepare_cfg(
-            base_cfg,
-            out_dir=out_path,
-            run_name=f"meta_adaptation_{variant}",
-            seed=seed,
+    meta_cfg = _prepare_cfg(
+        base_cfg,
+        out_dir=out_path,
+        run_name="meta_adaptation_hybrid_meta",
+        seed=seed,
+        scenario=scenario,
+        train_iters=train_iters,
+        fast_mode=fast_mode,
+        support_episodes=support_episodes,
+        query_episodes=query_episodes,
+        episode_len=episode_len,
+        device=device,
+    )
+    meta_trainer = MetaTrainer(meta_cfg)
+    if int(train_iters) > 0:
+        meta_trainer.train(meta_iters=int(train_iters))
+    rows.extend(
+        _collect_variant_rows(
+            trainer=meta_trainer,
+            cfg=meta_cfg,
+            tasks=tasks,
             scenario=scenario,
-            train_iters=train_iters,
-            fast_mode=fast_mode,
+            seed=seed,
+            variant="hybrid_meta",
             support_episodes=support_episodes,
             query_episodes=query_episodes,
-            episode_len=episode_len,
-            device=device,
-            ablation=ablation,
+            pre_query_episodes=pre_query_episodes,
+            support_train_override=True,
         )
-        trainer = MetaTrainer(cfg)
-        if int(train_iters) > 0:
-            trainer.train(meta_iters=int(train_iters))
-        rows.extend(
-            _collect_variant_rows(
-                trainer=trainer,
-                cfg=cfg,
-                tasks=tasks,
-                scenario=scenario,
-                seed=seed,
-                variant=variant,
-                support_episodes=support_episodes,
-                query_episodes=query_episodes,
-                pre_query_episodes=pre_query_episodes,
-            )
+    )
+    rows.extend(
+        _collect_variant_rows(
+            trainer=meta_trainer,
+            cfg=meta_cfg,
+            tasks=tasks,
+            scenario=scenario,
+            seed=seed,
+            variant="hybrid_meta_no_support_adapt",
+            support_episodes=support_episodes,
+            query_episodes=query_episodes,
+            pre_query_episodes=pre_query_episodes,
+            support_train_override=False,
         )
+    )
+
+    wo_meta_cfg = _prepare_cfg(
+        base_cfg,
+        out_dir=out_path,
+        run_name="meta_adaptation_hybrid_wo_meta",
+        seed=seed,
+        scenario=scenario,
+        train_iters=train_iters,
+        fast_mode=fast_mode,
+        support_episodes=support_episodes,
+        query_episodes=query_episodes,
+        episode_len=episode_len,
+        device=device,
+        ablation="wo_meta",
+    )
+    wo_meta_trainer = MetaTrainer(wo_meta_cfg)
+    if int(train_iters) > 0:
+        wo_meta_trainer.train(meta_iters=int(train_iters))
+    rows.extend(
+        _collect_variant_rows(
+            trainer=wo_meta_trainer,
+            cfg=wo_meta_cfg,
+            tasks=tasks,
+            scenario=scenario,
+            seed=seed,
+            variant="hybrid_wo_meta",
+            support_episodes=support_episodes,
+            query_episodes=query_episodes,
+            pre_query_episodes=pre_query_episodes,
+            support_train_override=False,
+        )
+    )
 
     csv_path = out_path / "meta_adaptation_episode_metrics.csv"
     _write_csv(csv_path, rows)
@@ -538,7 +712,7 @@ def main() -> None:
     parser.add_argument("--train-iters", type=int, default=1)
     parser.add_argument("--tasks", type=int, default=3)
     parser.add_argument("--pre-query-episodes", type=int, default=None)
-    parser.add_argument("--support-episodes", type=int, default=3)
+    parser.add_argument("--support-episodes", type=int, default=5)
     parser.add_argument("--query-episodes", type=int, default=2)
     parser.add_argument("--episode-len", type=int, default=None)
     parser.add_argument("--fast-mode", action="store_true")
