@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import copy
+import math
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Dict, List
@@ -67,6 +68,7 @@ class MetaTrainer:
         self.explicit_inner_outer = bool(meta_cfg.get("explicit_inner_outer", True))
         self.outer_step_size = float(meta_cfg.get("outer_step_size", 0.15))
         self.query_updates_enabled = bool(meta_cfg.get("query_updates_enabled", True))
+        self.query_context_updates_enabled = bool(meta_cfg.get("query_context_updates_enabled", True))
         self.inner_warmup_steps = int(meta_cfg.get("inner_warmup_steps", max(self.agent.batch_size, 64)))
         self.inner_upper_warmup_steps = int(
             meta_cfg.get("inner_upper_warmup_steps", max(self.agent.batch_size // 2, 32))
@@ -121,6 +123,62 @@ class MetaTrainer:
         merged = copy.deepcopy(self.base_sampler_cfg)
         merged.update(copy.deepcopy(picked["sampler"]))
         return str(picked["name"]), merged
+
+    @staticmethod
+    def _state_path_delta_norm(reference: Dict, current: Dict, paths: List[tuple[str, ...]]) -> float:
+        total = 0.0
+
+        def get_path(obj: Dict, path: tuple[str, ...]):
+            out = obj
+            for key in path:
+                if not isinstance(out, dict) or key not in out:
+                    return None
+                out = out[key]
+            return out
+
+        def accumulate(ref_obj, cur_obj) -> None:
+            nonlocal total
+            if isinstance(ref_obj, dict) and isinstance(cur_obj, dict):
+                for key in ref_obj.keys() & cur_obj.keys():
+                    accumulate(ref_obj[key], cur_obj[key])
+            elif torch.is_tensor(ref_obj) and torch.is_tensor(cur_obj):
+                if torch.is_floating_point(ref_obj) and torch.is_floating_point(cur_obj):
+                    diff = cur_obj.detach().float().cpu() - ref_obj.detach().float().cpu()
+                    total += float(torch.sum(diff * diff).item())
+
+        for path in paths:
+            ref_obj = get_path(reference, path)
+            cur_obj = get_path(current, path)
+            if ref_obj is not None and cur_obj is not None:
+                accumulate(ref_obj, cur_obj)
+        return float(math.sqrt(max(total, 0.0)))
+
+    @classmethod
+    def _trainable_parameter_delta_norm(cls, reference: Dict, current: Dict) -> float:
+        return cls._state_path_delta_norm(
+            reference,
+            current,
+            paths=[
+                ("upper", "q"),
+                ("lower", "actor"),
+                ("lower", "q1"),
+                ("lower", "q2"),
+                ("context_encoder",),
+                ("context_predictor",),
+            ],
+        )
+
+    @classmethod
+    def _target_parameter_delta_norm(cls, reference: Dict, current: Dict) -> float:
+        return cls._state_path_delta_norm(
+            reference,
+            current,
+            paths=[
+                ("upper", "q_tgt"),
+                ("lower", "q1_tgt"),
+                ("lower", "q2_tgt"),
+            ],
+        )
 
     def _run_episode(self, env: MultiTxUwSliptEnv, train: bool, clear_context: bool = True) -> EpisodeStats:
         obs, _ = env.reset()
@@ -267,7 +325,7 @@ class MetaTrainer:
                     }
                     self.agent.observe_upper(upper_transition)
                 self.agent.learn()
-            else:
+            elif self.query_context_updates_enabled:
                 self.agent.episode.add(
                     {
                         "obs": lower_transition["obs"],
@@ -339,6 +397,8 @@ class MetaTrainer:
             query_stats: List[EpisodeStats] = []
             adapted_states: List[Dict] = []
             adapted_dual_states: List[Dict] = []
+            inner_delta_norms: List[float] = []
+            target_delta_norms: List[float] = []
             base_state = self.agent.snapshot_train_state() if self.explicit_inner_outer else None
             base_dual_state = copy.deepcopy(self.dual.state_dict()) if self.explicit_inner_outer else None
             shared_global_step = int(self.agent.global_step)
@@ -380,8 +440,12 @@ class MetaTrainer:
                     )
 
                 if self.explicit_inner_outer:
-                    adapted_states.append(self.agent.snapshot_train_state())
+                    adapted_state = self.agent.snapshot_train_state()
+                    adapted_states.append(adapted_state)
                     adapted_dual_states.append(copy.deepcopy(self.dual.state_dict()))
+                    if base_state is not None:
+                        inner_delta_norms.append(self._trainable_parameter_delta_norm(base_state, adapted_state))
+                        target_delta_norms.append(self._target_parameter_delta_norm(base_state, adapted_state))
                 shared_global_step = max(shared_global_step, int(self.agent.global_step))
                 shared_upper_steps = max(shared_upper_steps, int(self.agent.upper.update_steps))
                 shared_lower_steps = max(shared_lower_steps, int(self.agent.lower.update_steps))
@@ -465,6 +529,10 @@ class MetaTrainer:
                 "outer_step_size": float(self.outer_step_size if self.explicit_inner_outer else 0.0),
                 "explicit_inner_outer": bool(self.explicit_inner_outer),
                 "query_updates_enabled": bool(self.query_updates_enabled),
+                "query_context_updates_enabled": bool(self.query_context_updates_enabled),
+                "heldout_query_evaluation": bool(self.explicit_inner_outer and not self.query_updates_enabled),
+                "support_parameter_delta_norm": float(np.mean(inner_delta_norms)) if inner_delta_norms else 0.0,
+                "support_target_parameter_delta_norm": float(np.mean(target_delta_norms)) if target_delta_norms else 0.0,
                 "inner_warmup_steps": int(self.inner_warmup_steps),
                 "inner_upper_warmup_steps": int(self.inner_upper_warmup_steps),
                 "lower_batch_size": int(self.agent.batch_size),

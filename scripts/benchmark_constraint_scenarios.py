@@ -86,6 +86,27 @@ def apply_common_settings(
     return cfg
 
 
+def apply_strict_meta_protocol(cfg: Dict) -> None:
+    """Use held-out query episodes for the main Hybrid meta-learning protocol."""
+    meta_cfg = cfg.setdefault("meta", {})
+    meta_cfg["support_episodes"] = 5
+    meta_cfg["query_episodes"] = 2
+    meta_cfg["query_updates_enabled"] = False
+    meta_cfg["query_context_updates_enabled"] = True
+    meta_cfg["explicit_inner_outer"] = True
+    meta_cfg["outer_step_size"] = 0.15
+    meta_cfg["protocol_name"] = "strict_support_query"
+    cfg.setdefault("buffer", {})["context_max_len"] = max(
+        int(cfg.get("buffer", {}).get("context_max_len", 0)),
+        int(cfg.get("env", {}).get("episode_len", 80)) * int(meta_cfg["support_episodes"]),
+    )
+    ckpt_cfg = meta_cfg.setdefault("checkpoint_selection", {})
+    ckpt_cfg["enabled"] = True
+    ckpt_cfg["mode"] = "heldout_eval"
+    ckpt_cfg["eval_tasks"] = 8
+    ckpt_cfg["eval_eps"] = 3
+
+
 def infer_task_source(cfg: Dict) -> str:
     site_bank = cfg.get("sampler", {}).get("site_bank", [])
     return "site_bank" if site_bank else "global_fallback"
@@ -4285,6 +4306,8 @@ def run_one_scenario(
             physics_eh_model = str(cfg.get("physics", {}).get("eh_model", ""))
             eh_model_cfg = str(cfg.get("env", {}).get("eh_model", physics_eh_model))
             eh_nonlinear_cfg = dict(cfg.get("env", {}).get("eh_nonlinear", {}) or {})
+            run_meta_cfg = dict(cfg.get("meta", {}) or {})
+            run_ckpt_cfg = dict(run_meta_cfg.get("checkpoint_selection", {}) or {})
             formal_meta = formal_metadata_snapshot(cfg)
             formal_record_probe = {
                 **formal_meta,
@@ -4306,6 +4329,17 @@ def run_one_scenario(
                     "seed": int(seed),
                     "run_name": run_name,
                     "resolved_config": str(resolved_cfg_path),
+                    "meta_protocol_name": str(run_meta_cfg.get("protocol_name", "")),
+                    "meta_iters": int(run_meta_cfg.get("meta_iters", meta_iters)),
+                    "support_episodes": int(run_meta_cfg.get("support_episodes", 0)),
+                    "query_episodes": int(run_meta_cfg.get("query_episodes", 0)),
+                    "query_updates_enabled": bool(run_meta_cfg.get("query_updates_enabled", True)),
+                    "query_context_updates_enabled": bool(run_meta_cfg.get("query_context_updates_enabled", True)),
+                    "explicit_inner_outer": bool(run_meta_cfg.get("explicit_inner_outer", False)),
+                    "outer_step_size": float(run_meta_cfg.get("outer_step_size", 0.0)),
+                    "context_max_len": int(cfg.get("buffer", {}).get("context_max_len", 0)),
+                    "checkpoint_selection_eval_tasks": int(run_ckpt_cfg.get("eval_tasks", eval_tasks)),
+                    "checkpoint_selection_eval_eps": int(run_ckpt_cfg.get("eval_eps", 1)),
                     "checkpoint_strategy": str(ckpt_pick.get("strategy", "none")),
                     "checkpoint_iter": int(ckpt_pick.get("selected_iter", -1)),
                     "checkpoint_score": (
@@ -4825,7 +4859,7 @@ def run_benchmark(
     cfg_path: str,
     out_dir: str,
     scenarios: List[str],
-    meta_iters: int,
+    meta_iters: int | None,
     fast_mode: bool,
     seeds: List[int],
     eval_tasks: int,
@@ -4845,8 +4879,13 @@ def run_benchmark(
     thermal_model: str | None = None,
     safety_projection_version: str | None = None,
     physics_eh_model: str | None = None,
+    strict_meta: bool = False,
 ) -> Path:
     base_cfg = apply_cli_overrides(load_cfg(cfg_path), device=device)
+    if strict_meta:
+        apply_strict_meta_protocol(base_cfg)
+    effective_meta_iters = int(meta_iters if meta_iters is not None else base_cfg.get("meta", {}).get("meta_iters", 45))
+    base_cfg.setdefault("meta", {})["meta_iters"] = effective_meta_iters
     if thermal_model is not None:
         thermal_model = str(thermal_model).strip().lower()
         if thermal_model not in {"independent", "coupled"}:
@@ -4894,7 +4933,7 @@ def run_benchmark(
             base_cfg=base_cfg,
             out_root=out_root,
             scenario=scenario,
-            meta_iters=meta_iters,
+            meta_iters=effective_meta_iters,
             fast_mode=fast_mode,
             seeds=seeds,
             eval_tasks=eval_tasks,
@@ -4971,7 +5010,14 @@ def run_benchmark(
         "eh_nonlinear_override": dict(base_cfg.get("env", {}).get("eh_nonlinear", {}) or {}),
         "task_distribution_scope": "base_config_snapshot",
         "task_distribution": task_distribution_summary(base_cfg),
-        "meta_iters": meta_iters,
+        "meta_iters": effective_meta_iters,
+        "meta_protocol_name": str(base_cfg.get("meta", {}).get("protocol_name", "")),
+        "support_episodes": int(base_cfg.get("meta", {}).get("support_episodes", 0)),
+        "query_episodes": int(base_cfg.get("meta", {}).get("query_episodes", 0)),
+        "query_updates_enabled": bool(base_cfg.get("meta", {}).get("query_updates_enabled", True)),
+        "query_context_updates_enabled": bool(base_cfg.get("meta", {}).get("query_context_updates_enabled", True)),
+        "context_max_len": int(base_cfg.get("buffer", {}).get("context_max_len", 0)),
+        "strict_meta": bool(strict_meta or str(base_cfg.get("meta", {}).get("protocol_name", "")) == "strict_support_query"),
         "fast_mode": bool(fast_mode),
         "use_curriculum": bool(use_curriculum),
         "shared_init": bool(shared_init),
@@ -5024,7 +5070,17 @@ def parse_args() -> argparse.Namespace:
             "thermal_rebalanced",
         ],
     )
-    parser.add_argument("--meta-iters", type=int, default=45)
+    parser.add_argument(
+        "--meta-iters",
+        type=int,
+        default=None,
+        help="Override meta.meta_iters. If omitted, the value from the config is used.",
+    )
+    parser.add_argument(
+        "--strict-meta",
+        action="store_true",
+        help="Force the strict support-query protocol: 5 support episodes, 2 held-out query episodes, no query updates, and 8x3 checkpoint selection.",
+    )
     parser.add_argument(
         "--fast-mode",
         action="store_true",
@@ -5156,6 +5212,7 @@ def main() -> None:
         thermal_model=args.thermal_model,
         safety_projection_version=args.safety_projection_version,
         physics_eh_model=args.physics_eh_model,
+        strict_meta=args.strict_meta,
     )
 
 

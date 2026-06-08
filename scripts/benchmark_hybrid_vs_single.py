@@ -302,7 +302,7 @@ def plot_env_realism(env_df: pd.DataFrame, out_path: Path) -> None:
 def run_benchmark(
     cfg_path: str,
     out_dir: str,
-    meta_iters: int,
+    meta_iters: int | None,
     fast_mode: bool,
     seeds: List[int],
     eval_tasks: int,
@@ -312,6 +312,8 @@ def run_benchmark(
     device: str | None = None,
 ) -> Tuple[Path, Path, Path, Path]:
     base_cfg = apply_cli_overrides(load_cfg(cfg_path), device=device)
+    effective_meta_iters = int(meta_iters if meta_iters is not None else base_cfg.get("meta", {}).get("meta_iters", 20))
+    base_cfg.setdefault("meta", {})["meta_iters"] = effective_meta_iters
     out_base = Path(out_dir)
     out_base.mkdir(parents=True, exist_ok=True)
 
@@ -329,11 +331,11 @@ def run_benchmark(
                 variant,
                 seed,
                 out_base,
-                meta_iters,
+                effective_meta_iters,
                 fast_mode=fast_mode,
             )
             trainer = MetaTrainer(cfg)
-            train_csv = trainer.train(meta_iters=meta_iters)
+            train_csv = trainer.train(meta_iters=effective_meta_iters)
 
             run_df = pd.read_csv(train_csv)
             run_df["variant"] = variant
@@ -399,7 +401,13 @@ def run_benchmark(
     gain_vs_led = 100.0 * (hybrid_reward - single_led_reward) / (abs(single_led_reward) + 1e-8)
 
     summary = {
-        "meta_iters": meta_iters,
+        "meta_iters": effective_meta_iters,
+        "meta_protocol_name": str(base_cfg.get("meta", {}).get("protocol_name", "")),
+        "support_episodes": int(base_cfg.get("meta", {}).get("support_episodes", 0)),
+        "query_episodes": int(base_cfg.get("meta", {}).get("query_episodes", 0)),
+        "query_updates_enabled": bool(base_cfg.get("meta", {}).get("query_updates_enabled", True)),
+        "query_context_updates_enabled": bool(base_cfg.get("meta", {}).get("query_context_updates_enabled", True)),
+        "context_max_len": int(base_cfg.get("buffer", {}).get("context_max_len", 0)),
         "fast_mode": bool(fast_mode),
         "seeds": seeds,
         "eval_summary": eval_summary,
@@ -435,7 +443,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--cfg", type=str, default="configs/default.yaml")
     parser.add_argument("--device", type=str, default=None, help="Override config device: auto/cpu/cuda/mps")
     parser.add_argument("--out-dir", type=str, default="logs/benchmark_hybrid_vs_single")
-    parser.add_argument("--meta-iters", type=int, default=20)
+    parser.add_argument(
+        "--meta-iters",
+        type=int,
+        default=None,
+        help="Override meta.meta_iters. If omitted, the value from the config is used.",
+    )
     parser.add_argument(
         "--fast-mode",
         action="store_true",

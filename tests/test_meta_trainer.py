@@ -1,6 +1,9 @@
 from __future__ import annotations
 
+import copy
 import csv
+
+import torch
 
 from scripts.meta_adaptation_diagnostics import run_meta_adaptation_diagnostics
 from tchhmrl.meta.meta_trainer import MetaTrainer
@@ -10,17 +13,20 @@ from tchhmrl.utils.config import load_cfg
 def test_default_meta_protocol_uses_heldout_query_and_stable_checkpoint_selection():
     for cfg_path in ("configs/default.yaml", "configs/moderate.yaml"):
         cfg = load_cfg(cfg_path)
-        assert int(cfg["meta"]["meta_iters"]) == 60
+        assert int(cfg["meta"]["meta_iters"]) == 80
         assert int(cfg["meta"]["support_episodes"]) == 5
         assert int(cfg["meta"]["query_episodes"]) == 2
         assert bool(cfg["meta"]["query_updates_enabled"]) is False
+        assert bool(cfg["meta"]["query_context_updates_enabled"]) is True
+        assert str(cfg["meta"]["protocol_name"]) == "strict_support_query"
+        assert int(cfg["buffer"]["context_max_len"]) >= int(cfg["env"]["episode_len"]) * int(cfg["meta"]["support_episodes"])
         assert int(cfg["upper_dqn"]["batch_size"]) == 64
 
         selection = cfg["meta"]["checkpoint_selection"]
         assert bool(selection["enabled"]) is True
         assert str(selection["mode"]) == "heldout_eval"
-        assert int(selection["eval_tasks"]) == 5
-        assert int(selection["eval_eps"]) == 2
+        assert int(selection["eval_tasks"]) == 8
+        assert int(selection["eval_eps"]) == 3
 
 
 def test_meta_trainer_one_iter_explicit_inner_outer_smoke(tmp_path):
@@ -54,8 +60,43 @@ def test_meta_trainer_one_iter_explicit_inner_outer_smoke(tmp_path):
     assert "lambda_qos" in rows[0]
     assert "query_cost_temp_anchor" in rows[0]
     assert "query_updates_enabled" in rows[0]
+    assert "query_context_updates_enabled" in rows[0]
+    assert "heldout_query_evaluation" in rows[0]
+    assert "support_parameter_delta_norm" in rows[0]
+    assert "support_target_parameter_delta_norm" in rows[0]
     assert "upper_batch_size" in rows[0]
     assert "iter_upper_update_step_delta" in rows[0]
+
+
+def test_support_delta_norm_ignores_optimizer_state():
+    base = {
+        "upper": {
+            "q": {"w": torch.zeros(2)},
+            "q_tgt": {"w": torch.zeros(2)},
+            "optim": {"state": {"m": torch.zeros(2)}},
+        },
+        "lower": {
+            "actor": {"w": torch.zeros(2)},
+            "q1": {"w": torch.zeros(2)},
+            "q2": {"w": torch.zeros(2)},
+            "q1_tgt": {"w": torch.zeros(2)},
+            "q2_tgt": {"w": torch.zeros(2)},
+            "actor_optim": {"state": {"m": torch.zeros(2)}},
+        },
+        "context_encoder": {"w": torch.zeros(2)},
+        "context_predictor": {"w": torch.zeros(2)},
+        "context_optim": {"state": {"m": torch.zeros(2)}},
+    }
+    optimizer_only = copy.deepcopy(base)
+    optimizer_only["upper"]["optim"]["state"]["m"] = torch.ones(2)
+    optimizer_only["context_optim"]["state"]["m"] = torch.ones(2)
+
+    assert MetaTrainer._trainable_parameter_delta_norm(base, optimizer_only) == 0.0
+
+    param_changed = copy.deepcopy(base)
+    param_changed["lower"]["actor"]["w"] = torch.ones(2)
+    assert MetaTrainer._trainable_parameter_delta_norm(base, param_changed) > 0.0
+    assert MetaTrainer._target_parameter_delta_norm(base, param_changed) == 0.0
 
 
 def test_meta_trainer_upper_batch_size_allows_short_support_upper_update(tmp_path):

@@ -333,7 +333,7 @@ def _collect_variant_rows(
             "support_global_step_delta": int(trainer.agent.global_step - base_global_step),
             "support_lower_update_delta": int(trainer.agent.lower.update_steps - base_lower_steps),
             "support_upper_update_delta": int(trainer.agent.upper.update_steps - base_upper_steps),
-            "support_parameter_delta_norm": float(_state_delta_norm(base_state, current_state)),
+            "support_parameter_delta_norm": float(MetaTrainer._trainable_parameter_delta_norm(base_state, current_state)),
             **_module_delta_summary(base_state, current_state),
             "support_lower_replay_len_after_support": int(len(trainer.agent.replay)),
             "support_upper_replay_len_after_support": int(len(trainer.agent.upper_replay)),
@@ -375,7 +375,7 @@ def _collect_variant_rows(
             "query_global_step_delta": int(trainer.agent.global_step - query_base_global_step),
             "query_lower_update_delta": int(trainer.agent.lower.update_steps - query_base_lower_steps),
             "query_upper_update_delta": int(trainer.agent.upper.update_steps - query_base_upper_steps),
-            "query_parameter_delta_norm": float(_state_delta_norm(query_base_state, query_state)),
+            "query_parameter_delta_norm": float(MetaTrainer._trainable_parameter_delta_norm(query_base_state, query_state)),
         }
         for row in rows[query_row_start:]:
             row.update(query_diag)

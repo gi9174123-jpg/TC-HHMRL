@@ -96,7 +96,7 @@ lower_sac:
 
 meta:
   n_tasks_per_iter: 6
-  meta_iters: 60
+  meta_iters: 80
   support_episodes: 5
   query_episodes: 2
   dual_lr: 0.05
@@ -109,13 +109,15 @@ meta:
   explicit_inner_outer: true
   outer_step_size: 0.15
   query_updates_enabled: false
+  query_context_updates_enabled: true
+  protocol_name: strict_support_query
   inner_warmup_steps: 128
   inner_upper_warmup_steps: 64
   checkpoint_selection:
     enabled: true
     mode: heldout_eval
-    eval_tasks: 5
-    eval_eps: 2
+    eval_tasks: 8
+    eval_eps: 3
     reward_w: 1.0
     se_w: 0.0
     eh_w: 0.0
@@ -124,7 +126,7 @@ meta:
 
 buffer:
   replay_size: 100000
-  context_max_len: 200
+  context_max_len: 400
 
 context:
   input_dim: 30
