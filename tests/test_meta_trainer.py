@@ -20,6 +20,9 @@ def test_default_meta_protocol_uses_heldout_query_and_stable_checkpoint_selectio
         assert bool(cfg["meta"]["query_context_updates_enabled"]) is True
         assert str(cfg["meta"]["protocol_name"]) == "strict_support_query"
         assert int(cfg["buffer"]["context_max_len"]) >= int(cfg["env"]["episode_len"]) * int(cfg["meta"]["support_episodes"])
+        assert int(cfg["agent"]["upper_update_every"]) == 1
+        assert int(cfg["agent"]["lower_updates_per_step"]) == 2
+        assert int(cfg["agent"]["upper_batch_size"]) == 64
         assert int(cfg["upper_dqn"]["batch_size"]) == 64
 
         selection = cfg["meta"]["checkpoint_selection"]
@@ -65,6 +68,9 @@ def test_meta_trainer_one_iter_explicit_inner_outer_smoke(tmp_path):
     assert "support_parameter_delta_norm" in rows[0]
     assert "support_target_parameter_delta_norm" in rows[0]
     assert "upper_batch_size" in rows[0]
+    assert "upper_update_every" in rows[0]
+    assert "lower_updates_per_step" in rows[0]
+    assert "upper_warmup_steps" in rows[0]
     assert "iter_upper_update_step_delta" in rows[0]
 
 
@@ -107,6 +113,7 @@ def test_meta_trainer_upper_batch_size_allows_short_support_upper_update(tmp_pat
     cfg["env"]["episode_len"] = 8
     cfg["agent"]["hidden_dim"] = 32
     cfg["agent"]["batch_size"] = 8
+    cfg["agent"]["upper_batch_size"] = 2
     cfg["upper_dqn"]["batch_size"] = 2
     cfg["agent"]["warmup_steps"] = 4
     cfg["agent"]["upper_update_every"] = 1

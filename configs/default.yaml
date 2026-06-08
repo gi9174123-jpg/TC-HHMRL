@@ -98,10 +98,11 @@ agent:
   n_upper_actions: 12
   upper_hold_steps: 2
   lower_updates_per_step: 2
-  upper_update_every: 2
+  upper_update_every: 1
   gamma: 0.99
   tau: 0.005
   batch_size: 128
+  upper_batch_size: 64
   warmup_steps: 1500
 
 upper_dqn:

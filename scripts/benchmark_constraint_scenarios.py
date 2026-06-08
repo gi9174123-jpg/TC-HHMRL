@@ -4338,6 +4338,17 @@ def run_one_scenario(
                     "explicit_inner_outer": bool(run_meta_cfg.get("explicit_inner_outer", False)),
                     "outer_step_size": float(run_meta_cfg.get("outer_step_size", 0.0)),
                     "context_max_len": int(cfg.get("buffer", {}).get("context_max_len", 0)),
+                    "lower_updates_per_step": int(cfg.get("agent", {}).get("lower_updates_per_step", 1)),
+                    "upper_update_every": int(cfg.get("agent", {}).get("upper_update_every", 1)),
+                    "lower_batch_size": int(cfg.get("agent", {}).get("batch_size", 0)),
+                    "upper_batch_size": int(
+                        cfg.get("agent", {}).get(
+                            "upper_batch_size",
+                            cfg.get("upper_dqn", {}).get("batch_size", cfg.get("agent", {}).get("batch_size", 0)),
+                        )
+                    ),
+                    "inner_warmup_steps": int(run_meta_cfg.get("inner_warmup_steps", 0)),
+                    "inner_upper_warmup_steps": int(run_meta_cfg.get("inner_upper_warmup_steps", 0)),
                     "checkpoint_selection_eval_tasks": int(run_ckpt_cfg.get("eval_tasks", eval_tasks)),
                     "checkpoint_selection_eval_eps": int(run_ckpt_cfg.get("eval_eps", 1)),
                     "checkpoint_strategy": str(ckpt_pick.get("strategy", "none")),
@@ -5017,6 +5028,15 @@ def run_benchmark(
         "query_updates_enabled": bool(base_cfg.get("meta", {}).get("query_updates_enabled", True)),
         "query_context_updates_enabled": bool(base_cfg.get("meta", {}).get("query_context_updates_enabled", True)),
         "context_max_len": int(base_cfg.get("buffer", {}).get("context_max_len", 0)),
+        "lower_updates_per_step": int(base_cfg.get("agent", {}).get("lower_updates_per_step", 1)),
+        "upper_update_every": int(base_cfg.get("agent", {}).get("upper_update_every", 1)),
+        "lower_batch_size": int(base_cfg.get("agent", {}).get("batch_size", 0)),
+        "upper_batch_size": int(
+            base_cfg.get("agent", {}).get(
+                "upper_batch_size",
+                base_cfg.get("upper_dqn", {}).get("batch_size", base_cfg.get("agent", {}).get("batch_size", 0)),
+            )
+        ),
         "strict_meta": bool(strict_meta or str(base_cfg.get("meta", {}).get("protocol_name", "")) == "strict_support_query"),
         "fast_mode": bool(fast_mode),
         "use_curriculum": bool(use_curriculum),

@@ -408,6 +408,15 @@ def run_benchmark(
         "query_updates_enabled": bool(base_cfg.get("meta", {}).get("query_updates_enabled", True)),
         "query_context_updates_enabled": bool(base_cfg.get("meta", {}).get("query_context_updates_enabled", True)),
         "context_max_len": int(base_cfg.get("buffer", {}).get("context_max_len", 0)),
+        "lower_updates_per_step": int(base_cfg.get("agent", {}).get("lower_updates_per_step", 1)),
+        "upper_update_every": int(base_cfg.get("agent", {}).get("upper_update_every", 1)),
+        "lower_batch_size": int(base_cfg.get("agent", {}).get("batch_size", 0)),
+        "upper_batch_size": int(
+            base_cfg.get("agent", {}).get(
+                "upper_batch_size",
+                base_cfg.get("upper_dqn", {}).get("batch_size", base_cfg.get("agent", {}).get("batch_size", 0)),
+            )
+        ),
         "fast_mode": bool(fast_mode),
         "seeds": seeds,
         "eval_summary": eval_summary,
