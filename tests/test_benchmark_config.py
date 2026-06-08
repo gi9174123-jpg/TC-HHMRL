@@ -35,6 +35,26 @@ def test_default_safety_uses_corrected_action_mapping_and_main_projection():
     assert float(cfg["safety"]["thermal_cap_margin_c"]) == 0.5
 
 
+def test_main_cli_defaults_match_strict_meta_evaluation_scale(monkeypatch):
+    from scripts import benchmark_constraint_scenarios as bench
+    from scripts import benchmark_hybrid_vs_single as structural
+
+    monkeypatch.setattr("sys.argv", ["benchmark_constraint_scenarios.py"])
+    args = bench.parse_args()
+    assert list(args.scenarios) == ["moderate_practical", "hard_stress"]
+    assert int(args.eval_tasks) == 10
+    assert int(args.eval_eps) == 3
+    assert int(args.env_tasks) == 8
+    assert int(args.env_eps) == 1
+
+    monkeypatch.setattr("sys.argv", ["benchmark_hybrid_vs_single.py"])
+    args = structural.parse_args()
+    assert int(args.eval_tasks) == 10
+    assert int(args.eval_eps) == 3
+    assert int(args.env_tasks) == 8
+    assert int(args.env_eps) == 1
+
+
 def test_practical_hard_safety_is_earlier_than_env():
     cfg = load_cfg("configs/default.yaml")
     cfg = copy.deepcopy(cfg)

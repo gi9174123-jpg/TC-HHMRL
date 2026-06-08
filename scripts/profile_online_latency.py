@@ -418,8 +418,8 @@ def main() -> None:
     parser.add_argument("--out-dir", default=str(DEFAULT_OUT_DIR))
     parser.add_argument("--warmup", type=int, default=1000)
     parser.add_argument("--runs", type=int, default=10000)
-    parser.add_argument("--eval-tasks", type=int, default=8)
-    parser.add_argument("--eval-eps", type=int, default=2)
+    parser.add_argument("--eval-tasks", type=int, default=10)
+    parser.add_argument("--eval-eps", type=int, default=3)
     parser.add_argument("--max-samples", type=int, default=2048)
     args = parser.parse_args()
 

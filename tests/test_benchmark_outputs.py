@@ -71,6 +71,12 @@ def test_benchmark_writes_resolved_config_and_run_summary(tmp_path: Path):
         assert row["ordered_selection_task_batch_hash"]
         assert row["ordered_eval_task_batch_hash"]
         assert row["ordered_env_task_batch_hash"]
+        assert int(row["selection_tasks"]) == 10
+        assert int(row["selection_eps"]) == 3
+        assert int(row["eval_tasks"]) == 1
+        assert int(row["eval_eps"]) == 1
+        assert int(row["env_tasks"]) == 1
+        assert int(row["env_eps"]) == 1
         assert "shared_init" in row and bool(row["shared_init"]) is True
         assert "shared_init_pretrain_iters" in row
         assert int(row["shared_init_pretrain_iters"]) >= 0
@@ -101,6 +107,10 @@ def test_benchmark_writes_resolved_config_and_run_summary(tmp_path: Path):
     report = json.loads(report_path.read_text(encoding="utf-8"))
     assert report["task_distribution_scope"] == "base_config_snapshot"
     assert report["physics"]["physics_version"] == "physics_v2"
+    assert int(report["eval_tasks"]) == 1
+    assert int(report["eval_eps"]) == 1
+    assert int(report["env_tasks"]) == 1
+    assert int(report["env_eps"]) == 1
     stats = report.get("stats_artifacts", {})
     assert stats == {}
 

@@ -710,7 +710,7 @@ def main() -> None:
     parser.add_argument("--scenario", default="hard_stress")
     parser.add_argument("--seed", type=int, default=101)
     parser.add_argument("--train-iters", type=int, default=1)
-    parser.add_argument("--tasks", type=int, default=3)
+    parser.add_argument("--tasks", type=int, default=8)
     parser.add_argument("--pre-query-episodes", type=int, default=None)
     parser.add_argument("--support-episodes", type=int, default=5)
     parser.add_argument("--query-episodes", type=int, default=2)

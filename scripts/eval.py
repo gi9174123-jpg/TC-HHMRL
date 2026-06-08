@@ -10,8 +10,8 @@ def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--cfg", type=str, default="configs/default.yaml")
     parser.add_argument("--ckpt", type=str, default=None)
-    parser.add_argument("--n-tasks", type=int, default=5)
-    parser.add_argument("--episodes-per-task", type=int, default=2)
+    parser.add_argument("--n-tasks", type=int, default=10)
+    parser.add_argument("--episodes-per-task", type=int, default=3)
     parser.add_argument("--device", type=str, default=None, help="Override config device: auto/cpu/cuda/mps")
     args = parser.parse_args()
 

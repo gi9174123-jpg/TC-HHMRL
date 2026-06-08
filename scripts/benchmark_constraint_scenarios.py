@@ -4354,6 +4354,12 @@ def run_one_scenario(
                     "inner_upper_warmup_steps": int(run_meta_cfg.get("inner_upper_warmup_steps", 0)),
                     "checkpoint_selection_eval_tasks": int(run_ckpt_cfg.get("eval_tasks", eval_tasks)),
                     "checkpoint_selection_eval_eps": int(run_ckpt_cfg.get("eval_eps", 1)),
+                    "selection_tasks": int(len(selection_tasks)),
+                    "selection_eps": int(selection_eps),
+                    "eval_tasks": int(eval_tasks),
+                    "eval_eps": int(eval_eps),
+                    "env_tasks": int(env_tasks),
+                    "env_eps": int(env_eps),
                     "checkpoint_strategy": str(ckpt_pick.get("strategy", "none")),
                     "checkpoint_iter": int(ckpt_pick.get("selected_iter", -1)),
                     "checkpoint_score": (
@@ -5025,6 +5031,10 @@ def run_benchmark(
         "task_distribution_scope": "base_config_snapshot",
         "task_distribution": task_distribution_summary(base_cfg),
         "meta_iters": effective_meta_iters,
+        "eval_tasks": int(eval_tasks),
+        "eval_eps": int(eval_eps),
+        "env_tasks": int(env_tasks),
+        "env_eps": int(env_eps),
         "meta_protocol_name": str(base_cfg.get("meta", {}).get("protocol_name", "")),
         "support_episodes": int(base_cfg.get("meta", {}).get("support_episodes", 0)),
         "query_episodes": int(base_cfg.get("meta", {}).get("query_episodes", 0)),
@@ -5077,7 +5087,7 @@ def parse_args() -> argparse.Namespace:
         "--scenarios",
         type=str,
         nargs="+",
-        default=["moderate_practical", "practical_hard"],
+        default=["moderate_practical", "hard_stress"],
         choices=[
             "easy_baseline",
             "baseline_easy",
@@ -5102,7 +5112,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--strict-meta",
         action="store_true",
-        help="Force the strict support-query protocol: 5 support episodes, 2 held-out query episodes, no query updates, and 8x3 checkpoint selection.",
+        help="Force the strict support-query protocol: 5 support episodes, 2 held-out query episodes, no query updates, and 10x3 checkpoint selection.",
     )
     parser.add_argument(
         "--fast-mode",
@@ -5169,9 +5179,9 @@ def parse_args() -> argparse.Namespace:
         action="store_true",
         help="Run only the requested baselines and skip variant/ablation experiments.",
     )
-    parser.add_argument("--eval-tasks", type=int, default=8)
-    parser.add_argument("--eval-eps", type=int, default=2)
-    parser.add_argument("--env-tasks", type=int, default=6)
+    parser.add_argument("--eval-tasks", type=int, default=10)
+    parser.add_argument("--eval-eps", type=int, default=3)
+    parser.add_argument("--env-tasks", type=int, default=8)
     parser.add_argument("--env-eps", type=int, default=1)
     parser.add_argument(
         "--eh-model",

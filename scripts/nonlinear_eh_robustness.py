@@ -337,8 +337,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--seed", type=int, default=None)
     parser.add_argument("--ckpt", type=str, default="")
     parser.add_argument("--device", type=str, default="cpu")
-    parser.add_argument("--eval-tasks", type=int, default=8)
-    parser.add_argument("--eval-eps", type=int, default=2)
+    parser.add_argument("--eval-tasks", type=int, default=10)
+    parser.add_argument("--eval-eps", type=int, default=3)
     return parser.parse_args()
 
 

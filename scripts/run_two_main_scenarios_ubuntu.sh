@@ -8,12 +8,13 @@ PYTHON_BIN="${PYTHON_BIN:-python3}"
 VENV_DIR="${VENV_DIR:-.venv}"
 CFG_PATH="${CFG_PATH:-configs/default.yaml}"
 DEVICE="${DEVICE:-auto}"
-META_ITERS="${META_ITERS:-45}"
-EVAL_TASKS="${EVAL_TASKS:-8}"
-EVAL_EPS="${EVAL_EPS:-2}"
-ENV_TASKS="${ENV_TASKS:-6}"
+META_ITERS="${META_ITERS:-100}"
+EVAL_TASKS="${EVAL_TASKS:-10}"
+EVAL_EPS="${EVAL_EPS:-3}"
+ENV_TASKS="${ENV_TASKS:-8}"
 ENV_EPS="${ENV_EPS:-1}"
-SEEDS="${SEEDS:-101 202 303 404 505}"
+SEEDS="${SEEDS:-101 202 303 404 505 606 707 808 909 1001}"
+SCENARIOS="${SCENARIOS:-moderate_practical hard_stress}"
 OUT_DIR="${OUT_DIR:-logs/two_main_scenarios_live_$(date +%Y%m%d_%H%M%S)}"
 INSTALL_TORCH_CUDA="${INSTALL_TORCH_CUDA:-0}"
 TORCH_INDEX_URL="${TORCH_INDEX_URL:-https://download.pytorch.org/whl/cu128}"
@@ -44,18 +45,24 @@ else:
 PY
 
 read -r -a seed_args <<< "$SEEDS"
+read -r -a scenario_args <<< "$SCENARIOS"
 
 cmd=(
   python -m scripts.benchmark_constraint_scenarios
   --cfg "$CFG_PATH"
   --device "$DEVICE"
   --out-dir "$OUT_DIR"
-  --scenarios moderate_practical practical_hard
+  --scenarios
+)
+cmd+=("${scenario_args[@]}")
+cmd+=(
   --meta-iters "$META_ITERS"
   --eval-tasks "$EVAL_TASKS"
   --eval-eps "$EVAL_EPS"
   --env-tasks "$ENV_TASKS"
   --env-eps "$ENV_EPS"
+  --strict-meta
+  --no-shared-init
   --seeds
 )
 cmd+=("${seed_args[@]}")

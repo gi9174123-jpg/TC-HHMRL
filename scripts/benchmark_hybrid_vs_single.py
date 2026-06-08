@@ -402,6 +402,10 @@ def run_benchmark(
 
     summary = {
         "meta_iters": effective_meta_iters,
+        "eval_tasks": int(eval_tasks),
+        "eval_eps": int(eval_eps),
+        "env_tasks": int(env_tasks),
+        "env_eps": int(env_eps),
         "meta_protocol_name": str(base_cfg.get("meta", {}).get("protocol_name", "")),
         "support_episodes": int(base_cfg.get("meta", {}).get("support_episodes", 0)),
         "query_episodes": int(base_cfg.get("meta", {}).get("query_episodes", 0)),
@@ -464,9 +468,9 @@ def parse_args() -> argparse.Namespace:
         help="Use reduced workload for quick smoke benchmarks.",
     )
     parser.add_argument("--seeds", type=int, nargs="+", default=[11, 22, 33])
-    parser.add_argument("--eval-tasks", type=int, default=8)
-    parser.add_argument("--eval-eps", type=int, default=2)
-    parser.add_argument("--env-tasks", type=int, default=6)
+    parser.add_argument("--eval-tasks", type=int, default=10)
+    parser.add_argument("--eval-eps", type=int, default=3)
+    parser.add_argument("--env-tasks", type=int, default=8)
     parser.add_argument("--env-eps", type=int, default=1)
     return parser.parse_args()
 
