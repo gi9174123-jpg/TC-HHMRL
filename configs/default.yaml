@@ -185,8 +185,8 @@ baselines:
     q_lr: 3.0e-4
 
 meta:
-  n_tasks_per_iter: 6
-  meta_iters: 80
+  n_tasks_per_iter: 8
+  meta_iters: 100
   support_episodes: 5
   query_episodes: 2
   dual_lr: 0.05
@@ -206,7 +206,7 @@ meta:
   checkpoint_selection:
     enabled: true
     mode: heldout_eval
-    eval_tasks: 8
+    eval_tasks: 10
     eval_eps: 3
     reward_w: 1.0
     se_w: 0.0
@@ -216,7 +216,7 @@ meta:
 
 buffer:
   replay_size: 100000
-  context_max_len: 400
+  context_max_len: 560
 
 context:
   input_dim: 37

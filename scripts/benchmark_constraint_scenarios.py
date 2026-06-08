@@ -89,6 +89,8 @@ def apply_common_settings(
 def apply_strict_meta_protocol(cfg: Dict) -> None:
     """Use held-out query episodes for the main Hybrid meta-learning protocol."""
     meta_cfg = cfg.setdefault("meta", {})
+    meta_cfg["n_tasks_per_iter"] = max(int(meta_cfg.get("n_tasks_per_iter", 0)), 8)
+    meta_cfg["meta_iters"] = max(int(meta_cfg.get("meta_iters", 0)), 100)
     meta_cfg["support_episodes"] = 5
     meta_cfg["query_episodes"] = 2
     meta_cfg["query_updates_enabled"] = False
@@ -98,12 +100,13 @@ def apply_strict_meta_protocol(cfg: Dict) -> None:
     meta_cfg["protocol_name"] = "strict_support_query"
     cfg.setdefault("buffer", {})["context_max_len"] = max(
         int(cfg.get("buffer", {}).get("context_max_len", 0)),
-        int(cfg.get("env", {}).get("episode_len", 80)) * int(meta_cfg["support_episodes"]),
+        int(cfg.get("env", {}).get("episode_len", 80))
+        * (int(meta_cfg["support_episodes"]) + int(meta_cfg["query_episodes"])),
     )
     ckpt_cfg = meta_cfg.setdefault("checkpoint_selection", {})
     ckpt_cfg["enabled"] = True
     ckpt_cfg["mode"] = "heldout_eval"
-    ckpt_cfg["eval_tasks"] = 8
+    ckpt_cfg["eval_tasks"] = 10
     ckpt_cfg["eval_eps"] = 3
 
 

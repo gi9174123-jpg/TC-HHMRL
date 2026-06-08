@@ -13,13 +13,16 @@ from tchhmrl.utils.config import load_cfg
 def test_default_meta_protocol_uses_heldout_query_and_stable_checkpoint_selection():
     for cfg_path in ("configs/default.yaml", "configs/moderate.yaml"):
         cfg = load_cfg(cfg_path)
-        assert int(cfg["meta"]["meta_iters"]) == 80
+        assert int(cfg["meta"]["meta_iters"]) == 100
+        assert int(cfg["meta"]["n_tasks_per_iter"]) == 8
         assert int(cfg["meta"]["support_episodes"]) == 5
         assert int(cfg["meta"]["query_episodes"]) == 2
         assert bool(cfg["meta"]["query_updates_enabled"]) is False
         assert bool(cfg["meta"]["query_context_updates_enabled"]) is True
         assert str(cfg["meta"]["protocol_name"]) == "strict_support_query"
-        assert int(cfg["buffer"]["context_max_len"]) >= int(cfg["env"]["episode_len"]) * int(cfg["meta"]["support_episodes"])
+        assert int(cfg["buffer"]["context_max_len"]) >= int(cfg["env"]["episode_len"]) * (
+            int(cfg["meta"]["support_episodes"]) + int(cfg["meta"]["query_episodes"])
+        )
         assert int(cfg["agent"]["upper_update_every"]) == 1
         assert int(cfg["agent"]["lower_updates_per_step"]) == 2
         assert int(cfg["agent"]["upper_batch_size"]) == 64
@@ -28,7 +31,7 @@ def test_default_meta_protocol_uses_heldout_query_and_stable_checkpoint_selectio
         selection = cfg["meta"]["checkpoint_selection"]
         assert bool(selection["enabled"]) is True
         assert str(selection["mode"]) == "heldout_eval"
-        assert int(selection["eval_tasks"]) == 8
+        assert int(selection["eval_tasks"]) == 10
         assert int(selection["eval_eps"]) == 3
 
 
