@@ -403,13 +403,18 @@ def _summarize_rows(rows: List[Dict[str, object]]) -> Dict[str, object]:
 
     meta_query = phase_summary.get("hybrid_meta_query", {})
     meta_no_adapt_query = phase_summary.get("hybrid_meta_no_support_adapt_query", {})
+    context_only_query = phase_summary.get("hybrid_context_only_query", {})
     wo_query = phase_summary.get("hybrid_wo_meta_query", {})
     meta_pre_query = phase_summary.get("hybrid_meta_pre_query", {})
     meta_no_adapt_pre_query = phase_summary.get("hybrid_meta_no_support_adapt_pre_query", {})
+    context_only_pre_query = phase_summary.get("hybrid_context_only_pre_query", {})
     wo_pre_query = phase_summary.get("hybrid_wo_meta_pre_query", {})
     meta_query_reward_gain = float(meta_query.get("reward", 0.0) - meta_pre_query.get("reward", 0.0))
     meta_no_adapt_query_reward_gain = float(
         meta_no_adapt_query.get("reward", 0.0) - meta_no_adapt_pre_query.get("reward", 0.0)
+    )
+    context_only_query_reward_gain = float(
+        context_only_query.get("reward", 0.0) - context_only_pre_query.get("reward", 0.0)
     )
     wo_query_reward_gain = float(wo_query.get("reward", 0.0) - wo_pre_query.get("reward", 0.0))
     comparison = {
@@ -417,18 +422,34 @@ def _summarize_rows(rows: List[Dict[str, object]]) -> Dict[str, object]:
         "query_reward_delta_meta_minus_no_support_adapt": float(
             meta_query.get("reward", 0.0) - meta_no_adapt_query.get("reward", 0.0)
         ),
+        "query_reward_delta_meta_minus_context_only": float(
+            meta_query.get("reward", 0.0) - context_only_query.get("reward", 0.0)
+        ),
+        "query_reward_delta_context_only_minus_wo_meta": float(
+            context_only_query.get("reward", 0.0) - wo_query.get("reward", 0.0)
+        ),
         "query_violation_delta_meta_minus_wo_meta": float(
             meta_query.get("violation_rate", 0.0) - wo_query.get("violation_rate", 0.0)
         ),
         "query_violation_delta_meta_minus_no_support_adapt": float(
             meta_query.get("violation_rate", 0.0) - meta_no_adapt_query.get("violation_rate", 0.0)
         ),
+        "query_violation_delta_meta_minus_context_only": float(
+            meta_query.get("violation_rate", 0.0) - context_only_query.get("violation_rate", 0.0)
+        ),
+        "query_violation_delta_context_only_minus_wo_meta": float(
+            context_only_query.get("violation_rate", 0.0) - wo_query.get("violation_rate", 0.0)
+        ),
         "query_cost_delta_meta_minus_wo_meta": float(meta_query.get("cost", 0.0) - wo_query.get("cost", 0.0)),
         "query_cost_delta_meta_minus_no_support_adapt": float(
             meta_query.get("cost", 0.0) - meta_no_adapt_query.get("cost", 0.0)
         ),
+        "query_cost_delta_meta_minus_context_only": float(
+            meta_query.get("cost", 0.0) - context_only_query.get("cost", 0.0)
+        ),
         "meta_query_reward_after_minus_before_support": meta_query_reward_gain,
         "meta_no_support_adapt_query_reward_after_minus_before_support": meta_no_adapt_query_reward_gain,
+        "context_only_query_reward_after_minus_before_support": context_only_query_reward_gain,
         "meta_query_se_after_minus_before_support": float(meta_query.get("se", 0.0) - meta_pre_query.get("se", 0.0)),
         "meta_query_eh_after_minus_before_support": float(meta_query.get("eh", 0.0) - meta_pre_query.get("eh", 0.0)),
         "meta_query_cost_after_minus_before_support": float(meta_query.get("cost", 0.0) - meta_pre_query.get("cost", 0.0)),
@@ -443,6 +464,8 @@ def _summarize_rows(rows: List[Dict[str, object]]) -> Dict[str, object]:
         "few_shot_reward_gain_meta_minus_no_support_adapt": (
             meta_query_reward_gain - meta_no_adapt_query_reward_gain
         ),
+        "few_shot_reward_gain_meta_minus_context_only": meta_query_reward_gain - context_only_query_reward_gain,
+        "few_shot_reward_gain_context_only_minus_wo_meta": context_only_query_reward_gain - wo_query_reward_gain,
     }
     adaptation_summary: Dict[str, Dict[str, float]] = {}
     for variant in sorted({str(row["variant"]) for row in rows}):
@@ -513,6 +536,16 @@ def _summarize_rows(rows: List[Dict[str, object]]) -> Dict[str, object]:
                 "query_train_updates": False,
                 "matched_pre_post_eval_episode_seeds": True,
                 "same_checkpoint_as": "hybrid_meta",
+            },
+            "hybrid_context_only": {
+                "context_enabled": True,
+                "explicit_inner_outer": False,
+                "pre_query_eval_before_support": True,
+                "support_train_adapts": False,
+                "query_eval_after_support": True,
+                "query_train_updates": False,
+                "matched_pre_post_eval_episode_seeds": True,
+                "purpose": "isolate GRU support-context conditioning without Reptile/outer meta update",
             },
             "hybrid_wo_meta": {
                 "context_enabled": False,
@@ -634,6 +667,43 @@ def run_meta_adaptation_diagnostics(
             scenario=scenario,
             seed=seed,
             variant="hybrid_meta_no_support_adapt",
+            support_episodes=support_episodes,
+            query_episodes=query_episodes,
+            pre_query_episodes=pre_query_episodes,
+            support_train_override=False,
+        )
+    )
+
+    context_only_cfg = _prepare_cfg(
+        base_cfg,
+        out_dir=out_path,
+        run_name="meta_adaptation_hybrid_context_only",
+        seed=seed,
+        scenario=scenario,
+        train_iters=train_iters,
+        fast_mode=fast_mode,
+        support_episodes=support_episodes,
+        query_episodes=query_episodes,
+        episode_len=episode_len,
+        device=device,
+    )
+    context_only_cfg.setdefault("context", {})["enabled"] = True
+    context_only_cfg.setdefault("meta", {})["explicit_inner_outer"] = False
+    context_only_cfg["meta"]["outer_step_size"] = 0.0
+    context_only_cfg["meta"]["query_updates_enabled"] = False
+    context_only_cfg["meta"]["query_context_updates_enabled"] = True
+    context_only_cfg["meta"]["protocol_name"] = "context_only_no_outer_meta"
+    context_only_trainer = MetaTrainer(context_only_cfg)
+    if int(train_iters) > 0:
+        context_only_trainer.train(meta_iters=int(train_iters))
+    rows.extend(
+        _collect_variant_rows(
+            trainer=context_only_trainer,
+            cfg=context_only_cfg,
+            tasks=tasks,
+            scenario=scenario,
+            seed=seed,
+            variant="hybrid_context_only",
             support_episodes=support_episodes,
             query_episodes=query_episodes,
             pre_query_episodes=pre_query_episodes,

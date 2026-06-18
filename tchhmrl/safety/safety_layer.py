@@ -62,7 +62,14 @@ class SafetyLayer:
         self.thermal_coupling_matrix = validate_coupling_matrix(coupling_matrix, n_tx=len(safety_cfg["current_max"]))
         self.thermal_coupling_matrix_hash = coupling_matrix_hash(self.thermal_coupling_matrix)
         self.projection_mode = str(safety_cfg.get("projection_mode", "thermal_cap")).lower()
-        if self.projection_mode not in {"smooth", "smooth_relaxed", "thermal_cap", "hard_clip", "dalal_safe"}:
+        if self.projection_mode not in {
+            "smooth",
+            "smooth_relaxed",
+            "thermal_cap",
+            "hard_clip",
+            "qos_aware_hard_clip",
+            "dalal_safe",
+        }:
             raise ValueError(f"unsupported safety.projection_mode={self.projection_mode}")
         self.action_decode_mode = str(safety_cfg.get("action_decode_mode", "tanh_affine")).lower()
         if self.action_decode_mode not in {"tanh_affine", "sigmoid_logit"}:
@@ -245,6 +252,59 @@ class SafetyLayer:
         scale = np.where(currents > 1.0e-6, scale, 1.0).astype(np.float32)
         return safe_currents, cap, scale, base, coupling
 
+    def _qos_aware_hard_clip_np(
+        self,
+        *,
+        currents: np.ndarray,
+        target_total: float,
+        active_mask: np.ndarray,
+        temps: np.ndarray,
+        amb_temp: float,
+        gamma: float,
+        delta: float,
+    ) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+        """Hard per-source clipping with non-oracle current recovery.
+
+        Naive hard clipping drops a source to zero whenever the one-step
+        prediction crosses the thermal limit. This tuned hard-clip baseline is
+        still a hard feasibility rule, but clips each active source to its
+        current thermal cap and redistributes any lost current only to currently
+        active sources with remaining thermal and bus headroom. It does not
+        inspect future disturbances or realized reward.
+        """
+        safe_currents, cap, scale, base, coupling = self._thermal_cap_np(
+            currents=currents,
+            temps=temps,
+            amb_temp=amb_temp,
+            gamma=gamma,
+            delta=delta,
+        )
+        active = (np.asarray(active_mask, dtype=np.float32) > 0.5).astype(np.float32)
+        cap = np.minimum(cap, self.current_max * active).astype(np.float32)
+        safe_currents = np.minimum(safe_currents, cap).astype(np.float32)
+        shortage = float(max(0.0, min(float(target_total), self.bus_current_max) - float(np.sum(safe_currents))))
+        if shortage > 1.0e-8:
+            available = np.maximum(cap - safe_currents, 0.0).astype(np.float32) * active
+            # Fill cooler / larger-headroom sources first. This is deterministic
+            # and uses only the current thermal state.
+            order = np.argsort(-available)
+            for idx in order:
+                room = float(available[idx])
+                if room <= 1.0e-8 or shortage <= 1.0e-8:
+                    continue
+                add = min(room, shortage)
+                safe_currents[idx] += add
+                shortage -= add
+        recovered_total = float(np.sum(safe_currents))
+        if recovered_total > self.bus_current_max:
+            safe_currents *= self._hard_bus_scale_np(recovered_total)
+        scale = np.where(
+            currents > 1.0e-6,
+            safe_currents / np.maximum(currents, 1.0e-6),
+            np.where(safe_currents > 1.0e-6, 1.0, 0.0),
+        ).astype(np.float32)
+        return safe_currents.astype(np.float32), cap.astype(np.float32), scale, base, coupling
+
     def _thermal_cap_torch(
         self,
         *,
@@ -266,6 +326,48 @@ class SafetyLayer:
             currents > 1.0e-6,
             safe_currents / torch.clamp(currents, min=1.0e-6),
             torch.ones_like(currents),
+        )
+        return safe_currents, cap, scale, base, coupling
+
+    def _qos_aware_hard_clip_torch(
+        self,
+        *,
+        currents: torch.Tensor,
+        target_total: torch.Tensor,
+        active_mask: torch.Tensor,
+        temps: torch.Tensor,
+        amb_temp: torch.Tensor,
+        gamma: torch.Tensor,
+        delta: torch.Tensor,
+        current_max: torch.Tensor,
+        thermal_coeff: torch.Tensor,
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        safe_currents, cap, scale, base, coupling = self._thermal_cap_torch(
+            currents=currents,
+            temps=temps,
+            amb_temp=amb_temp,
+            gamma=gamma,
+            delta=delta,
+            current_max=current_max,
+            thermal_coeff=thermal_coeff,
+        )
+        active = (active_mask > 0.5).to(currents.dtype)
+        cap = torch.minimum(cap, current_max * active)
+        safe_currents = torch.minimum(safe_currents, cap)
+        shortage = torch.clamp(
+            torch.minimum(target_total, torch.full_like(target_total, self.bus_current_max))
+            - safe_currents.sum(dim=1, keepdim=True),
+            min=0.0,
+        )
+        available = torch.clamp(cap - safe_currents, min=0.0) * active
+        weights = available / torch.clamp(available.sum(dim=1, keepdim=True), min=1.0e-6)
+        safe_currents = safe_currents + weights * shortage
+        total = safe_currents.sum(dim=1, keepdim=True)
+        safe_currents = safe_currents * self._hard_bus_scale_torch(total)
+        scale = torch.where(
+            currents > 1.0e-6,
+            safe_currents / torch.clamp(currents, min=1.0e-6),
+            torch.where(safe_currents > 1.0e-6, torch.ones_like(currents), torch.zeros_like(currents)),
         )
         return safe_currents, cap, scale, base, coupling
 
@@ -318,6 +420,7 @@ class SafetyLayer:
         mask = self.tx_enabled * mask
         currents *= mask.astype(np.float32)
         masked_current_total = float(np.sum(currents))
+        active_mask = mask.astype(np.float32)
 
         total = float(np.sum(currents))
         if self.projection_mode in {"smooth", "smooth_relaxed", "thermal_cap"}:
@@ -363,6 +466,20 @@ class SafetyLayer:
             thermal_cap_scale = thermal_scale.astype(np.float32)
             soft_scale = thermal_scale.astype(np.float32)
             cutoff_scale = np.ones_like(currents, dtype=np.float32)
+        elif self.projection_mode == "qos_aware_hard_clip":
+            currents, thermal_cap_current, thermal_scale, thermal_base, thermal_source_term = self._qos_aware_hard_clip_np(
+                currents=currents,
+                target_total=bus_projected_current_total,
+                active_mask=active_mask,
+                temps=temps,
+                amb_temp=float(amb_temp),
+                gamma=float(gamma),
+                delta=float(delta),
+            )
+            T_pred = thermal_base + delta * self.tx_thermal_coeff * (currents**2)
+            thermal_cap_scale = thermal_scale.astype(np.float32)
+            soft_scale = thermal_scale.astype(np.float32)
+            cutoff_scale = np.ones_like(currents, dtype=np.float32)
         elif self.projection_mode == "dalal_safe":
             soft_scale = np.ones_like(currents, dtype=np.float32)
             cutoff_scale = np.ones_like(currents, dtype=np.float32)
@@ -371,7 +488,7 @@ class SafetyLayer:
             soft_scale = (T_pred <= self.thermal_safe).astype(np.float32)
             cutoff_scale = np.ones_like(currents, dtype=np.float32)
             thermal_scale = (T_pred <= self.thermal_safe).astype(np.float32)
-        if self.projection_mode not in {"dalal_safe", "thermal_cap"}:
+        if self.projection_mode not in {"dalal_safe", "thermal_cap", "qos_aware_hard_clip"}:
             currents *= thermal_scale
         projected_current_total = float(np.sum(currents))
         projection_compression_ratio = float(projected_current_total / max(raw_current_total, 1.0e-6))
@@ -451,6 +568,7 @@ class SafetyLayer:
         mask = tx_enabled * mask
         currents = currents * mask
         masked_current_total = currents.sum(dim=1)
+        active_mask = mask
 
         total = currents.sum(dim=1, keepdim=True)
         if self.projection_mode in {"smooth", "smooth_relaxed", "thermal_cap"}:
@@ -510,6 +628,22 @@ class SafetyLayer:
             thermal_cap_scale = thermal_scale
             soft_scale = thermal_scale
             cutoff_scale = torch.ones_like(currents)
+        elif self.projection_mode == "qos_aware_hard_clip":
+            currents, thermal_cap_current, thermal_scale, thermal_base, thermal_source_term = self._qos_aware_hard_clip_torch(
+                currents=currents,
+                target_total=bus_projected_current_total.view(-1, 1),
+                active_mask=active_mask,
+                temps=temps,
+                amb_temp=amb_temp,
+                gamma=gamma,
+                delta=delta,
+                current_max=current_max,
+                thermal_coeff=thermal_coeff,
+            )
+            T_pred = thermal_base + delta * thermal_coeff * (currents**2)
+            thermal_cap_scale = thermal_scale
+            soft_scale = thermal_scale
+            cutoff_scale = torch.ones_like(currents)
         elif self.projection_mode == "dalal_safe":
             soft_scale = torch.ones_like(currents)
             cutoff_scale = torch.ones_like(currents)
@@ -522,7 +656,7 @@ class SafetyLayer:
             soft_scale = (T_pred <= self.thermal_safe).to(lower_raw.dtype)
             cutoff_scale = torch.ones_like(currents)
             thermal_scale = (T_pred <= self.thermal_safe).to(lower_raw.dtype)
-        if self.projection_mode not in {"dalal_safe", "thermal_cap"}:
+        if self.projection_mode not in {"dalal_safe", "thermal_cap", "qos_aware_hard_clip"}:
             currents = currents * thermal_scale
         projected_current_total = currents.sum(dim=1)
         projection_compression_ratio = projected_current_total / torch.clamp(raw_current_total, min=1.0e-6)

@@ -246,3 +246,36 @@ def test_new_baselines_can_run_one_episode_smoke(tmp_path):
         assert np.isfinite(stats.bus_utilization)
         assert cfg["baseline_metadata"]["paper_inspired"] is True
         assert cfg["baseline_metadata"]["exact_reproduction"] is False
+
+
+def test_qos_aware_hard_clip_keeps_hard_feasible_current(tmp_path):
+    cfg = load_cfg("configs/default.yaml")
+    cfg = apply_common_settings(
+        copy.deepcopy(cfg),
+        meta_iters=1,
+        out_dir=tmp_path,
+        run_name="qos_aware_hard_clip_contract",
+        seed=101,
+        fast_mode=True,
+        use_curriculum=False,
+    )
+    apply_scenario(cfg, "hard_stress")
+    apply_variant(cfg, "hybrid")
+    apply_ablation(cfg, "qos_aware_hard_clip")
+    safety = SafetyLayer(cfg)
+
+    safe, _ = safety.project_np(
+        upper_raw=11,  # all sources + HY
+        lower_raw=np.ones(5, dtype=np.float32),
+        temps=np.asarray([45.0, 45.0, 45.0], dtype=np.float32),
+        amb_temp=float(cfg["env"]["amb_temp"]),
+        gamma=float(cfg["env"]["gamma"]),
+        delta=float(cfg["env"]["delta"]),
+        mem={"current_boost": 3, "dwell_count": int(cfg["safety"]["min_dwell_steps"])},
+    )
+    currents = np.asarray(safe["currents_exec"], dtype=np.float32)
+    assert cfg["safety"]["projection_mode"] == "qos_aware_hard_clip"
+    assert np.isfinite(currents).all()
+    assert currents.sum() > 0.0
+    assert currents.sum() <= cfg["safety"]["bus_current_max"] + 1.0e-5
+    assert float(np.max(safe["t_pred"])) <= cfg["safety"]["thermal_safe"] + 1.0e-4

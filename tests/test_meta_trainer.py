@@ -190,10 +190,17 @@ def test_meta_adaptation_diagnostics_outputs_meta_vs_wo_meta_rows(tmp_path):
     assert summary["diagnostic_contract"]["hybrid_meta"]["query_train_updates"] is False
     assert summary["diagnostic_contract"]["hybrid_meta_no_support_adapt"]["support_train_adapts"] is False
     assert summary["diagnostic_contract"]["hybrid_meta_no_support_adapt"]["same_checkpoint_as"] == "hybrid_meta"
+    assert summary["diagnostic_contract"]["hybrid_context_only"]["context_enabled"] is True
+    assert summary["diagnostic_contract"]["hybrid_context_only"]["explicit_inner_outer"] is False
+    assert summary["diagnostic_contract"]["hybrid_context_only"]["support_train_adapts"] is False
+    assert summary["diagnostic_contract"]["hybrid_context_only"]["query_train_updates"] is False
     assert summary["diagnostic_contract"]["hybrid_wo_meta"]["support_train_adapts"] is False
     assert "query_reward_delta_meta_minus_wo_meta" in summary["comparison"]
     assert "query_reward_delta_meta_minus_no_support_adapt" in summary["comparison"]
+    assert "query_reward_delta_meta_minus_context_only" in summary["comparison"]
+    assert "query_reward_delta_context_only_minus_wo_meta" in summary["comparison"]
     assert "few_shot_reward_gain_meta_minus_no_support_adapt" in summary["comparison"]
+    assert "few_shot_reward_gain_meta_minus_context_only" in summary["comparison"]
     assert summary["fixed_task_batch_hash"]
     assert summary["ordered_fixed_task_batch_hash"]
     assert "meta_query_reward_after_minus_before_support" in summary["comparison"]
@@ -203,6 +210,7 @@ def test_meta_adaptation_diagnostics_outputs_meta_vs_wo_meta_rows(tmp_path):
     assert "query_reward_after_support" in summary["adaptation_summary"]["hybrid_meta"]
     assert summary["adaptation_summary"]["hybrid_meta"]["query_has_support_context_fraction"] == 1.0
     assert summary["adaptation_summary"]["hybrid_meta_no_support_adapt"]["query_has_support_context_fraction"] == 1.0
+    assert summary["adaptation_summary"]["hybrid_context_only"]["query_has_support_context_fraction"] == 1.0
     assert summary["adaptation_summary"]["hybrid_wo_meta"]["query_has_support_context_fraction"] == 0.0
     assert "support_upper_delta_norm" in summary["adaptation_summary"]["hybrid_meta"]
     assert "support_lower_actor_delta_norm" in summary["adaptation_summary"]["hybrid_meta"]
@@ -218,6 +226,7 @@ def test_meta_adaptation_diagnostics_outputs_meta_vs_wo_meta_rows(tmp_path):
     assert {row["variant"] for row in rows} == {
         "hybrid_meta",
         "hybrid_meta_no_support_adapt",
+        "hybrid_context_only",
         "hybrid_wo_meta",
     }
     assert {row["phase"] for row in rows} == {"pre_query", "support", "query"}
@@ -225,7 +234,7 @@ def test_meta_adaptation_diagnostics_outputs_meta_vs_wo_meta_rows(tmp_path):
     pre_query = [row for row in rows if row["phase"] == "pre_query"]
     assert pre_query
     assert pre_query[0]["pre_query_eval_before_support"] == "True"
-    for variant in {"hybrid_meta", "hybrid_meta_no_support_adapt", "hybrid_wo_meta"}:
+    for variant in {"hybrid_meta", "hybrid_meta_no_support_adapt", "hybrid_context_only", "hybrid_wo_meta"}:
         before = [row for row in rows if row["variant"] == variant and row["phase"] == "pre_query"][0]
         after = [row for row in rows if row["variant"] == variant and row["phase"] == "query"][0]
         assert before["episode_seed"] == after["episode_seed"]
@@ -233,12 +242,17 @@ def test_meta_adaptation_diagnostics_outputs_meta_vs_wo_meta_rows(tmp_path):
     no_adapt_support = [
         row for row in rows if row["variant"] == "hybrid_meta_no_support_adapt" and row["phase"] == "support"
     ]
+    context_only_support = [
+        row for row in rows if row["variant"] == "hybrid_context_only" and row["phase"] == "support"
+    ]
     wo_support = [row for row in rows if row["variant"] == "hybrid_wo_meta" and row["phase"] == "support"]
     assert meta_support[0]["support_train_adapts"] == "True"
     assert no_adapt_support[0]["support_train_adapts"] == "False"
+    assert context_only_support[0]["support_train_adapts"] == "False"
     assert wo_support[0]["support_train_adapts"] == "False"
     assert int(meta_support[0]["context_history_len_before_query"]) > 0
     assert int(no_adapt_support[0]["context_history_len_before_query"]) > 0
+    assert int(context_only_support[0]["context_history_len_before_query"]) > 0
     assert int(wo_support[0]["context_history_len_before_query"]) == 0
     assert "support_parameter_delta_norm" in rows[0]
     assert "support_upper_delta_norm" in rows[0]

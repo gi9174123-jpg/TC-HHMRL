@@ -110,6 +110,35 @@ def apply_strict_meta_protocol(cfg: Dict) -> None:
     ckpt_cfg["eval_eps"] = 3
 
 
+def apply_online_meta_protocol(cfg: Dict) -> None:
+    """Restore the main-paper online adaptation protocol explicitly.
+
+    The repository default can be switched to strict support-query diagnostics
+    during development. Formal main-paper comparisons should not depend on that
+    mutable default, so runners can call this helper to pin the online
+    adaptation protocol used by the main benchmark pool.
+    """
+    meta_cfg = cfg.setdefault("meta", {})
+    meta_cfg["n_tasks_per_iter"] = 6
+    meta_cfg["support_episodes"] = 3
+    meta_cfg["query_episodes"] = 2
+    meta_cfg["explicit_inner_outer"] = True
+    meta_cfg["outer_step_size"] = 0.15
+    meta_cfg["query_updates_enabled"] = True
+    meta_cfg["query_context_updates_enabled"] = True
+    meta_cfg["protocol_name"] = "online_adaptation_main"
+    cfg.setdefault("buffer", {})["context_max_len"] = max(
+        int(cfg.get("buffer", {}).get("context_max_len", 0)),
+        int(cfg.get("env", {}).get("episode_len", 80))
+        * (int(meta_cfg["support_episodes"]) + int(meta_cfg["query_episodes"])),
+    )
+    ckpt_cfg = meta_cfg.setdefault("checkpoint_selection", {})
+    ckpt_cfg["enabled"] = True
+    ckpt_cfg["mode"] = "heldout_eval"
+    ckpt_cfg["eval_tasks"] = 8
+    ckpt_cfg["eval_eps"] = 2
+
+
 def infer_task_source(cfg: Dict) -> str:
     site_bank = cfg.get("sampler", {}).get("site_bank", [])
     return "site_bank" if site_bank else "global_fallback"
@@ -276,6 +305,17 @@ def apply_ablation(cfg: Dict, ablation: str) -> None:
     if ablation == "hard_clip":
         cfg.setdefault("safety", {})["projection_mode"] = "hard_clip"
         return
+    if ablation == "qos_aware_hard_clip":
+        cfg.setdefault("safety", {})["projection_mode"] = "qos_aware_hard_clip"
+        cfg["pilot_metadata"] = {
+            "projection_variant": "qos_aware_hard_clip",
+            "pilot_only": False,
+            "formal_ranking_exclude": False,
+            "comparison_role": "fair_hard_projection_baseline",
+            "oracle_future_disturbances": False,
+            "qos_recovery_rule": "current_recovery_to_active_sources_with_thermal_and_bus_headroom",
+        }
+        return
     if ablation == "smooth_relaxed":
         cfg.setdefault("safety", {})["projection_mode"] = "smooth_relaxed"
         cfg.setdefault("safety", {})["smooth_relaxed_margin_c"] = float(
@@ -322,6 +362,23 @@ PAPER_BASELINE_EXPLANATIONS: Dict[str, Dict[str, str]] = {
         "not_exact_reproduction_reason": (
             "the original point-to-point beam-divergence control is adapted to the project fixed multi-source "
             "heterogeneous transmitter and common safety protocol"
+        ),
+    },
+    "shin2024_adapted_codebook_tuned": {
+        "paper_core_mechanism": (
+            "hierarchical DQN-DDPG for underwater SLIPT: transmitter-side optical control "
+            "and receiver-side TS/PS ratio control for the EH-SE trade-off"
+        ),
+        "adapted_mapping_to_tc_hhmrl": (
+            "beam-divergence control is mapped to boost_combo x source-aware intensity codeword "
+            "on the fixed [LED,LD,LD] transmitter; lower DDPG learns rho/tau only and execution is HY"
+        ),
+        "domain_match": "underwater_slipt_same_domain_adapted_to_fixed_hybrid_tx",
+        "environment_dependency": "performance depends on underwater channel, QoS target, EH scale, and thermal-cap projection",
+        "not_exact_reproduction_reason": (
+            "the original point-to-point beam-divergence control is adapted to the project fixed multi-source "
+            "heterogeneous transmitter and common safety protocol; tuned variant keeps the same action contract "
+            "and only changes a pre-registered validation-selected codebook / learning-rate scale"
         ),
     },
     "uysal_policy_optimizer": {
@@ -463,7 +520,8 @@ def apply_baseline_overrides(cfg: Dict, baseline: str) -> None:
         }
         cfg["agent"]["batch_size"] = 64
         return
-    if baseline == "shin2024_adapted_codebook":
+    if baseline in {"shin2024_adapted_codebook", "shin2024_adapted_codebook_tuned"}:
+        tuned = baseline == "shin2024_adapted_codebook_tuned"
         cfg.setdefault("context", {})["enabled"] = False
         cfg.setdefault("agent", {})["z_dim"] = 0
         cfg.setdefault("meta", {})["explicit_inner_outer"] = False
@@ -472,11 +530,16 @@ def apply_baseline_overrides(cfg: Dict, baseline: str) -> None:
         cfg["meta"]["dual_lr"] = 0.0
         cfg["meta"]["dual_lrs"] = [0.0] * len(cfg["meta"].get("dual_names", []))
         cfg.setdefault("upper_dqn", {})
+        tuned_cfg = cfg.setdefault("baselines", {}).setdefault("shin2024_adapted_codebook_tuned", {})
+        lr_scale = float(tuned_cfg.get("ddpg_lr_scale", 1.0)) if tuned else 1.0
         cfg["upper_dqn"]["lr"] = 1.0e-4
         cfg["upper_dqn"]["epsilon_start"] = 0.01
         cfg["upper_dqn"]["epsilon_final"] = 0.01
         cfg["upper_dqn"]["replay_size"] = 2000
-        shin_cfg = cfg.setdefault("baselines", {}).setdefault("shin2024_adapted_codebook", {})
+        shin_cfg = cfg.setdefault("baselines", {}).setdefault(
+            "shin2024_adapted_codebook_tuned" if tuned else "shin2024_adapted_codebook",
+            {},
+        )
         current_template_codeword_names = list(
             shin_cfg.get("current_template_codeword_names", ["low_safe", "balanced", "high_performance"])
         )
@@ -499,8 +562,8 @@ def apply_baseline_overrides(cfg: Dict, baseline: str) -> None:
                 "current_template_codewords": current_template_codewords,
                 "replay_size": int(1.0e6),
                 "batch_size": 64,
-                "actor_lr": 1.0e-4,
-                "critic_lr": 3.0e-4,
+                "actor_lr": 1.0e-4 * lr_scale,
+                "critic_lr": 3.0e-4 * lr_scale,
                 "gamma": 0.99,
                 "target_tau": 0.2,
                 "noise_std": 0.10,
@@ -508,10 +571,10 @@ def apply_baseline_overrides(cfg: Dict, baseline: str) -> None:
             }
         )
         cfg["baseline_metadata"] = {
-            "baseline_family": "shin2024_adapted_codebook",
+            "baseline_family": "shin2024_adapted_codebook_tuned" if tuned else "shin2024_adapted_codebook",
             "paper_inspired": True,
             "exact_reproduction": False,
-            **paper_baseline_explanation("shin2024_adapted_codebook"),
+            **paper_baseline_explanation("shin2024_adapted_codebook_tuned" if tuned else "shin2024_adapted_codebook"),
             "original_algorithm_structure": "hierarchical_dqn_ddpg",
             "upper_action_contract": "boost_combo_intensity_codeword",
             "lower_action_contract": "rho_tau_only",
@@ -522,6 +585,9 @@ def apply_baseline_overrides(cfg: Dict, baseline: str) -> None:
             "current_template_codeword_names": current_template_codeword_names,
             "current_template_codewords": current_template_codewords,
             "source_aware_current_codewords": True,
+            "validation_tuned": bool(tuned),
+            "ddpg_lr_scale": float(lr_scale),
+            "tuning_scope": "source_aware_codebook_and_ddpg_lr_scale_only" if tuned else "none",
             "mapped_original_control": "beam_divergence_angle_to_source_intensity_codeword",
             "rho_symbol_mapping": "paper_rho_is_id_fraction; env_rho_exec_is_eh_fraction; paper_rho=1-env_rho_exec",
             "tau_symbol_mapping": "paper_tau_and_env_tau_exec_are_id_time_fraction",
@@ -531,7 +597,7 @@ def apply_baseline_overrides(cfg: Dict, baseline: str) -> None:
             "uses_learned_policy": True,
             "uses_same_safety_projection": True,
             "safety_protocol": f"common_{cfg.get('safety', {}).get('projection_mode', 'thermal_cap')}_projection_for_evaluation",
-            "comparison_role": "prior_study_inspired_adapted_baseline",
+            "comparison_role": "prior_study_inspired_adapted_baseline_tuned" if tuned else "prior_study_inspired_adapted_baseline",
         }
         cfg["agent"]["batch_size"] = 64
         return
@@ -3586,6 +3652,7 @@ STRUCTURAL_VARIANT_ORDER = (
     "single_led",
     "single_ld",
     "shin2024_adapted_codebook",
+    "shin2024_adapted_codebook_tuned",
     "shin2024_matched",
     "uysal_policy_optimizer",
     "mpc_grid",
@@ -3599,9 +3666,11 @@ HARD_TARGETED_VARIANT_ORDER = (
     "hybrid_wo_meta",
     "hybrid_wo_lagrangian",
     "hybrid_hard_clip",
+    "hybrid_qos_aware_hard_clip",
     "heuristic_safe",
     "sac_lagrangian",
     "shin2024_adapted_codebook",
+    "shin2024_adapted_codebook_tuned",
     "shin2024_matched",
     "uysal_policy_optimizer",
     "mpc_grid",
@@ -3616,8 +3685,10 @@ THERMAL_VARIANT_ORDER = (
     "hybrid",
     "hybrid_wo_lagrangian",
     "hybrid_hard_clip",
+    "hybrid_qos_aware_hard_clip",
     "sac_lagrangian",
     "shin2024_adapted_codebook",
+    "shin2024_adapted_codebook_tuned",
     "shin2024_matched",
     "uysal_policy_optimizer",
     "mpc_grid",
@@ -3948,6 +4019,7 @@ def run_one_scenario(
             "sac_lagrangian",
             "sac_dalal_safe",
             "shin2024_adapted_codebook",
+            "shin2024_adapted_codebook_tuned",
             "shin2024_matched",
             "dalal2018_safe",
             "mpc_lite_oracle",
@@ -3965,7 +4037,7 @@ def run_one_scenario(
         elif baseline in {"sac_lagrangian", "sac_dalal_safe"}:
             runner = "sac_lagrangian"
             baseline_override = baseline
-        elif baseline in {"shin2024_matched", "shin2024_adapted_codebook"}:
+        elif baseline in {"shin2024_matched", "shin2024_adapted_codebook", "shin2024_adapted_codebook_tuned"}:
             runner = baseline
             baseline_override = baseline
         elif baseline in {"mpc_lite_oracle", "mpc_lite"}:
@@ -4098,7 +4170,7 @@ def run_one_scenario(
 
             if runner == "sac_lagrangian":
                 trainer = SacLagrangianBaseline(cfg)
-            elif runner in {"shin2024_matched", "shin2024_adapted_codebook"}:
+            elif runner in {"shin2024_matched", "shin2024_adapted_codebook", "shin2024_adapted_codebook_tuned"}:
                 trainer = Shin2024MatchedBaseline(cfg)
             elif runner == "mpc_lite":
                 trainer = MpcLiteOracleBaseline(cfg)
@@ -4150,7 +4222,7 @@ def run_one_scenario(
                 )
                 if ckpt_pick.get("selected_path"):
                     trainer.agent.load(ckpt_pick["selected_path"])
-            elif runner in {"sac_lagrangian", "shin2024_matched", "shin2024_adapted_codebook"}:
+            elif runner in {"sac_lagrangian", "shin2024_matched", "shin2024_adapted_codebook", "shin2024_adapted_codebook_tuned"}:
                 train_csv = trainer.train(meta_iters=meta_iters)
 
                 run_df = pd.read_csv(train_csv)
@@ -4226,7 +4298,7 @@ def run_one_scenario(
                     tasks=env_task_subset,
                     episodes_per_task=env_eps,
                 )
-            elif runner in {"sac_lagrangian", "shin2024_matched", "shin2024_adapted_codebook"}:
+            elif runner in {"sac_lagrangian", "shin2024_matched", "shin2024_adapted_codebook", "shin2024_adapted_codebook_tuned"}:
                 ev = evaluate_plain_hierarchical_baseline_on_tasks(
                     trainer=trainer,
                     cfg=cfg,
@@ -4640,16 +4712,18 @@ def run_one_scenario(
                     else "Literature-style SAC-Lagrangian baseline on the fixed heterogeneous hybrid structure, without context latent z or inner/outer meta adaptation"
                 ),
             }
-        elif runner == "shin2024_adapted_codebook":
+        elif runner in {"shin2024_adapted_codebook", "shin2024_adapted_codebook_tuned"}:
+            tuned = runner == "shin2024_adapted_codebook_tuned"
             variant_definitions[label] = {
-                "runner": "shin2024_adapted_codebook",
+                "runner": runner,
                 "base_variant": variant,
                 "ablation": ablation,
                 "tx_device": ["LED", "LD", "LD"],
                 "tx_enabled": [1.0, 1.0, 1.0],
-                "baseline_family": "shin2024_adapted_codebook",
+                "baseline_family": "shin2024_adapted_codebook_tuned" if tuned else "shin2024_adapted_codebook",
                 "paper_inspired": True,
                 "exact_reproduction": False,
+                "validation_tuned": bool(tuned),
                 "original_algorithm_structure": "hierarchical_dqn_ddpg",
                 "upper_action_contract": "boost_combo_intensity_codeword",
                 "lower_action_contract": "rho_tau_only",
@@ -4664,8 +4738,12 @@ def run_one_scenario(
                 "shared_lagrangian": False,
                 "uses_same_safety_projection": True,
                 "safety_protocol": f"{common_projection_protocol}_for_evaluation",
-                "comparison_role": "prior_study_inspired_adapted_baseline",
-                "description": "Shin 2024-adapted hierarchical DQN-DDPG baseline: upper DQN selects boost/current-template codebook entries, lower DDPG learns only rho/tau, and execution is fixed to HY under the shared safety projection.",
+                "comparison_role": "prior_study_inspired_adapted_baseline_tuned" if tuned else "prior_study_inspired_adapted_baseline",
+                "description": (
+                    "Validation-tuned Shin 2024-adapted hierarchical DQN-DDPG baseline under the same action contract."
+                    if tuned
+                    else "Shin 2024-adapted hierarchical DQN-DDPG baseline: upper DQN selects boost/current-template codebook entries, lower DDPG learns only rho/tau, and execution is fixed to HY under the shared safety projection."
+                ),
             }
         elif runner == "shin2024_matched":
             variant_definitions[label] = {
@@ -4900,10 +4978,15 @@ def run_benchmark(
     safety_projection_version: str | None = None,
     physics_eh_model: str | None = None,
     strict_meta: bool = False,
+    online_meta: bool = False,
 ) -> Path:
     base_cfg = apply_cli_overrides(load_cfg(cfg_path), device=device)
+    if strict_meta and online_meta:
+        raise ValueError("--strict-meta and --online-meta are mutually exclusive")
     if strict_meta:
         apply_strict_meta_protocol(base_cfg)
+    if online_meta:
+        apply_online_meta_protocol(base_cfg)
     effective_meta_iters = int(meta_iters if meta_iters is not None else base_cfg.get("meta", {}).get("meta_iters", 45))
     base_cfg.setdefault("meta", {})["meta_iters"] = effective_meta_iters
     if thermal_model is not None:
@@ -5051,6 +5134,7 @@ def run_benchmark(
             )
         ),
         "strict_meta": bool(strict_meta or str(base_cfg.get("meta", {}).get("protocol_name", "")) == "strict_support_query"),
+        "online_meta": bool(online_meta or str(base_cfg.get("meta", {}).get("protocol_name", "")) == "online_adaptation_main"),
         "fast_mode": bool(fast_mode),
         "use_curriculum": bool(use_curriculum),
         "shared_init": bool(shared_init),
@@ -5115,6 +5199,11 @@ def parse_args() -> argparse.Namespace:
         help="Force the strict support-query protocol: 5 support episodes, 2 held-out query episodes, no query updates, and 10x3 checkpoint selection.",
     )
     parser.add_argument(
+        "--online-meta",
+        action="store_true",
+        help="Force the main-paper online adaptation protocol: 3 support episodes, 2 query episodes, query updates enabled, and 8x2 checkpoint selection.",
+    )
+    parser.add_argument(
         "--fast-mode",
         action="store_true",
         help="Use reduced workload for quick smoke benchmarks.",
@@ -5149,7 +5238,15 @@ def parse_args() -> argparse.Namespace:
         type=str,
         nargs="+",
         default=["full"],
-        choices=["full", "wo_meta", "wo_lagrangian", "hard_clip", "smooth_relaxed", "thermal_cap"],
+        choices=[
+            "full",
+            "wo_meta",
+            "wo_lagrangian",
+            "hard_clip",
+            "qos_aware_hard_clip",
+            "smooth_relaxed",
+            "thermal_cap",
+        ],
         help="Ablation settings applied on top of each selected variant.",
     )
     parser.add_argument(
@@ -5162,6 +5259,7 @@ def parse_args() -> argparse.Namespace:
             "sac_lagrangian",
             "sac_dalal_safe",
             "shin2024_adapted_codebook",
+            "shin2024_adapted_codebook_tuned",
             "shin2024_matched",
             "dalal2018_safe",
             "mpc_lite_oracle",
@@ -5246,6 +5344,7 @@ def main() -> None:
         safety_projection_version=args.safety_projection_version,
         physics_eh_model=args.physics_eh_model,
         strict_meta=args.strict_meta,
+        online_meta=args.online_meta,
     )
 
 
