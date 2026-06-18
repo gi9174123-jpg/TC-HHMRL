@@ -7,11 +7,28 @@ from pathlib import Path
 
 import pandas as pd
 
+from scripts.benchmark_constraint_scenarios import _apply_holm_correction, _paired_diff_stats
 from scripts.meta_adaptation_diagnostics import run_meta_adaptation_diagnostics
 
 
 DEFAULT_SEEDS = [101, 202, 303, 404, 505, 606, 707, 808, 909, 1001]
 DEFAULT_SCENARIOS = ["moderate_practical", "hard_stress"]
+VARIANT_ORDER = [
+    "hybrid_meta",
+    "hybrid_meta_no_support_adapt",
+    "hybrid_context_only",
+    "hybrid_wo_meta",
+]
+PAIRWISE_METRICS = [
+    "query_reward_after_support",
+    "query_reward_after_minus_before_support",
+    "query_violation_after_support",
+    "query_violation_after_minus_before_support",
+    "support_parameter_delta_norm",
+    "support_lower_update_delta",
+    "context_history_len_before_query",
+    "query_has_support_context_fraction",
+]
 
 
 def _flatten_adaptation_summary(summary: dict) -> list[dict]:
@@ -38,6 +55,57 @@ def _flatten_adaptation_summary(summary: dict) -> list[dict]:
                 row[f"comparison__{key}"] = float(val)
         rows.append(row)
     return rows
+
+
+def _pair_key(row: pd.Series) -> tuple:
+    return (
+        str(row["scenario"]),
+        int(row["seed"]),
+        str(row.get("fixed_task_batch_hash", "")),
+        str(row.get("ordered_fixed_task_batch_hash", "")),
+    )
+
+
+def _build_pairwise_stats(seed_df: pd.DataFrame) -> pd.DataFrame:
+    rows: list[dict] = []
+    if seed_df.empty:
+        return pd.DataFrame()
+
+    for scenario, scenario_df in seed_df.groupby("scenario"):
+        present = [variant for variant in VARIANT_ORDER if variant in set(scenario_df["variant"].astype(str))]
+        scenario_rows: list[dict] = []
+        for metric in PAIRWISE_METRICS:
+            if metric not in scenario_df.columns:
+                continue
+            for left_idx in range(len(present)):
+                for right_idx in range(left_idx + 1, len(present)):
+                    left_variant = present[left_idx]
+                    right_variant = present[right_idx]
+                    left_map = {
+                        _pair_key(row): float(row[metric])
+                        for _, row in scenario_df[scenario_df["variant"] == left_variant].iterrows()
+                        if pd.notna(row.get(metric))
+                    }
+                    right_map = {
+                        _pair_key(row): float(row[metric])
+                        for _, row in scenario_df[scenario_df["variant"] == right_variant].iterrows()
+                        if pd.notna(row.get(metric))
+                    }
+                    common_keys = sorted(set(left_map) & set(right_map))
+                    diffs = [left_map[key] - right_map[key] for key in common_keys]
+                    scenario_rows.append(
+                        {
+                            "scenario": scenario,
+                            "metric": metric,
+                            "left_variant": left_variant,
+                            "right_variant": right_variant,
+                            "pairing_key_fields": "scenario,seed,fixed_task_batch_hash,ordered_fixed_task_batch_hash",
+                            **_paired_diff_stats(diffs),
+                        }
+                    )
+        _apply_holm_correction(scenario_rows)
+        rows.extend(scenario_rows)
+    return pd.DataFrame(rows)
 
 
 def main() -> None:
@@ -120,6 +188,10 @@ def main() -> None:
     stats_csv = root / "meta_context_variant_stats.csv"
     stats_df.to_csv(stats_csv, index=False)
 
+    pairwise_df = _build_pairwise_stats(seed_df)
+    pairwise_csv = root / "meta_context_pairwise_stats.csv"
+    pairwise_df.to_csv(pairwise_csv, index=False)
+
     episode_csv = root / "meta_context_episode_metrics.csv"
     if episode_frames:
         pd.concat(episode_frames, ignore_index=True).to_csv(episode_csv, index=False)
@@ -139,16 +211,12 @@ def main() -> None:
         "query_episodes": int(args.query_episodes),
         "episode_len": int(args.episode_len),
         "device": str(args.device),
-        "variants": [
-            "hybrid_meta",
-            "hybrid_meta_no_support_adapt",
-            "hybrid_context_only",
-            "hybrid_wo_meta",
-        ],
+        "variants": list(VARIANT_ORDER),
         "purpose": "meta_context_causal_diagnostic",
         "artifacts": {
             "seed_summary_csv": str(seed_csv),
             "variant_stats_csv": str(stats_csv),
+            "pairwise_stats_csv": str(pairwise_csv),
             "episode_metrics_csv": str(episode_csv),
         },
         "summaries": summaries,
