@@ -16,6 +16,7 @@ DEFAULT_SCENARIOS = ["moderate_practical", "hard_stress"]
 VARIANT_ORDER = [
     "hybrid_meta",
     "hybrid_meta_no_support_adapt",
+    "hybrid_meta_support_gated",
     "hybrid_context_only",
     "hybrid_wo_meta",
 ]
@@ -28,6 +29,10 @@ PAIRWISE_METRICS = [
     "support_lower_update_delta",
     "context_history_len_before_query",
     "query_has_support_context_fraction",
+    "support_gate_accept_rate",
+    "support_gate_context_only_rate",
+    "support_gate_no_support_rate",
+    "support_gate_score_delta",
 ]
 
 
@@ -116,9 +121,9 @@ def main() -> None:
     parser.add_argument("--seeds", nargs="+", type=int, default=DEFAULT_SEEDS)
     parser.add_argument("--train-iters", type=int, default=45)
     parser.add_argument("--tasks", type=int, default=8)
-    parser.add_argument("--pre-query-episodes", type=int, default=2)
-    parser.add_argument("--support-episodes", type=int, default=5)
-    parser.add_argument("--query-episodes", type=int, default=2)
+    parser.add_argument("--pre-query-episodes", type=int, default=3)
+    parser.add_argument("--support-episodes", type=int, default=6)
+    parser.add_argument("--query-episodes", type=int, default=3)
     parser.add_argument("--episode-len", type=int, default=80)
     parser.add_argument("--device", default="auto")
     parser.add_argument("--fast-mode", action="store_true")

@@ -4,6 +4,7 @@ import argparse
 import copy
 import csv
 import json
+import random
 from collections import defaultdict
 from pathlib import Path
 from typing import Dict, Iterable, List
@@ -46,6 +47,15 @@ ROW_FIELDS = [
     "context_enabled",
     "explicit_inner_outer",
     "support_train_adapts",
+    "support_gate_enabled",
+    "support_gate_validation",
+    "support_gate_accepted",
+    "support_gate_selected",
+    "support_gate_metric",
+    "support_gate_score_no_context",
+    "support_gate_score_before",
+    "support_gate_score_after",
+    "support_gate_score_delta",
     "query_eval_after_support",
     "pre_query_eval_before_support",
     "support_global_step_delta",
@@ -116,6 +126,30 @@ def _module_delta_summary(base_state: Dict, current_state: Dict) -> Dict[str, fl
     }
 
 
+def _snapshot_context(trainer: MetaTrainer) -> List[Dict]:
+    return copy.deepcopy(trainer.agent.episode.as_list())
+
+
+def _restore_context(trainer: MetaTrainer, context_items: List[Dict]) -> None:
+    trainer.agent.episode.clear()
+    for item in context_items:
+        trainer.agent.episode.add(copy.deepcopy(item))
+
+
+def _gate_score(stats: EpisodeStats) -> float:
+    # Use the same shaped episode reward used by the diagnostic; query rollouts
+    # are never consulted by the gate.
+    return float(stats.reward)
+
+
+def _set_episode_seed(seed: int) -> None:
+    random.seed(int(seed))
+    np.random.seed(int(seed) % (2**32 - 1))
+    torch.manual_seed(int(seed))
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(int(seed))
+
+
 def _episode_row(
     *,
     scenario: str,
@@ -131,6 +165,15 @@ def _episode_row(
     context_enabled: bool,
     explicit_inner_outer: bool,
     support_train_adapts: bool,
+    support_gate_enabled: bool = False,
+    support_gate_validation: bool = False,
+    support_gate_accepted: bool = False,
+    support_gate_selected: str = "",
+    support_gate_metric: str = "",
+    support_gate_score_no_context: float = 0.0,
+    support_gate_score_before: float = 0.0,
+    support_gate_score_after: float = 0.0,
+    support_gate_score_delta: float = 0.0,
     support_global_step_delta: int = 0,
     support_lower_update_delta: int = 0,
     support_upper_update_delta: int = 0,
@@ -168,6 +211,15 @@ def _episode_row(
         "context_enabled": bool(context_enabled),
         "explicit_inner_outer": bool(explicit_inner_outer),
         "support_train_adapts": bool(support_train_adapts),
+        "support_gate_enabled": bool(support_gate_enabled),
+        "support_gate_validation": bool(support_gate_validation),
+        "support_gate_accepted": bool(support_gate_accepted),
+        "support_gate_selected": str(support_gate_selected),
+        "support_gate_metric": str(support_gate_metric),
+        "support_gate_score_no_context": float(support_gate_score_no_context),
+        "support_gate_score_before": float(support_gate_score_before),
+        "support_gate_score_after": float(support_gate_score_after),
+        "support_gate_score_delta": float(support_gate_score_delta),
         "query_eval_after_support": phase == "query",
         "pre_query_eval_before_support": phase == "pre_query",
         "support_global_step_delta": int(support_global_step_delta),
@@ -239,6 +291,8 @@ def _collect_variant_rows(
     query_episodes: int,
     pre_query_episodes: int,
     support_train_override: bool | None = None,
+    support_gate_enabled: bool = False,
+    support_gate_validation_episodes: int = 1,
 ) -> List[Dict[str, object]]:
     base_state = trainer.agent.snapshot_train_state()
     base_dual_state = copy.deepcopy(trainer.dual.state_dict())
@@ -263,7 +317,6 @@ def _collect_variant_rows(
         trainer.dual.load_state_dict(copy.deepcopy(base_dual_state))
         trainer.agent.clear_learning_buffers()
 
-        env = MultiTxUwSliptEnv(cfg, overrides=task.to_env_overrides())
         site_id = int(getattr(task, "site_id", -1))
         support_stats: List[EpisodeStats] = []
         episode_global = 0
@@ -271,6 +324,8 @@ def _collect_variant_rows(
 
         for ep_idx in range(int(pre_query_episodes)):
             episode_seed = int(seed + task_id * 10_000 + ep_idx)
+            _set_episode_seed(episode_seed)
+            env = MultiTxUwSliptEnv(cfg, overrides=task.to_env_overrides())
             env.rng = np.random.default_rng(episode_seed)
             stats = trainer._run_episode(env, train=False, clear_context=(ep_idx == 0))
             rows.append(
@@ -292,12 +347,29 @@ def _collect_variant_rows(
             )
             episode_global += 1
 
-        env = MultiTxUwSliptEnv(cfg, overrides=task.to_env_overrides())
         trainer.agent.reset_rollout_state(clear_context=True)
         task_row_start = len(rows)
 
-        for ep_idx in range(int(support_episodes)):
+        gate_active = bool(support_gate_enabled and support_train_adapts and int(support_episodes) >= 2)
+        gate_validation_episodes = int(np.clip(int(support_gate_validation_episodes), 1, max(1, int(support_episodes) - 1)))
+        n_adapt_support = int(support_episodes) - gate_validation_episodes if gate_active else int(support_episodes)
+        support_context_snapshot: List[Dict] = []
+        adapted_state: Dict | None = None
+        adapted_dual_state: Dict | None = None
+        gate_stats_no_context: EpisodeStats | None = None
+        gate_stats_context_only: EpisodeStats | None = None
+        gate_stats_after: EpisodeStats | None = None
+        gate_accepted = False
+        gate_selected = ""
+        gate_score_no_context = 0.0
+        gate_score_before = 0.0
+        gate_score_after = 0.0
+        gate_score_delta = 0.0
+
+        for ep_idx in range(n_adapt_support):
             episode_seed = int(seed + task_id * 10_000 + 1_000 + ep_idx)
+            _set_episode_seed(episode_seed)
+            env = MultiTxUwSliptEnv(cfg, overrides=task.to_env_overrides())
             env.rng = np.random.default_rng(episode_seed)
             stats = trainer._run_episode(
                 env,
@@ -324,12 +396,144 @@ def _collect_variant_rows(
             )
             episode_global += 1
 
-        if support_train_adapts and trainer.dual_enabled and support_stats:
+        if gate_active:
+            support_context_snapshot = _snapshot_context(trainer)
+            adapted_state = trainer.agent.snapshot_train_state()
+            adapted_dual_state = copy.deepcopy(trainer.dual.state_dict())
+            validation_seeds = [
+                int(seed + task_id * 10_000 + 1_000 + n_adapt_support + val_idx)
+                for val_idx in range(gate_validation_episodes)
+            ]
+
+            def _score_candidate(
+                *,
+                train_state: Dict,
+                dual_state: Dict,
+                context_items: List[Dict],
+                clear_context: bool,
+            ) -> float:
+                scores: List[float] = []
+                for validation_seed in validation_seeds:
+                    _set_episode_seed(validation_seed)
+                    trainer.agent.restore_train_state(train_state)
+                    trainer.dual.load_state_dict(copy.deepcopy(dual_state))
+                    if clear_context:
+                        trainer.agent.episode.clear()
+                    else:
+                        _restore_context(trainer, context_items)
+                    gate_env = MultiTxUwSliptEnv(cfg, overrides=task.to_env_overrides())
+                    gate_env.rng = np.random.default_rng(validation_seed)
+                    stats_val = trainer._run_episode(gate_env, train=False, clear_context=clear_context)
+                    scores.append(_gate_score(stats_val))
+                return _mean(scores)
+
+            gate_score_no_context = _score_candidate(
+                train_state=base_state,
+                dual_state=base_dual_state,
+                context_items=[],
+                clear_context=True,
+            )
+            gate_score_before = _score_candidate(
+                train_state=base_state,
+                dual_state=base_dual_state,
+                context_items=support_context_snapshot,
+                clear_context=False,
+            )
+            gate_score_after = _score_candidate(
+                train_state=adapted_state,
+                dual_state=adapted_dual_state,
+                context_items=support_context_snapshot,
+                clear_context=False,
+            )
+            candidates = {
+                "no_support": gate_score_no_context,
+                "context_only": gate_score_before,
+                "adapted": gate_score_after,
+            }
+            if gate_score_after >= gate_score_no_context and gate_score_after >= gate_score_before:
+                gate_selected = "adapted"
+            elif gate_score_before >= gate_score_no_context:
+                gate_selected = "context_only"
+            else:
+                gate_selected = "no_support"
+            selected_score = float(candidates[gate_selected])
+            gate_score_delta = float(selected_score - gate_score_no_context)
+            gate_accepted = gate_selected == "adapted"
+
+            if gate_selected == "adapted":
+                trainer.agent.restore_train_state(adapted_state)
+                trainer.dual.load_state_dict(copy.deepcopy(adapted_dual_state))
+                _restore_context(trainer, support_context_snapshot)
+                validation_clear_context = False
+            elif gate_selected == "context_only":
+                trainer.agent.restore_train_state(base_state)
+                trainer.agent.upper.update_steps = base_upper_steps
+                trainer.agent.lower.update_steps = base_lower_steps
+                trainer.dual.load_state_dict(copy.deepcopy(base_dual_state))
+                _restore_context(trainer, support_context_snapshot)
+                validation_clear_context = False
+            else:
+                trainer.agent.restore_train_state(base_state)
+                trainer.agent.upper.update_steps = base_upper_steps
+                trainer.agent.lower.update_steps = base_lower_steps
+                trainer.dual.load_state_dict(copy.deepcopy(base_dual_state))
+                trainer.agent.episode.clear()
+                validation_clear_context = True
+
+            for val_idx, validation_seed in enumerate(validation_seeds):
+                _set_episode_seed(validation_seed)
+                gate_env = MultiTxUwSliptEnv(cfg, overrides=task.to_env_overrides())
+                gate_env.rng = np.random.default_rng(validation_seed)
+                validation_stats = trainer._run_episode(
+                    gate_env,
+                    train=False,
+                    clear_context=validation_clear_context and val_idx == 0,
+                )
+                if gate_selected == "no_support":
+                    trainer.agent.episode.clear()
+                support_stats.append(validation_stats)
+                rows.append(
+                    _episode_row(
+                        scenario=scenario,
+                        seed=seed,
+                        variant=variant,
+                        task_id=task_id,
+                        site_id=site_id,
+                        phase="support",
+                        episode_in_phase=n_adapt_support + val_idx,
+                        episode_global=episode_global,
+                        episode_seed=validation_seed,
+                        stats=validation_stats,
+                        context_enabled=context_enabled,
+                        explicit_inner_outer=explicit_inner_outer,
+                        support_train_adapts=False,
+                        support_gate_enabled=True,
+                        support_gate_validation=True,
+                        support_gate_accepted=gate_accepted,
+                        support_gate_selected=gate_selected,
+                        support_gate_metric="support_validation_reward",
+                        support_gate_score_no_context=gate_score_no_context,
+                        support_gate_score_before=gate_score_before,
+                        support_gate_score_after=selected_score,
+                        support_gate_score_delta=gate_score_delta,
+                    )
+                )
+                episode_global += 1
+
+        if support_train_adapts and trainer.dual_enabled and support_stats and (not gate_active or gate_accepted):
             mean_cost_vec = np.mean(np.stack([s.cost_vec for s in support_stats], axis=0), axis=0)
             trainer.dual.update(mean_cost_vec)
 
         current_state = trainer.agent.snapshot_train_state()
         support_diag = {
+            "support_gate_enabled": gate_active,
+            "support_gate_accepted": gate_accepted,
+            "support_gate_selected": gate_selected,
+            "support_gate_metric": "support_validation_reward" if gate_active else "",
+            "support_gate_score_no_context": gate_score_no_context,
+            "support_gate_score_before": gate_score_before,
+            "support_gate_score_after": float(gate_score_no_context + gate_score_delta) if gate_active else gate_score_after,
+            "support_gate_score_delta": gate_score_delta,
             "support_global_step_delta": int(trainer.agent.global_step - base_global_step),
             "support_lower_update_delta": int(trainer.agent.lower.update_steps - base_lower_steps),
             "support_upper_update_delta": int(trainer.agent.upper.update_steps - base_upper_steps),
@@ -342,6 +546,15 @@ def _collect_variant_rows(
         }
         for row in rows[task_row_start:]:
             row.update(support_diag)
+            if bool(row.get("support_gate_validation", False)):
+                row["support_gate_enabled"] = True
+                row["support_gate_accepted"] = gate_accepted
+                row["support_gate_selected"] = gate_selected
+                row["support_gate_metric"] = "support_validation_reward"
+                row["support_gate_score_no_context"] = gate_score_no_context
+                row["support_gate_score_before"] = gate_score_before
+                row["support_gate_score_after"] = float(gate_score_no_context + gate_score_delta)
+                row["support_gate_score_delta"] = gate_score_delta
 
         query_base_state = trainer.agent.snapshot_train_state()
         query_base_global_step = int(trainer.agent.global_step)
@@ -350,6 +563,8 @@ def _collect_variant_rows(
         query_row_start = len(rows)
         for ep_idx in range(int(query_episodes)):
             episode_seed = int(seed + task_id * 10_000 + ep_idx)
+            _set_episode_seed(episode_seed)
+            env = MultiTxUwSliptEnv(cfg, overrides=task.to_env_overrides())
             env.rng = np.random.default_rng(episode_seed)
             stats = trainer._run_episode(env, train=False, clear_context=(support_episodes <= 0 and ep_idx == 0))
             row = _episode_row(
@@ -402,14 +617,17 @@ def _summarize_rows(rows: List[Dict[str, object]]) -> Dict[str, object]:
         }
 
     meta_query = phase_summary.get("hybrid_meta_query", {})
+    gated_query = phase_summary.get("hybrid_meta_support_gated_query", {})
     meta_no_adapt_query = phase_summary.get("hybrid_meta_no_support_adapt_query", {})
     context_only_query = phase_summary.get("hybrid_context_only_query", {})
     wo_query = phase_summary.get("hybrid_wo_meta_query", {})
     meta_pre_query = phase_summary.get("hybrid_meta_pre_query", {})
+    gated_pre_query = phase_summary.get("hybrid_meta_support_gated_pre_query", {})
     meta_no_adapt_pre_query = phase_summary.get("hybrid_meta_no_support_adapt_pre_query", {})
     context_only_pre_query = phase_summary.get("hybrid_context_only_pre_query", {})
     wo_pre_query = phase_summary.get("hybrid_wo_meta_pre_query", {})
     meta_query_reward_gain = float(meta_query.get("reward", 0.0) - meta_pre_query.get("reward", 0.0))
+    gated_query_reward_gain = float(gated_query.get("reward", 0.0) - gated_pre_query.get("reward", 0.0))
     meta_no_adapt_query_reward_gain = float(
         meta_no_adapt_query.get("reward", 0.0) - meta_no_adapt_pre_query.get("reward", 0.0)
     )
@@ -422,6 +640,14 @@ def _summarize_rows(rows: List[Dict[str, object]]) -> Dict[str, object]:
         "query_reward_delta_meta_minus_no_support_adapt": float(
             meta_query.get("reward", 0.0) - meta_no_adapt_query.get("reward", 0.0)
         ),
+        "query_reward_delta_gated_minus_meta": float(gated_query.get("reward", 0.0) - meta_query.get("reward", 0.0)),
+        "query_reward_delta_gated_minus_no_support_adapt": float(
+            gated_query.get("reward", 0.0) - meta_no_adapt_query.get("reward", 0.0)
+        ),
+        "query_reward_delta_gated_minus_context_only": float(
+            gated_query.get("reward", 0.0) - context_only_query.get("reward", 0.0)
+        ),
+        "query_reward_delta_gated_minus_wo_meta": float(gated_query.get("reward", 0.0) - wo_query.get("reward", 0.0)),
         "query_reward_delta_meta_minus_context_only": float(
             meta_query.get("reward", 0.0) - context_only_query.get("reward", 0.0)
         ),
@@ -434,6 +660,15 @@ def _summarize_rows(rows: List[Dict[str, object]]) -> Dict[str, object]:
         "query_violation_delta_meta_minus_no_support_adapt": float(
             meta_query.get("violation_rate", 0.0) - meta_no_adapt_query.get("violation_rate", 0.0)
         ),
+        "query_violation_delta_gated_minus_meta": float(
+            gated_query.get("violation_rate", 0.0) - meta_query.get("violation_rate", 0.0)
+        ),
+        "query_violation_delta_gated_minus_context_only": float(
+            gated_query.get("violation_rate", 0.0) - context_only_query.get("violation_rate", 0.0)
+        ),
+        "query_violation_delta_gated_minus_wo_meta": float(
+            gated_query.get("violation_rate", 0.0) - wo_query.get("violation_rate", 0.0)
+        ),
         "query_violation_delta_meta_minus_context_only": float(
             meta_query.get("violation_rate", 0.0) - context_only_query.get("violation_rate", 0.0)
         ),
@@ -444,10 +679,12 @@ def _summarize_rows(rows: List[Dict[str, object]]) -> Dict[str, object]:
         "query_cost_delta_meta_minus_no_support_adapt": float(
             meta_query.get("cost", 0.0) - meta_no_adapt_query.get("cost", 0.0)
         ),
+        "query_cost_delta_gated_minus_meta": float(gated_query.get("cost", 0.0) - meta_query.get("cost", 0.0)),
         "query_cost_delta_meta_minus_context_only": float(
             meta_query.get("cost", 0.0) - context_only_query.get("cost", 0.0)
         ),
         "meta_query_reward_after_minus_before_support": meta_query_reward_gain,
+        "gated_query_reward_after_minus_before_support": gated_query_reward_gain,
         "meta_no_support_adapt_query_reward_after_minus_before_support": meta_no_adapt_query_reward_gain,
         "context_only_query_reward_after_minus_before_support": context_only_query_reward_gain,
         "meta_query_se_after_minus_before_support": float(meta_query.get("se", 0.0) - meta_pre_query.get("se", 0.0)),
@@ -461,6 +698,8 @@ def _summarize_rows(rows: List[Dict[str, object]]) -> Dict[str, object]:
             wo_query.get("violation_rate", 0.0) - wo_pre_query.get("violation_rate", 0.0)
         ),
         "few_shot_reward_gain_meta_minus_wo_meta": meta_query_reward_gain - wo_query_reward_gain,
+        "few_shot_reward_gain_gated_minus_wo_meta": gated_query_reward_gain - wo_query_reward_gain,
+        "few_shot_reward_gain_gated_minus_meta": gated_query_reward_gain - meta_query_reward_gain,
         "few_shot_reward_gain_meta_minus_no_support_adapt": (
             meta_query_reward_gain - meta_no_adapt_query_reward_gain
         ),
@@ -512,6 +751,21 @@ def _summarize_rows(rows: List[Dict[str, object]]) -> Dict[str, object]:
             "query_parameter_delta_norm": _mean(row["query_parameter_delta_norm"] for row in variant_rows),
             "context_history_len_before_query": _mean(row["context_history_len_before_query"] for row in variant_rows),
             "query_has_support_context_fraction": _mean(float(row["query_has_support_context"]) for row in variant_rows),
+            "support_gate_enabled_fraction": _mean(float(row["support_gate_enabled"]) for row in variant_rows),
+            "support_gate_accept_rate": _mean(float(row["support_gate_accepted"]) for row in variant_rows),
+            "support_gate_context_only_rate": _mean(
+                float(row.get("support_gate_selected", "") == "context_only") for row in variant_rows
+            ),
+            "support_gate_no_support_rate": _mean(
+                float(row.get("support_gate_selected", "") == "no_support") for row in variant_rows
+            ),
+            "support_gate_adapted_rate": _mean(
+                float(row.get("support_gate_selected", "") == "adapted") for row in variant_rows
+            ),
+            "support_gate_score_no_context": _mean(row["support_gate_score_no_context"] for row in variant_rows),
+            "support_gate_score_before": _mean(row["support_gate_score_before"] for row in variant_rows),
+            "support_gate_score_after": _mean(row["support_gate_score_after"] for row in variant_rows),
+            "support_gate_score_delta": _mean(row["support_gate_score_delta"] for row in variant_rows),
         }
     return {
         "phase_summary": phase_summary,
@@ -532,6 +786,19 @@ def _summarize_rows(rows: List[Dict[str, object]]) -> Dict[str, object]:
                 "explicit_inner_outer": True,
                 "pre_query_eval_before_support": True,
                 "support_train_adapts": False,
+                "query_eval_after_support": True,
+                "query_train_updates": False,
+                "matched_pre_post_eval_episode_seeds": True,
+                "same_checkpoint_as": "hybrid_meta",
+            },
+            "hybrid_meta_support_gated": {
+                "context_enabled": True,
+                "explicit_inner_outer": True,
+                "pre_query_eval_before_support": True,
+                "support_train_adapts": True,
+                "support_gate_enabled": True,
+                "support_gate_rule": "select_best_of_no_support_context_only_adapted_using_support_validation_reward",
+                "query_used_by_gate": False,
                 "query_eval_after_support": True,
                 "query_train_updates": False,
                 "matched_pre_post_eval_episode_seeds": True,
@@ -671,6 +938,22 @@ def run_meta_adaptation_diagnostics(
             query_episodes=query_episodes,
             pre_query_episodes=pre_query_episodes,
             support_train_override=False,
+        )
+    )
+    rows.extend(
+        _collect_variant_rows(
+            trainer=meta_trainer,
+            cfg=meta_cfg,
+            tasks=tasks,
+            scenario=scenario,
+            seed=seed,
+            variant="hybrid_meta_support_gated",
+            support_episodes=support_episodes,
+            query_episodes=query_episodes,
+            pre_query_episodes=pre_query_episodes,
+            support_train_override=True,
+            support_gate_enabled=True,
+            support_gate_validation_episodes=min(2, max(1, int(support_episodes) - 1)),
         )
     )
 

@@ -190,6 +190,9 @@ def test_meta_adaptation_diagnostics_outputs_meta_vs_wo_meta_rows(tmp_path):
     assert summary["diagnostic_contract"]["hybrid_meta"]["query_train_updates"] is False
     assert summary["diagnostic_contract"]["hybrid_meta_no_support_adapt"]["support_train_adapts"] is False
     assert summary["diagnostic_contract"]["hybrid_meta_no_support_adapt"]["same_checkpoint_as"] == "hybrid_meta"
+    assert summary["diagnostic_contract"]["hybrid_meta_support_gated"]["support_gate_enabled"] is True
+    assert summary["diagnostic_contract"]["hybrid_meta_support_gated"]["query_used_by_gate"] is False
+    assert summary["diagnostic_contract"]["hybrid_meta_support_gated"]["same_checkpoint_as"] == "hybrid_meta"
     assert summary["diagnostic_contract"]["hybrid_context_only"]["context_enabled"] is True
     assert summary["diagnostic_contract"]["hybrid_context_only"]["explicit_inner_outer"] is False
     assert summary["diagnostic_contract"]["hybrid_context_only"]["support_train_adapts"] is False
@@ -197,9 +200,12 @@ def test_meta_adaptation_diagnostics_outputs_meta_vs_wo_meta_rows(tmp_path):
     assert summary["diagnostic_contract"]["hybrid_wo_meta"]["support_train_adapts"] is False
     assert "query_reward_delta_meta_minus_wo_meta" in summary["comparison"]
     assert "query_reward_delta_meta_minus_no_support_adapt" in summary["comparison"]
+    assert "query_reward_delta_gated_minus_meta" in summary["comparison"]
+    assert "query_reward_delta_gated_minus_context_only" in summary["comparison"]
     assert "query_reward_delta_meta_minus_context_only" in summary["comparison"]
     assert "query_reward_delta_context_only_minus_wo_meta" in summary["comparison"]
     assert "few_shot_reward_gain_meta_minus_no_support_adapt" in summary["comparison"]
+    assert "few_shot_reward_gain_gated_minus_meta" in summary["comparison"]
     assert "few_shot_reward_gain_meta_minus_context_only" in summary["comparison"]
     assert summary["fixed_task_batch_hash"]
     assert summary["ordered_fixed_task_batch_hash"]
@@ -210,6 +216,10 @@ def test_meta_adaptation_diagnostics_outputs_meta_vs_wo_meta_rows(tmp_path):
     assert "query_reward_after_support" in summary["adaptation_summary"]["hybrid_meta"]
     assert summary["adaptation_summary"]["hybrid_meta"]["query_has_support_context_fraction"] == 1.0
     assert summary["adaptation_summary"]["hybrid_meta_no_support_adapt"]["query_has_support_context_fraction"] == 1.0
+    assert summary["adaptation_summary"]["hybrid_meta_support_gated"]["query_has_support_context_fraction"] == 1.0
+    assert "support_gate_accept_rate" in summary["adaptation_summary"]["hybrid_meta_support_gated"]
+    assert "support_gate_no_support_rate" in summary["adaptation_summary"]["hybrid_meta_support_gated"]
+    assert "support_gate_context_only_rate" in summary["adaptation_summary"]["hybrid_meta_support_gated"]
     assert summary["adaptation_summary"]["hybrid_context_only"]["query_has_support_context_fraction"] == 1.0
     assert summary["adaptation_summary"]["hybrid_wo_meta"]["query_has_support_context_fraction"] == 0.0
     assert "support_upper_delta_norm" in summary["adaptation_summary"]["hybrid_meta"]
@@ -226,6 +236,7 @@ def test_meta_adaptation_diagnostics_outputs_meta_vs_wo_meta_rows(tmp_path):
     assert {row["variant"] for row in rows} == {
         "hybrid_meta",
         "hybrid_meta_no_support_adapt",
+        "hybrid_meta_support_gated",
         "hybrid_context_only",
         "hybrid_wo_meta",
     }
@@ -234,7 +245,13 @@ def test_meta_adaptation_diagnostics_outputs_meta_vs_wo_meta_rows(tmp_path):
     pre_query = [row for row in rows if row["phase"] == "pre_query"]
     assert pre_query
     assert pre_query[0]["pre_query_eval_before_support"] == "True"
-    for variant in {"hybrid_meta", "hybrid_meta_no_support_adapt", "hybrid_context_only", "hybrid_wo_meta"}:
+    for variant in {
+        "hybrid_meta",
+        "hybrid_meta_no_support_adapt",
+        "hybrid_meta_support_gated",
+        "hybrid_context_only",
+        "hybrid_wo_meta",
+    }:
         before = [row for row in rows if row["variant"] == variant and row["phase"] == "pre_query"][0]
         after = [row for row in rows if row["variant"] == variant and row["phase"] == "query"][0]
         assert before["episode_seed"] == after["episode_seed"]
@@ -242,22 +259,68 @@ def test_meta_adaptation_diagnostics_outputs_meta_vs_wo_meta_rows(tmp_path):
     no_adapt_support = [
         row for row in rows if row["variant"] == "hybrid_meta_no_support_adapt" and row["phase"] == "support"
     ]
+    gated_support = [
+        row for row in rows if row["variant"] == "hybrid_meta_support_gated" and row["phase"] == "support"
+    ]
     context_only_support = [
         row for row in rows if row["variant"] == "hybrid_context_only" and row["phase"] == "support"
     ]
     wo_support = [row for row in rows if row["variant"] == "hybrid_wo_meta" and row["phase"] == "support"]
     assert meta_support[0]["support_train_adapts"] == "True"
     assert no_adapt_support[0]["support_train_adapts"] == "False"
+    assert gated_support
     assert context_only_support[0]["support_train_adapts"] == "False"
     assert wo_support[0]["support_train_adapts"] == "False"
     assert int(meta_support[0]["context_history_len_before_query"]) > 0
     assert int(no_adapt_support[0]["context_history_len_before_query"]) > 0
+    assert int(gated_support[0]["context_history_len_before_query"]) > 0
     assert int(context_only_support[0]["context_history_len_before_query"]) > 0
     assert int(wo_support[0]["context_history_len_before_query"]) == 0
     assert "support_parameter_delta_norm" in rows[0]
+    assert "support_gate_enabled" in rows[0]
+    assert "support_gate_accepted" in rows[0]
+    assert "support_gate_selected" in rows[0]
+    assert "support_gate_score_no_context" in rows[0]
+    assert "support_gate_score_delta" in rows[0]
     assert "support_upper_delta_norm" in rows[0]
     assert "support_lower_replay_len_after_support" in rows[0]
     assert "support_upper_replay_len_after_support" in rows[0]
+
+
+def test_support_gated_meta_uses_support_validation_not_query(tmp_path):
+    summary = run_meta_adaptation_diagnostics(
+        out_dir=tmp_path,
+        scenario="moderate_practical",
+        seed=17,
+        train_iters=0,
+        n_tasks=1,
+        support_episodes=2,
+        query_episodes=1,
+        episode_len=3,
+        fast_mode=True,
+        device="cpu",
+        make_plots=False,
+    )
+
+    assert summary["diagnostic_contract"]["hybrid_meta_support_gated"]["support_gate_enabled"] is True
+    assert summary["diagnostic_contract"]["hybrid_meta_support_gated"]["query_used_by_gate"] is False
+    gated = summary["adaptation_summary"]["hybrid_meta_support_gated"]
+    assert gated["support_gate_enabled_fraction"] == 1.0
+    assert 0.0 <= gated["support_gate_accept_rate"] <= 1.0
+
+    with open(summary["csv_path"], newline="") as f:
+        rows = list(csv.DictReader(f))
+
+    gated_rows = [row for row in rows if row["variant"] == "hybrid_meta_support_gated"]
+    assert gated_rows
+    validation_rows = [row for row in gated_rows if row["support_gate_validation"] == "True"]
+    assert validation_rows
+    assert all(row["phase"] == "support" for row in validation_rows)
+    assert all(row["support_train_adapts"] == "False" for row in validation_rows)
+    assert all(row["support_gate_selected"] in {"adapted", "context_only", "no_support"} for row in validation_rows)
+    query_rows = [row for row in gated_rows if row["phase"] == "query"]
+    assert query_rows
+    assert all(row["query_parameter_delta_norm"] == "0.0" for row in query_rows)
     assert "query_parameter_delta_norm" in rows[0]
     meta_query = [row for row in rows if row["variant"] == "hybrid_meta" and row["phase"] == "query"]
     assert meta_query

@@ -25,9 +25,9 @@ echo "[1/3] Meta/context causal diagnostic"
   --seeds $SEEDS \
   --train-iters "$META_ITERS" \
   --tasks "$EVAL_TASKS" \
-  --pre-query-episodes 2 \
-  --support-episodes 5 \
-  --query-episodes 2 \
+  --pre-query-episodes 3 \
+  --support-episodes 6 \
+  --query-episodes 3 \
   --episode-len 80 \
   --device "$DEVICE"
 
