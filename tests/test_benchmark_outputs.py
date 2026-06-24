@@ -430,6 +430,10 @@ def test_statistics_contract_trusts_pvalue_only_with_two_or_more_pairs():
     assert pair["insufficient_pairs"] is False
     assert pair["p_value_trusted"] is True
     assert pair["p_value"] is not None
+    assert "bootstrap_ci_low" in pair
+    assert "bootstrap_ci_high" in pair
+    assert "median_diff" in pair
+    assert pair["positive_seed_count"] + pair["negative_seed_count"] + pair["zero_seed_count"] == pair["n_pairs"]
     assert pair["pair_keys"] == [
         ["hard_stress", 101, "same-task-set", "same-task-order"],
         ["hard_stress", 202, "same-task-set", "same-task-order"],

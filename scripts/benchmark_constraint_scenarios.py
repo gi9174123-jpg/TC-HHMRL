@@ -98,6 +98,14 @@ def apply_strict_meta_protocol(cfg: Dict) -> None:
     meta_cfg["explicit_inner_outer"] = True
     meta_cfg["outer_step_size"] = 0.15
     meta_cfg["protocol_name"] = "strict_support_query"
+    support_gate = meta_cfg.setdefault("support_gate", {})
+    support_gate.setdefault("role", "rollback_guard")
+    support_gate.setdefault("rule", "support_score_non_degradation")
+    support_gate["enabled"] = True
+    support_gate["query_leakage"] = False
+    support_gate["extra_support_rollouts"] = 0
+    support_gate["extra_gradient_updates"] = 0
+    support_gate["extra_query_evaluations"] = 0
     cfg.setdefault("buffer", {})["context_max_len"] = max(
         int(cfg.get("buffer", {}).get("context_max_len", 0)),
         int(cfg.get("env", {}).get("episode_len", 80))
@@ -127,6 +135,14 @@ def apply_online_meta_protocol(cfg: Dict) -> None:
     meta_cfg["query_updates_enabled"] = True
     meta_cfg["query_context_updates_enabled"] = True
     meta_cfg["protocol_name"] = "online_adaptation_main"
+    support_gate = meta_cfg.setdefault("support_gate", {})
+    support_gate.setdefault("role", "rollback_guard")
+    support_gate.setdefault("rule", "support_score_non_degradation")
+    support_gate["enabled"] = True
+    support_gate["query_leakage"] = False
+    support_gate["extra_support_rollouts"] = 0
+    support_gate["extra_gradient_updates"] = 0
+    support_gate["extra_query_evaluations"] = 0
     cfg.setdefault("buffer", {})["context_max_len"] = max(
         int(cfg.get("buffer", {}).get("context_max_len", 0)),
         int(cfg.get("env", {}).get("episode_len", 80))
@@ -289,10 +305,21 @@ def apply_ablation(cfg: Dict, ablation: str) -> None:
         cfg.setdefault("context", {})["enabled"] = False
         cfg.setdefault("meta", {})["explicit_inner_outer"] = False
         cfg["meta"]["query_updates_enabled"] = False
+        cfg["meta"].setdefault("support_gate", {})["enabled"] = False
         support_eps = int(cfg["meta"].get("support_episodes", 0))
         query_eps = int(cfg["meta"].get("query_episodes", 0))
         cfg["meta"]["support_episodes"] = support_eps + query_eps
         cfg["meta"]["query_episodes"] = 0
+        sync_site_bank_with_cfg(cfg)
+        return
+    if ablation == "meta_ungated":
+        cfg.setdefault("meta", {}).setdefault("support_gate", {})["enabled"] = False
+        cfg["meta"]["support_update_acceptance"] = "unconditional"
+        cfg["pilot_metadata"] = {
+            "comparison_role": "ungated_meta_ablation",
+            "support_gate": False,
+            "support_update_acceptance": "unconditional",
+        }
         sync_site_bank_with_cfg(cfg)
         return
     if ablation == "wo_lagrangian":
@@ -304,16 +331,27 @@ def apply_ablation(cfg: Dict, ablation: str) -> None:
         return
     if ablation == "hard_clip":
         cfg.setdefault("safety", {})["projection_mode"] = "hard_clip"
+        cfg["pilot_metadata"] = {
+            "projection_variant": "naive_component_wise_clip",
+            "pilot_only": False,
+            "formal_ranking_exclude": False,
+            "comparison_role": "diagnostic_clip_ablation",
+            "strong_safety_baseline": False,
+            "oracle_future_disturbances": False,
+            "qos_recovery_rule": "none_componentwise_zero_if_thermal_infeasible",
+        }
         return
     if ablation == "qos_aware_hard_clip":
         cfg.setdefault("safety", {})["projection_mode"] = "qos_aware_hard_clip"
         cfg["pilot_metadata"] = {
-            "projection_variant": "qos_aware_hard_clip",
+            "projection_variant": "qos_aware_feasible_hard_projection",
             "pilot_only": False,
             "formal_ranking_exclude": False,
             "comparison_role": "fair_hard_projection_baseline",
+            "strong_safety_baseline": True,
             "oracle_future_disturbances": False,
-            "qos_recovery_rule": "current_recovery_to_active_sources_with_thermal_and_bus_headroom",
+            "qos_recovery_rule": "non_oracle_current_recovery_to_active_sources_with_thermal_and_bus_headroom",
+            "projection_objective": "preserve feasible executed current after hard thermal and bus clipping",
         }
         return
     if ablation == "smooth_relaxed":
@@ -450,11 +488,15 @@ def apply_baseline_overrides(cfg: Dict, baseline: str) -> None:
         cfg.setdefault("agent", {})["z_dim"] = 0
         cfg.setdefault("meta", {})["explicit_inner_outer"] = False
         cfg["meta"]["query_updates_enabled"] = False
+        cfg["meta"].setdefault("support_gate", {})["enabled"] = False
         cfg["baseline_metadata"] = {
             "baseline_family": "sac_lagrangian",
             "uses_task_oracle": False,
             "uses_learned_policy": True,
             "uses_same_safety_projection": True,
+            "meta_learning": False,
+            "support_gate": False,
+            "support_update_acceptance": "none",
             "safety_protocol": f"common_{cfg.get('safety', {}).get('projection_mode', 'thermal_cap')}_projection",
             "comparison_role": "learning_baseline",
         }
@@ -464,6 +506,7 @@ def apply_baseline_overrides(cfg: Dict, baseline: str) -> None:
         cfg.setdefault("agent", {})["z_dim"] = 0
         cfg.setdefault("meta", {})["explicit_inner_outer"] = False
         cfg["meta"]["query_updates_enabled"] = False
+        cfg["meta"].setdefault("support_gate", {})["enabled"] = False
         cfg["meta"]["dual_enabled"] = False
         cfg["meta"]["dual_lr"] = 0.0
         n_duals = len(cfg["meta"].get("dual_names", ["qos"] + [f"temp_tx{i}" for i in range(int(cfg["env"]["n_tx"]))]))
@@ -473,6 +516,9 @@ def apply_baseline_overrides(cfg: Dict, baseline: str) -> None:
             "baseline_family": "sac_dalal_safe",
             "exact_reproduction": False,
             "external_baseline": True,
+            "meta_learning": False,
+            "support_gate": False,
+            "support_update_acceptance": "none",
             "safety_protocol": "dalal_style_projection",
             "comparison_role": "external_safety_layer_baseline",
         }
@@ -482,6 +528,7 @@ def apply_baseline_overrides(cfg: Dict, baseline: str) -> None:
         cfg.setdefault("agent", {})["z_dim"] = 0
         cfg.setdefault("meta", {})["explicit_inner_outer"] = False
         cfg["meta"]["query_updates_enabled"] = False
+        cfg["meta"].setdefault("support_gate", {})["enabled"] = False
         cfg["meta"]["dual_enabled"] = False
         cfg["meta"]["dual_lr"] = 0.0
         cfg["meta"]["dual_lrs"] = [0.0] * len(cfg["meta"].get("dual_names", []))
@@ -517,6 +564,10 @@ def apply_baseline_overrides(cfg: Dict, baseline: str) -> None:
             "fixed_current_fraction": 0.5,
             "rho_symbol_mapping": "paper_rho_is_id_fraction; env_rho_exec_is_eh_fraction; paper_rho=1-env_rho_exec",
             "tau_symbol_mapping": "paper_tau_and_env_tau_exec_are_id_time_fraction",
+            "meta_learning": False,
+            "shared_lagrangian": False,
+            "support_gate": False,
+            "support_update_acceptance": "none",
         }
         cfg["agent"]["batch_size"] = 64
         return
@@ -526,6 +577,7 @@ def apply_baseline_overrides(cfg: Dict, baseline: str) -> None:
         cfg.setdefault("agent", {})["z_dim"] = 0
         cfg.setdefault("meta", {})["explicit_inner_outer"] = False
         cfg["meta"]["query_updates_enabled"] = False
+        cfg["meta"].setdefault("support_gate", {})["enabled"] = False
         cfg["meta"]["dual_enabled"] = False
         cfg["meta"]["dual_lr"] = 0.0
         cfg["meta"]["dual_lrs"] = [0.0] * len(cfg["meta"].get("dual_names", []))
@@ -606,6 +658,7 @@ def apply_baseline_overrides(cfg: Dict, baseline: str) -> None:
         cfg.setdefault("agent", {})["z_dim"] = 0
         cfg.setdefault("meta", {})["explicit_inner_outer"] = False
         cfg["meta"]["query_updates_enabled"] = False
+        cfg["meta"].setdefault("support_gate", {})["enabled"] = False
         cfg["meta"]["dual_enabled"] = False
         cfg["meta"]["dual_lr"] = 0.0
         cfg["meta"]["dual_lrs"] = [0.0] * len(cfg["meta"].get("dual_names", []))
@@ -641,6 +694,7 @@ def apply_baseline_overrides(cfg: Dict, baseline: str) -> None:
         cfg.setdefault("agent", {})["z_dim"] = 0
         cfg.setdefault("meta", {})["explicit_inner_outer"] = False
         cfg["meta"]["query_updates_enabled"] = False
+        cfg["meta"].setdefault("support_gate", {})["enabled"] = False
         cfg["meta"]["dual_enabled"] = False
         cfg["meta"]["dual_lr"] = 0.0
         cfg["meta"]["dual_lrs"] = [0.0] * len(cfg["meta"].get("dual_names", []))
@@ -676,6 +730,7 @@ def apply_baseline_overrides(cfg: Dict, baseline: str) -> None:
         cfg.setdefault("agent", {})["z_dim"] = 0
         cfg.setdefault("meta", {})["explicit_inner_outer"] = False
         cfg["meta"]["query_updates_enabled"] = False
+        cfg["meta"].setdefault("support_gate", {})["enabled"] = False
         cfg["meta"]["dual_enabled"] = False
         cfg["meta"]["dual_lr"] = 0.0
         cfg["meta"]["dual_lrs"] = [0.0] * len(cfg["meta"].get("dual_names", []))
@@ -710,6 +765,7 @@ def apply_baseline_overrides(cfg: Dict, baseline: str) -> None:
         cfg.setdefault("agent", {})["z_dim"] = 0
         cfg.setdefault("meta", {})["explicit_inner_outer"] = False
         cfg["meta"]["query_updates_enabled"] = False
+        cfg["meta"].setdefault("support_gate", {})["enabled"] = False
         cfg["meta"]["dual_enabled"] = False
         cfg["meta"]["dual_lr"] = 0.0
         cfg["meta"]["dual_lrs"] = [0.0] * len(cfg["meta"].get("dual_names", []))
@@ -765,6 +821,7 @@ def apply_baseline_overrides(cfg: Dict, baseline: str) -> None:
         cfg.setdefault("agent", {})["z_dim"] = 0
         cfg.setdefault("meta", {})["explicit_inner_outer"] = False
         cfg["meta"]["query_updates_enabled"] = False
+        cfg["meta"].setdefault("support_gate", {})["enabled"] = False
         cfg["meta"]["dual_enabled"] = False
         cfg["meta"]["dual_lr"] = 0.0
         cfg["meta"]["dual_lrs"] = [0.0] * len(cfg["meta"].get("dual_names", []))
@@ -3663,6 +3720,7 @@ STRUCTURAL_VARIANT_ORDER = (
 )
 HARD_TARGETED_VARIANT_ORDER = (
     "hybrid",
+    "hybrid_meta_ungated",
     "hybrid_wo_meta",
     "hybrid_wo_lagrangian",
     "hybrid_hard_clip",
@@ -3740,19 +3798,35 @@ def _paired_diff_stats(diffs: np.ndarray) -> Dict[str, float | int | None]:
             "insufficient_pairs": True,
             "p_value_trusted": False,
             "mean_diff": float("nan"),
+            "median_diff": float("nan"),
             "std_diff": float("nan"),
+            "bootstrap_ci_low": float("nan"),
+            "bootstrap_ci_high": float("nan"),
+            "positive_seed_count": 0,
+            "negative_seed_count": 0,
+            "zero_seed_count": 0,
             "t_stat": float("nan"),
             "effect_size_dz": float("nan"),
             "p_value": None,
         }
     mean_diff = float(np.mean(diffs))
+    median_diff = float(np.median(diffs))
+    positive_count = int(np.count_nonzero(diffs > 0.0))
+    negative_count = int(np.count_nonzero(diffs < 0.0))
+    zero_count = int(n_pairs - positive_count - negative_count)
     if n_pairs == 1:
         return {
             "n_pairs": 1,
             "insufficient_pairs": True,
             "p_value_trusted": False,
             "mean_diff": mean_diff,
+            "median_diff": median_diff,
             "std_diff": float("nan"),
+            "bootstrap_ci_low": mean_diff,
+            "bootstrap_ci_high": mean_diff,
+            "positive_seed_count": positive_count,
+            "negative_seed_count": negative_count,
+            "zero_seed_count": zero_count,
             "t_stat": float("nan"),
             "effect_size_dz": float("nan"),
             "p_value": None,
@@ -3765,12 +3839,21 @@ def _paired_diff_stats(diffs: np.ndarray) -> Dict[str, float | int | None]:
         t_stat = float(mean_diff / (std_diff / math.sqrt(n_pairs)))
         effect_size = float(mean_diff / std_diff)
     p_value = _paired_signflip_pvalue(diffs)
+    rng = np.random.default_rng(0)
+    boot = rng.choice(diffs, size=(20000, n_pairs), replace=True).mean(axis=1)
+    ci_low, ci_high = np.percentile(boot, [2.5, 97.5])
     return {
         "n_pairs": n_pairs,
         "insufficient_pairs": False,
         "p_value_trusted": p_value is not None,
         "mean_diff": mean_diff,
+        "median_diff": median_diff,
         "std_diff": std_diff,
+        "bootstrap_ci_low": float(ci_low),
+        "bootstrap_ci_high": float(ci_high),
+        "positive_seed_count": positive_count,
+        "negative_seed_count": negative_count,
+        "zero_seed_count": zero_count,
         "t_stat": t_stat,
         "effect_size_dz": effect_size,
         "p_value": p_value,
@@ -3906,7 +3989,13 @@ def build_statistics_artifact(
                     "insufficient_pairs": row["insufficient_pairs"],
                     "p_value_trusted": row["p_value_trusted"],
                     "mean_diff": row["mean_diff"],
+                    "median_diff": row.get("median_diff"),
                     "std_diff": row["std_diff"],
+                    "bootstrap_ci_low": row.get("bootstrap_ci_low"),
+                    "bootstrap_ci_high": row.get("bootstrap_ci_high"),
+                    "positive_seed_count": row.get("positive_seed_count"),
+                    "negative_seed_count": row.get("negative_seed_count"),
+                    "zero_seed_count": row.get("zero_seed_count"),
                     "t_stat": row["t_stat"],
                     "effect_size_dz": row["effect_size_dz"],
                     "p_value": row["p_value"],
@@ -4383,6 +4472,7 @@ def run_one_scenario(
             eh_nonlinear_cfg = dict(cfg.get("env", {}).get("eh_nonlinear", {}) or {})
             run_meta_cfg = dict(cfg.get("meta", {}) or {})
             run_ckpt_cfg = dict(run_meta_cfg.get("checkpoint_selection", {}) or {})
+            run_support_gate_cfg = dict(run_meta_cfg.get("support_gate", {}) or {})
             formal_meta = formal_metadata_snapshot(cfg)
             formal_record_probe = {
                 **formal_meta,
@@ -4412,6 +4502,19 @@ def run_one_scenario(
                     "query_context_updates_enabled": bool(run_meta_cfg.get("query_context_updates_enabled", True)),
                     "explicit_inner_outer": bool(run_meta_cfg.get("explicit_inner_outer", False)),
                     "outer_step_size": float(run_meta_cfg.get("outer_step_size", 0.0)),
+                    "meta_learning": bool(run_meta_cfg.get("explicit_inner_outer", False)),
+                    "support_gate": bool(run_support_gate_cfg.get("enabled", False)),
+                    "support_gate_role": str(run_support_gate_cfg.get("role", "")),
+                    "support_gate_rule": str(run_support_gate_cfg.get("rule", "")),
+                    "support_gate_uses_query": bool(run_support_gate_cfg.get("query_leakage", False)),
+                    "support_gate_extra_rollouts": int(run_support_gate_cfg.get("extra_support_rollouts", 0)),
+                    "support_gate_extra_gradient_updates": int(run_support_gate_cfg.get("extra_gradient_updates", 0)),
+                    "support_gate_extra_query_evaluations": int(
+                        run_support_gate_cfg.get("extra_query_evaluations", 0)
+                    ),
+                    "support_update_acceptance": (
+                        "support_side_gated" if bool(run_support_gate_cfg.get("enabled", False)) else "unconditional"
+                    ),
                     "context_max_len": int(cfg.get("buffer", {}).get("context_max_len", 0)),
                     "lower_updates_per_step": int(cfg.get("agent", {}).get("lower_updates_per_step", 1)),
                     "upper_update_every": int(cfg.get("agent", {}).get("upper_update_every", 1)),
@@ -4430,6 +4533,7 @@ def run_one_scenario(
                     "selection_eps": int(selection_eps),
                     "eval_tasks": int(eval_tasks),
                     "eval_eps": int(eval_eps),
+                    "eval_protocol": "fixed_policy_post_training_eval",
                     "env_tasks": int(env_tasks),
                     "env_eps": int(env_eps),
                     "checkpoint_strategy": str(ckpt_pick.get("strategy", "none")),
@@ -4704,6 +4808,10 @@ def run_one_scenario(
                 "baseline_family": "sac_dalal_safe" if is_sac_dalal else "sac_lagrangian",
                 "exact_reproduction": False if is_sac_dalal else None,
                 "external_baseline": True if is_sac_dalal else None,
+                "meta_learning": False,
+                "support_gate": False,
+                "support_gate_uses_query": False,
+                "support_update_acceptance": "none",
                 "safety_protocol": "dalal_style_projection" if is_sac_dalal else common_projection_protocol,
                 "comparison_role": "external_safety_layer_baseline" if is_sac_dalal else "learning_baseline",
                 "description": (
@@ -4813,7 +4921,35 @@ def run_one_scenario(
         elif variant == "hybrid":
             is_smooth_relaxed = ablation == "smooth_relaxed"
             is_thermal_cap = ablation == "thermal_cap"
-            projection_variant = "thermal_cap" if is_thermal_cap else "smooth_relaxed" if is_smooth_relaxed else ""
+            is_meta_ungated = ablation == "meta_ungated"
+            is_hard_clip = ablation == "hard_clip"
+            is_qos_aware_hard_clip = ablation == "qos_aware_hard_clip"
+            hybrid_meta_enabled = ablation != "wo_meta"
+            hybrid_gate_enabled = bool(hybrid_meta_enabled and not is_meta_ungated)
+            projection_variant = (
+                "thermal_cap"
+                if is_thermal_cap
+                else "smooth_relaxed"
+                if is_smooth_relaxed
+                else "naive_component_wise_clip"
+                if is_hard_clip
+                else "qos_aware_feasible_hard_projection"
+                if is_qos_aware_hard_clip
+                else ""
+            )
+            comparison_role = (
+                "projection_sensitivity"
+                if (is_smooth_relaxed or is_thermal_cap)
+                else "diagnostic_clip_ablation"
+                if is_hard_clip
+                else "fair_hard_projection_baseline"
+                if is_qos_aware_hard_clip
+                else "ungated_meta_ablation"
+                if is_meta_ungated
+                else "full_method"
+                if ablation == "full"
+                else ""
+            )
             variant_definitions[label] = {
                 "runner": "trainer",
                 "base_variant": variant,
@@ -4823,32 +4959,79 @@ def run_one_scenario(
                 "projection_variant": projection_variant,
                 "pilot_only": True if (is_smooth_relaxed or is_thermal_cap) else None,
                 "formal_ranking_exclude": True if (is_smooth_relaxed or is_thermal_cap) else None,
-                "comparison_role": "projection_sensitivity" if (is_smooth_relaxed or is_thermal_cap) else "",
+                "comparison_role": comparison_role,
+                "baseline_family": "hybrid_full" if ablation == "full" else label,
+                "meta_learning": bool(hybrid_meta_enabled),
+                "support_gate": bool(hybrid_gate_enabled),
+                "support_gate_role": "rollback_guard" if hybrid_gate_enabled else "",
+                "support_gate_uses_query": False,
+                "support_update_acceptance": "unconditional" if is_meta_ungated else "support_side_gated" if hybrid_meta_enabled else "none",
+                "support_gate_extra_rollouts": 0,
+                "support_gate_extra_gradient_updates": 0,
+                "support_gate_extra_query_evaluations": 0,
+                "strong_safety_baseline": True if is_qos_aware_hard_clip else False if is_hard_clip else None,
+                "qos_recovery_rule": (
+                    "non_oracle_current_recovery_to_active_sources_with_thermal_and_bus_headroom"
+                    if is_qos_aware_hard_clip
+                    else "none_componentwise_zero_if_thermal_infeasible"
+                    if is_hard_clip
+                    else ""
+                ),
                 "description": (
                     "Pilot-only projection sensitivity: full Hybrid with thermal-cap current projection."
                     if is_thermal_cap
                     else "Pilot-only projection sensitivity: full Hybrid with relaxed smooth thermal derating."
                     if is_smooth_relaxed
+                    else "Naive component-wise hard clipping diagnostic; not treated as a strong safety baseline."
+                    if is_hard_clip
+                    else "QoS-aware feasible hard projection baseline with non-oracle current recovery under thermal and bus headroom."
+                    if is_qos_aware_hard_clip
+                    else "Ungated meta ablation: support update is always accepted without rollback."
+                    if is_meta_ungated
                     else "Full hierarchical method on the fixed heterogeneous hybrid structure"
                     if label != "dalal2018_safe"
                     else "Full hierarchical method with Dalal 2018-style local action correction replacing the default smooth predictive derating path"
                 ),
             }
         elif variant == "single_led":
+            structural_meta = ablation != "wo_meta"
+            structural_ungated = ablation == "meta_ungated"
             variant_definitions[label] = {
                 "runner": "trainer",
                 "base_variant": variant,
                 "ablation": ablation,
                 "tx_device": ["LED", "LED", "LED"],
                 "tx_enabled": [1.0, 0.0, 0.0],
+                "comparison_role": "structural_ablation_led_only",
+                "meta_learning": bool(structural_meta),
+                "support_gate": bool(structural_meta and not structural_ungated),
+                "support_gate_role": "rollback_guard" if structural_meta and not structural_ungated else "",
+                "support_gate_uses_query": False,
+                "support_update_acceptance": "unconditional" if structural_ungated else "support_side_gated" if structural_meta else "none",
+                "support_gate_extra_rollouts": 0,
+                "support_gate_extra_gradient_updates": 0,
+                "support_gate_extra_query_evaluations": 0,
+                "description": "LED-only structural ablation with the same meta/context/gated adaptation pipeline as Full Hybrid.",
             }
         elif variant == "single_ld":
+            structural_meta = ablation != "wo_meta"
+            structural_ungated = ablation == "meta_ungated"
             variant_definitions[label] = {
                 "runner": "trainer",
                 "base_variant": variant,
                 "ablation": ablation,
                 "tx_device": ["LD", "LD", "LD"],
                 "tx_enabled": [1.0, 0.0, 0.0],
+                "comparison_role": "structural_ablation_ld_only",
+                "meta_learning": bool(structural_meta),
+                "support_gate": bool(structural_meta and not structural_ungated),
+                "support_gate_role": "rollback_guard" if structural_meta and not structural_ungated else "",
+                "support_gate_uses_query": False,
+                "support_update_acceptance": "unconditional" if structural_ungated else "support_side_gated" if structural_meta else "none",
+                "support_gate_extra_rollouts": 0,
+                "support_gate_extra_gradient_updates": 0,
+                "support_gate_extra_query_evaluations": 0,
+                "description": "LD-only structural ablation with the same meta/context/gated adaptation pipeline as Full Hybrid.",
             }
 
     train_query_cost_mean = (
@@ -4979,6 +5162,7 @@ def run_benchmark(
     physics_eh_model: str | None = None,
     strict_meta: bool = False,
     online_meta: bool = False,
+    episode_len: int | None = None,
 ) -> Path:
     base_cfg = apply_cli_overrides(load_cfg(cfg_path), device=device)
     if strict_meta and online_meta:
@@ -4987,6 +5171,16 @@ def run_benchmark(
         apply_strict_meta_protocol(base_cfg)
     if online_meta:
         apply_online_meta_protocol(base_cfg)
+    if episode_len is not None:
+        if int(episode_len) <= 0:
+            raise ValueError("--episode-len must be positive")
+        base_cfg.setdefault("env", {})["episode_len"] = int(episode_len)
+        meta_cfg = base_cfg.setdefault("meta", {})
+        base_cfg.setdefault("buffer", {})["context_max_len"] = max(
+            int(base_cfg.get("buffer", {}).get("context_max_len", 0)),
+            int(episode_len)
+            * (int(meta_cfg.get("support_episodes", 0)) + int(meta_cfg.get("query_episodes", 0))),
+        )
     effective_meta_iters = int(meta_iters if meta_iters is not None else base_cfg.get("meta", {}).get("meta_iters", 45))
     base_cfg.setdefault("meta", {})["meta_iters"] = effective_meta_iters
     if thermal_model is not None:
@@ -5116,13 +5310,34 @@ def run_benchmark(
         "meta_iters": effective_meta_iters,
         "eval_tasks": int(eval_tasks),
         "eval_eps": int(eval_eps),
+        "eval_protocol": "fixed_policy_post_training_eval",
         "env_tasks": int(env_tasks),
         "env_eps": int(env_eps),
+        "episode_len_override": int(episode_len) if episode_len is not None else None,
+        "episode_len": int(base_cfg.get("env", {}).get("episode_len", 0)),
         "meta_protocol_name": str(base_cfg.get("meta", {}).get("protocol_name", "")),
         "support_episodes": int(base_cfg.get("meta", {}).get("support_episodes", 0)),
         "query_episodes": int(base_cfg.get("meta", {}).get("query_episodes", 0)),
         "query_updates_enabled": bool(base_cfg.get("meta", {}).get("query_updates_enabled", True)),
         "query_context_updates_enabled": bool(base_cfg.get("meta", {}).get("query_context_updates_enabled", True)),
+        "meta_learning": bool(base_cfg.get("meta", {}).get("explicit_inner_outer", False)),
+        "support_gate": bool(base_cfg.get("meta", {}).get("support_gate", {}).get("enabled", False)),
+        "support_gate_role": str(base_cfg.get("meta", {}).get("support_gate", {}).get("role", "")),
+        "support_gate_uses_query": bool(base_cfg.get("meta", {}).get("support_gate", {}).get("query_leakage", False)),
+        "support_gate_extra_rollouts": int(
+            base_cfg.get("meta", {}).get("support_gate", {}).get("extra_support_rollouts", 0)
+        ),
+        "support_gate_extra_gradient_updates": int(
+            base_cfg.get("meta", {}).get("support_gate", {}).get("extra_gradient_updates", 0)
+        ),
+        "support_gate_extra_query_evaluations": int(
+            base_cfg.get("meta", {}).get("support_gate", {}).get("extra_query_evaluations", 0)
+        ),
+        "support_update_acceptance": (
+            "support_side_gated"
+            if bool(base_cfg.get("meta", {}).get("support_gate", {}).get("enabled", False))
+            else "unconditional"
+        ),
         "context_max_len": int(base_cfg.get("buffer", {}).get("context_max_len", 0)),
         "lower_updates_per_step": int(base_cfg.get("agent", {}).get("lower_updates_per_step", 1)),
         "upper_update_every": int(base_cfg.get("agent", {}).get("upper_update_every", 1)),
@@ -5240,6 +5455,7 @@ def parse_args() -> argparse.Namespace:
         default=["full"],
         choices=[
             "full",
+            "meta_ungated",
             "wo_meta",
             "wo_lagrangian",
             "hard_clip",
@@ -5281,6 +5497,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--eval-eps", type=int, default=3)
     parser.add_argument("--env-tasks", type=int, default=8)
     parser.add_argument("--env-eps", type=int, default=1)
+    parser.add_argument(
+        "--episode-len",
+        type=int,
+        default=None,
+        help="Override env.episode_len for long-horizon diagnostics.",
+    )
     parser.add_argument(
         "--eh-model",
         type=str,
@@ -5345,6 +5567,7 @@ def main() -> None:
         physics_eh_model=args.physics_eh_model,
         strict_meta=args.strict_meta,
         online_meta=args.online_meta,
+        episode_len=args.episode_len,
     )
 
 

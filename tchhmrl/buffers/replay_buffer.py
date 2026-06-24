@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import copy
 import random
 from collections import deque
 from typing import Callable, Deque, Dict, List
@@ -17,6 +18,17 @@ class ReplayBuffer:
 
     def clear(self) -> None:
         self._buf.clear()
+
+    def state_dict(self) -> Dict:
+        return {
+            "capacity": int(self.capacity),
+            "items": copy.deepcopy(list(self._buf)),
+        }
+
+    def load_state_dict(self, state: Dict) -> None:
+        capacity = int(state.get("capacity", self.capacity))
+        self.capacity = capacity
+        self._buf = deque(copy.deepcopy(list(state.get("items", []))), maxlen=self.capacity)
 
     def __len__(self) -> int:
         return len(self._buf)
@@ -75,6 +87,18 @@ class EpisodeBuffer:
 
     def clear(self) -> None:
         self.data.clear()
+
+    def state_dict(self) -> Dict:
+        return {
+            "max_len": int(self.max_len),
+            "items": copy.deepcopy(self.data),
+        }
+
+    def load_state_dict(self, state: Dict) -> None:
+        self.max_len = int(state.get("max_len", self.max_len))
+        self.data = copy.deepcopy(list(state.get("items", [])))
+        if len(self.data) > self.max_len:
+            self.data = self.data[-self.max_len :]
 
     def __len__(self) -> int:
         return len(self.data)

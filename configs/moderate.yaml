@@ -112,6 +112,22 @@ meta:
   query_updates_enabled: false
   query_context_updates_enabled: true
   protocol_name: strict_support_query
+  support_gate:
+    enabled: true
+    role: rollback_guard
+    rule: support_score_non_degradation
+    reward_weight: 1.0
+    cost_weight: 1.0
+    violation_weight: 1.0
+    score_threshold: 0.0
+    max_cost_increase: .inf
+    max_violation_increase: .inf
+    min_parameter_delta_norm: 0.0
+    max_parameter_delta_norm: .inf
+    query_leakage: false
+    extra_support_rollouts: 0
+    extra_gradient_updates: 0
+    extra_query_evaluations: 0
   inner_warmup_steps: 128
   inner_upper_warmup_steps: 64
   checkpoint_selection:
@@ -130,6 +146,7 @@ buffer:
   context_max_len: 560
 
 context:
+  enabled: true
   input_dim: 30
   gru_hidden: 64
   z_dim: 8

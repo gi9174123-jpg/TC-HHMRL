@@ -6,6 +6,7 @@ import csv
 import torch
 
 from scripts.meta_adaptation_diagnostics import run_meta_adaptation_diagnostics
+from tchhmrl.meta.support_gate import SupportGateStats, evaluate_support_gate
 from tchhmrl.meta.meta_trainer import MetaTrainer
 from tchhmrl.utils.config import load_cfg
 
@@ -20,6 +21,9 @@ def test_default_meta_protocol_uses_heldout_query_and_stable_checkpoint_selectio
         assert bool(cfg["meta"]["query_updates_enabled"]) is False
         assert bool(cfg["meta"]["query_context_updates_enabled"]) is True
         assert str(cfg["meta"]["protocol_name"]) == "strict_support_query"
+        assert bool(cfg["meta"]["support_gate"]["enabled"]) is True
+        assert str(cfg["meta"]["support_gate"]["role"]) == "rollback_guard"
+        assert cfg["meta"]["support_gate"]["query_leakage"] is False
         assert int(cfg["buffer"]["context_max_len"]) >= int(cfg["env"]["episode_len"]) * (
             int(cfg["meta"]["support_episodes"]) + int(cfg["meta"]["query_episodes"])
         )
@@ -75,6 +79,123 @@ def test_meta_trainer_one_iter_explicit_inner_outer_smoke(tmp_path):
     assert "lower_updates_per_step" in rows[0]
     assert "upper_warmup_steps" in rows[0]
     assert "iter_upper_update_step_delta" in rows[0]
+    assert "support_gate_enabled" in rows[0]
+    assert rows[0]["support_gate_enabled"] == "True"
+    assert rows[0]["support_update_acceptance"] == "support_side_gated"
+    assert rows[0]["query_leakage"] == "False"
+
+
+def test_support_gate_accept_reject_and_query_independence():
+    cfg = {"score_threshold": 0.0, "reward_weight": 1.0, "cost_weight": 1.0, "violation_weight": 1.0}
+    accepted = evaluate_support_gate(
+        SupportGateStats(reward=1.0, cost=0.1, violation_rate=0.0),
+        SupportGateStats(reward=1.3, cost=0.1, violation_rate=0.0),
+        parameter_delta=0.5,
+        config={**cfg, "query_reward": -9999.0},
+    )
+    accepted_changed_query = evaluate_support_gate(
+        SupportGateStats(reward=1.0, cost=0.1, violation_rate=0.0),
+        SupportGateStats(reward=1.3, cost=0.1, violation_rate=0.0),
+        parameter_delta=0.5,
+        config={**cfg, "query_reward": 9999.0, "query_violation": 1.0},
+    )
+    rejected = evaluate_support_gate(
+        SupportGateStats(reward=1.0, cost=0.1, violation_rate=0.0),
+        SupportGateStats(reward=0.2, cost=0.5, violation_rate=0.2),
+        parameter_delta=0.5,
+        config=cfg,
+    )
+
+    assert accepted.accepted is True
+    assert accepted_changed_query == accepted
+    assert accepted.query_leakage is False
+    assert accepted.extra_support_rollouts == 0
+    assert accepted.extra_gradient_updates == 0
+    assert accepted.extra_query_evaluations == 0
+    assert rejected.accepted is False
+    assert rejected.reason == "reject_support_score_degradation"
+
+
+def test_support_gate_reject_rolls_back_full_training_state(tmp_path):
+    cfg = load_cfg("configs/default.yaml")
+    cfg["experiment"]["log_dir"] = str(tmp_path)
+    cfg["experiment"]["run_name"] = "gate_reject_smoke"
+    cfg["experiment"]["seed"] = 19
+    cfg["env"]["episode_len"] = 8
+    cfg["agent"]["hidden_dim"] = 32
+    cfg["agent"]["batch_size"] = 4
+    cfg["agent"]["warmup_steps"] = 4
+    cfg["agent"]["upper_batch_size"] = 2
+    cfg["upper_dqn"]["batch_size"] = 2
+    cfg["agent"]["upper_update_every"] = 1
+    cfg["buffer"]["replay_size"] = 128
+    cfg["buffer"]["context_max_len"] = 64
+    cfg["meta"]["meta_iters"] = 1
+    cfg["meta"]["n_tasks_per_iter"] = 1
+    cfg["meta"]["support_episodes"] = 1
+    cfg["meta"]["query_episodes"] = 0
+    cfg["meta"]["inner_warmup_steps"] = 4
+    cfg["meta"]["inner_upper_warmup_steps"] = 2
+    cfg["meta"]["support_gate"]["enabled"] = True
+    cfg["meta"]["support_gate"]["score_threshold"] = 1.0e9
+    cfg["upper_dqn"]["epsilon_decay_steps"] = 10
+    cfg["context"]["gru_hidden"] = 16
+
+    trainer = MetaTrainer(cfg)
+    csv_path = trainer.train(meta_iters=1)
+    with open(csv_path, newline="") as f:
+        row = list(csv.DictReader(f))[0]
+
+    assert row["support_gate_enabled"] == "True"
+    assert float(row["support_gate_reject_rate"]) == 1.0
+    assert row["rollback_performed"] == "True"
+    assert float(row["rollback_parameter_residual"]) == 0.0
+    assert float(row["rollback_dual_residual"]) == 0.0
+    assert float(row["rollback_context_residual"]) == 0.0
+    assert row["optimizer_state_restored"] == "True"
+    assert row["context_state_restored"] == "True"
+    assert row["dual_state_restored"] == "True"
+    assert int(float(row["extra_support_rollouts"])) == 0
+    assert int(float(row["extra_gradient_updates"])) == 0
+    assert int(float(row["extra_query_evaluations"])) == 0
+
+
+def test_support_gate_accept_keeps_adapted_parameters_without_extra_budget(tmp_path):
+    cfg = load_cfg("configs/default.yaml")
+    cfg["experiment"]["log_dir"] = str(tmp_path)
+    cfg["experiment"]["run_name"] = "gate_accept_smoke"
+    cfg["experiment"]["seed"] = 23
+    cfg["env"]["episode_len"] = 8
+    cfg["agent"]["hidden_dim"] = 32
+    cfg["agent"]["batch_size"] = 4
+    cfg["agent"]["warmup_steps"] = 4
+    cfg["agent"]["upper_batch_size"] = 2
+    cfg["upper_dqn"]["batch_size"] = 2
+    cfg["agent"]["upper_update_every"] = 1
+    cfg["buffer"]["replay_size"] = 128
+    cfg["buffer"]["context_max_len"] = 64
+    cfg["meta"]["meta_iters"] = 1
+    cfg["meta"]["n_tasks_per_iter"] = 1
+    cfg["meta"]["support_episodes"] = 1
+    cfg["meta"]["query_episodes"] = 0
+    cfg["meta"]["inner_warmup_steps"] = 4
+    cfg["meta"]["inner_upper_warmup_steps"] = 2
+    cfg["meta"]["support_gate"]["enabled"] = True
+    cfg["meta"]["support_gate"]["score_threshold"] = -1.0e9
+    cfg["upper_dqn"]["epsilon_decay_steps"] = 10
+    cfg["context"]["gru_hidden"] = 16
+
+    trainer = MetaTrainer(cfg)
+    csv_path = trainer.train(meta_iters=1)
+    with open(csv_path, newline="") as f:
+        row = list(csv.DictReader(f))[0]
+
+    assert row["support_gate_enabled"] == "True"
+    assert float(row["support_gate_accept_rate"]) == 1.0
+    assert row["rollback_performed"] == "False"
+    assert int(float(row["extra_support_rollouts"])) == 0
+    assert int(float(row["extra_gradient_updates"])) == 0
+    assert int(float(row["extra_query_evaluations"])) == 0
 
 
 def test_support_delta_norm_ignores_optimizer_state():
@@ -216,9 +337,10 @@ def test_meta_adaptation_diagnostics_outputs_meta_vs_wo_meta_rows(tmp_path):
     assert "query_reward_after_support" in summary["adaptation_summary"]["hybrid_meta"]
     assert summary["adaptation_summary"]["hybrid_meta"]["query_has_support_context_fraction"] == 1.0
     assert summary["adaptation_summary"]["hybrid_meta_no_support_adapt"]["query_has_support_context_fraction"] == 1.0
-    assert summary["adaptation_summary"]["hybrid_meta_support_gated"]["query_has_support_context_fraction"] == 1.0
+    assert 0.0 <= summary["adaptation_summary"]["hybrid_meta_support_gated"]["query_has_support_context_fraction"] <= 1.0
     assert "support_gate_accept_rate" in summary["adaptation_summary"]["hybrid_meta_support_gated"]
     assert "support_gate_no_support_rate" in summary["adaptation_summary"]["hybrid_meta_support_gated"]
+    assert "support_gate_rollback_rate" in summary["adaptation_summary"]["hybrid_meta_support_gated"]
     assert "support_gate_context_only_rate" in summary["adaptation_summary"]["hybrid_meta_support_gated"]
     assert summary["adaptation_summary"]["hybrid_context_only"]["query_has_support_context_fraction"] == 1.0
     assert summary["adaptation_summary"]["hybrid_wo_meta"]["query_has_support_context_fraction"] == 0.0
@@ -273,7 +395,7 @@ def test_meta_adaptation_diagnostics_outputs_meta_vs_wo_meta_rows(tmp_path):
     assert wo_support[0]["support_train_adapts"] == "False"
     assert int(meta_support[0]["context_history_len_before_query"]) > 0
     assert int(no_adapt_support[0]["context_history_len_before_query"]) > 0
-    assert int(gated_support[0]["context_history_len_before_query"]) > 0
+    assert int(gated_support[0]["context_history_len_before_query"]) >= 0
     assert int(context_only_support[0]["context_history_len_before_query"]) > 0
     assert int(wo_support[0]["context_history_len_before_query"]) == 0
     assert "support_parameter_delta_norm" in rows[0]
@@ -314,10 +436,11 @@ def test_support_gated_meta_uses_support_validation_not_query(tmp_path):
     gated_rows = [row for row in rows if row["variant"] == "hybrid_meta_support_gated"]
     assert gated_rows
     validation_rows = [row for row in gated_rows if row["support_gate_validation"] == "True"]
-    assert validation_rows
-    assert all(row["phase"] == "support" for row in validation_rows)
-    assert all(row["support_train_adapts"] == "False" for row in validation_rows)
-    assert all(row["support_gate_selected"] in {"adapted", "context_only", "no_support"} for row in validation_rows)
+    assert not validation_rows
+    support_rows = [row for row in gated_rows if row["phase"] == "support"]
+    assert support_rows
+    assert all(row["support_train_adapts"] == "True" for row in support_rows)
+    assert all(row["support_gate_selected"] in {"adapted", "rollback"} for row in support_rows)
     query_rows = [row for row in gated_rows if row["phase"] == "query"]
     assert query_rows
     assert all(row["query_parameter_delta_norm"] == "0.0" for row in query_rows)

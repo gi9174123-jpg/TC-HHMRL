@@ -169,8 +169,24 @@ def test_ablation_wo_meta_disables_meta_adaptation_and_context():
     assert cfg["context"]["enabled"] is False
     assert cfg["meta"]["explicit_inner_outer"] is False
     assert cfg["meta"]["query_updates_enabled"] is False
+    assert cfg["meta"]["support_gate"]["enabled"] is False
     assert int(cfg["meta"]["query_episodes"]) == 0
     assert int(cfg["meta"]["support_episodes"]) > 0
+
+
+def test_full_hybrid_support_gate_default_and_ungated_ablation():
+    cfg = load_cfg("configs/default.yaml")
+    assert cfg["meta"]["support_gate"]["enabled"] is True
+    assert cfg["meta"]["support_gate"]["role"] == "rollback_guard"
+    assert cfg["meta"]["support_gate"]["query_leakage"] is False
+    assert int(cfg["meta"]["support_gate"]["extra_support_rollouts"]) == 0
+    assert int(cfg["meta"]["support_gate"]["extra_gradient_updates"]) == 0
+
+    ungated = copy.deepcopy(cfg)
+    apply_ablation(ungated, "meta_ungated")
+    assert ungated["meta"]["support_gate"]["enabled"] is False
+    assert ungated["meta"]["support_update_acceptance"] == "unconditional"
+    assert ungated["pilot_metadata"]["comparison_role"] == "ungated_meta_ablation"
 
 
 def test_ablation_wo_lagrangian_disables_dual_updates():
@@ -192,6 +208,23 @@ def test_ablation_hard_clip_switches_safety_projection_mode():
     apply_ablation(cfg, "hard_clip")
 
     assert cfg["safety"]["projection_mode"] == "hard_clip"
+    assert cfg["pilot_metadata"]["projection_variant"] == "naive_component_wise_clip"
+    assert cfg["pilot_metadata"]["comparison_role"] == "diagnostic_clip_ablation"
+    assert cfg["pilot_metadata"]["strong_safety_baseline"] is False
+    assert cfg["pilot_metadata"]["qos_recovery_rule"] == "none_componentwise_zero_if_thermal_infeasible"
+
+
+def test_ablation_qos_aware_hard_clip_sets_fair_projection_metadata():
+    cfg = load_cfg("configs/default.yaml")
+    cfg = copy.deepcopy(cfg)
+    apply_ablation(cfg, "qos_aware_hard_clip")
+
+    assert cfg["safety"]["projection_mode"] == "qos_aware_hard_clip"
+    assert cfg["pilot_metadata"]["projection_variant"] == "qos_aware_feasible_hard_projection"
+    assert cfg["pilot_metadata"]["comparison_role"] == "fair_hard_projection_baseline"
+    assert cfg["pilot_metadata"]["strong_safety_baseline"] is True
+    assert cfg["pilot_metadata"]["oracle_future_disturbances"] is False
+    assert "non_oracle_current_recovery" in cfg["pilot_metadata"]["qos_recovery_rule"]
 
 
 def test_ablation_smooth_relaxed_sets_pilot_metadata():
@@ -229,6 +262,7 @@ def test_baseline_shin2024_disables_meta_and_sets_ddpg_hparams():
     assert cfg["context"]["enabled"] is False
     assert int(cfg["agent"]["z_dim"]) == 0
     assert cfg["meta"]["explicit_inner_outer"] is False
+    assert cfg["meta"]["support_gate"]["enabled"] is False
     assert cfg["meta"]["dual_enabled"] is False
     assert float(cfg["upper_dqn"]["epsilon_start"]) == 0.01
     assert float(cfg["upper_dqn"]["epsilon_final"]) == 0.01
@@ -243,6 +277,31 @@ def test_baseline_shin2024_disables_meta_and_sets_ddpg_hparams():
     assert cfg["baseline_metadata"]["safety_protocol"] == "common_thermal_cap_projection"
     assert cfg["baseline_metadata"]["fixed_mode_name"] == "HY"
     assert cfg["baseline_metadata"]["fixed_current_template"] == "tanh_affine_fraction"
+    assert cfg["baseline_metadata"]["meta_learning"] is False
+    assert cfg["baseline_metadata"]["support_gate"] is False
+
+
+def test_non_meta_baseline_overrides_disable_support_gate():
+    for baseline in [
+        "shin2024_matched",
+        "shin2024_adapted_codebook",
+        "shin2024_adapted_codebook_tuned",
+        "sac_lagrangian",
+        "sac_dalal_safe",
+        "uysal_policy_optimizer",
+        "mpc_grid",
+        "javadi_ppo_dimming",
+        "deeprat_assignment_power",
+        "pdqn_hybrid_action",
+    ]:
+        cfg = load_cfg("configs/default.yaml")
+        cfg = copy.deepcopy(cfg)
+        apply_baseline_overrides(cfg, baseline)
+
+        assert cfg["meta"]["explicit_inner_outer"] is False
+        assert cfg["meta"]["support_gate"]["enabled"] is False
+        assert cfg["meta"]["query_updates_enabled"] is False
+        assert cfg["context"]["enabled"] is False
 
 
 def test_shin2024_matched_action_contract_forces_hy_and_fixed_currents(tmp_path):

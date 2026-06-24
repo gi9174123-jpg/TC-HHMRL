@@ -198,6 +198,32 @@ class HierarchicalAgent:
         self.context_optim.load_state_dict(copy.deepcopy(state["context_optim"]))
         self.global_step = int(state.get("global_step", 0))
 
+    def snapshot_mutable_state(self) -> Dict:
+        state = self.snapshot_train_state()
+        state.update(
+            {
+                "replay": self.replay.state_dict(),
+                "upper_replay": self.upper_replay.state_dict(),
+                "episode": self.episode.state_dict(),
+                "safety_mem": copy.deepcopy(self.safety_mem),
+                "upper_mem": copy.deepcopy(self.upper_mem),
+                "upper_plan": copy.deepcopy(self.upper_plan),
+            }
+        )
+        return state
+
+    def restore_mutable_state(self, state: Dict) -> None:
+        self.restore_train_state(state)
+        if "replay" in state:
+            self.replay.load_state_dict(copy.deepcopy(state["replay"]))
+        if "upper_replay" in state:
+            self.upper_replay.load_state_dict(copy.deepcopy(state["upper_replay"]))
+        if "episode" in state:
+            self.episode.load_state_dict(copy.deepcopy(state["episode"]))
+        self.safety_mem = copy.deepcopy(state.get("safety_mem", self.safety_mem))
+        self.upper_mem = copy.deepcopy(state.get("upper_mem", self.upper_mem))
+        self.upper_plan = copy.deepcopy(state.get("upper_plan", None))
+
     @staticmethod
     def _average_state_dict(states: list[Dict[str, torch.Tensor]]) -> Dict[str, torch.Tensor]:
         if not states:

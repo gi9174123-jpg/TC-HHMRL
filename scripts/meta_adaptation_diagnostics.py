@@ -25,6 +25,7 @@ from scripts.benchmark_constraint_scenarios import (
 from tchhmrl.envs.task_contract import ordered_task_batch_hash, task_batch_hash
 from tchhmrl.envs.uw_slipt_env import MultiTxUwSliptEnv
 from tchhmrl.meta.meta_trainer import EpisodeStats, MetaTrainer
+from tchhmrl.meta.support_gate import evaluate_support_gate
 from tchhmrl.utils.config import load_cfg
 
 
@@ -350,17 +351,12 @@ def _collect_variant_rows(
         trainer.agent.reset_rollout_state(clear_context=True)
         task_row_start = len(rows)
 
-        gate_active = bool(support_gate_enabled and support_train_adapts and int(support_episodes) >= 2)
-        gate_validation_episodes = int(np.clip(int(support_gate_validation_episodes), 1, max(1, int(support_episodes) - 1)))
-        n_adapt_support = int(support_episodes) - gate_validation_episodes if gate_active else int(support_episodes)
-        support_context_snapshot: List[Dict] = []
-        adapted_state: Dict | None = None
-        adapted_dual_state: Dict | None = None
-        gate_stats_no_context: EpisodeStats | None = None
-        gate_stats_context_only: EpisodeStats | None = None
-        gate_stats_after: EpisodeStats | None = None
-        gate_accepted = False
-        gate_selected = ""
+        gate_active = bool(support_gate_enabled and support_train_adapts)
+        rollback_state = trainer.agent.snapshot_mutable_state() if gate_active else None
+        rollback_dual_state = copy.deepcopy(trainer.dual.state_dict()) if gate_active else None
+        n_adapt_support = int(support_episodes)
+        gate_accepted = True
+        gate_selected = "unconditional"
         gate_score_no_context = 0.0
         gate_score_before = 0.0
         gate_score_after = 0.0
@@ -396,129 +392,25 @@ def _collect_variant_rows(
             )
             episode_global += 1
 
-        if gate_active:
-            support_context_snapshot = _snapshot_context(trainer)
-            adapted_state = trainer.agent.snapshot_train_state()
-            adapted_dual_state = copy.deepcopy(trainer.dual.state_dict())
-            validation_seeds = [
-                int(seed + task_id * 10_000 + 1_000 + n_adapt_support + val_idx)
-                for val_idx in range(gate_validation_episodes)
-            ]
-
-            def _score_candidate(
-                *,
-                train_state: Dict,
-                dual_state: Dict,
-                context_items: List[Dict],
-                clear_context: bool,
-            ) -> float:
-                scores: List[float] = []
-                for validation_seed in validation_seeds:
-                    _set_episode_seed(validation_seed)
-                    trainer.agent.restore_train_state(train_state)
-                    trainer.dual.load_state_dict(copy.deepcopy(dual_state))
-                    if clear_context:
-                        trainer.agent.episode.clear()
-                    else:
-                        _restore_context(trainer, context_items)
-                    gate_env = MultiTxUwSliptEnv(cfg, overrides=task.to_env_overrides())
-                    gate_env.rng = np.random.default_rng(validation_seed)
-                    stats_val = trainer._run_episode(gate_env, train=False, clear_context=clear_context)
-                    scores.append(_gate_score(stats_val))
-                return _mean(scores)
-
-            gate_score_no_context = _score_candidate(
-                train_state=base_state,
-                dual_state=base_dual_state,
-                context_items=[],
-                clear_context=True,
+        if gate_active and rollback_state is not None and rollback_dual_state is not None:
+            current_state_for_gate = trainer.agent.snapshot_train_state()
+            parameter_delta = MetaTrainer._trainable_parameter_delta_norm(rollback_state, current_state_for_gate)
+            before_stats, after_stats = MetaTrainer._support_gate_before_after(support_stats)
+            decision = evaluate_support_gate(
+                before_stats,
+                after_stats,
+                parameter_delta=parameter_delta,
+                config=cfg.get("meta", {}).get("support_gate", {}),
             )
-            gate_score_before = _score_candidate(
-                train_state=base_state,
-                dual_state=base_dual_state,
-                context_items=support_context_snapshot,
-                clear_context=False,
-            )
-            gate_score_after = _score_candidate(
-                train_state=adapted_state,
-                dual_state=adapted_dual_state,
-                context_items=support_context_snapshot,
-                clear_context=False,
-            )
-            candidates = {
-                "no_support": gate_score_no_context,
-                "context_only": gate_score_before,
-                "adapted": gate_score_after,
-            }
-            if gate_score_after >= gate_score_no_context and gate_score_after >= gate_score_before:
-                gate_selected = "adapted"
-            elif gate_score_before >= gate_score_no_context:
-                gate_selected = "context_only"
-            else:
-                gate_selected = "no_support"
-            selected_score = float(candidates[gate_selected])
-            gate_score_delta = float(selected_score - gate_score_no_context)
-            gate_accepted = gate_selected == "adapted"
-
-            if gate_selected == "adapted":
-                trainer.agent.restore_train_state(adapted_state)
-                trainer.dual.load_state_dict(copy.deepcopy(adapted_dual_state))
-                _restore_context(trainer, support_context_snapshot)
-                validation_clear_context = False
-            elif gate_selected == "context_only":
-                trainer.agent.restore_train_state(base_state)
-                trainer.agent.upper.update_steps = base_upper_steps
-                trainer.agent.lower.update_steps = base_lower_steps
-                trainer.dual.load_state_dict(copy.deepcopy(base_dual_state))
-                _restore_context(trainer, support_context_snapshot)
-                validation_clear_context = False
-            else:
-                trainer.agent.restore_train_state(base_state)
-                trainer.agent.upper.update_steps = base_upper_steps
-                trainer.agent.lower.update_steps = base_lower_steps
-                trainer.dual.load_state_dict(copy.deepcopy(base_dual_state))
-                trainer.agent.episode.clear()
-                validation_clear_context = True
-
-            for val_idx, validation_seed in enumerate(validation_seeds):
-                _set_episode_seed(validation_seed)
-                gate_env = MultiTxUwSliptEnv(cfg, overrides=task.to_env_overrides())
-                gate_env.rng = np.random.default_rng(validation_seed)
-                validation_stats = trainer._run_episode(
-                    gate_env,
-                    train=False,
-                    clear_context=validation_clear_context and val_idx == 0,
-                )
-                if gate_selected == "no_support":
-                    trainer.agent.episode.clear()
-                support_stats.append(validation_stats)
-                rows.append(
-                    _episode_row(
-                        scenario=scenario,
-                        seed=seed,
-                        variant=variant,
-                        task_id=task_id,
-                        site_id=site_id,
-                        phase="support",
-                        episode_in_phase=n_adapt_support + val_idx,
-                        episode_global=episode_global,
-                        episode_seed=validation_seed,
-                        stats=validation_stats,
-                        context_enabled=context_enabled,
-                        explicit_inner_outer=explicit_inner_outer,
-                        support_train_adapts=False,
-                        support_gate_enabled=True,
-                        support_gate_validation=True,
-                        support_gate_accepted=gate_accepted,
-                        support_gate_selected=gate_selected,
-                        support_gate_metric="support_validation_reward",
-                        support_gate_score_no_context=gate_score_no_context,
-                        support_gate_score_before=gate_score_before,
-                        support_gate_score_after=selected_score,
-                        support_gate_score_delta=gate_score_delta,
-                    )
-                )
-                episode_global += 1
+            gate_accepted = bool(decision.accepted)
+            gate_selected = "adapted" if gate_accepted else "rollback"
+            gate_score_no_context = float(decision.threshold)
+            gate_score_before = float(decision.gate_score)
+            gate_score_after = float(decision.gate_score)
+            gate_score_delta = float(decision.gate_score)
+            if not gate_accepted:
+                trainer.agent.restore_mutable_state(rollback_state)
+                trainer.dual.load_state_dict(copy.deepcopy(rollback_dual_state))
 
         if support_train_adapts and trainer.dual_enabled and support_stats and (not gate_active or gate_accepted):
             mean_cost_vec = np.mean(np.stack([s.cost_vec for s in support_stats], axis=0), axis=0)
@@ -529,7 +421,7 @@ def _collect_variant_rows(
             "support_gate_enabled": gate_active,
             "support_gate_accepted": gate_accepted,
             "support_gate_selected": gate_selected,
-            "support_gate_metric": "support_validation_reward" if gate_active else "",
+            "support_gate_metric": "support_score_non_degradation" if gate_active else "",
             "support_gate_score_no_context": gate_score_no_context,
             "support_gate_score_before": gate_score_before,
             "support_gate_score_after": float(gate_score_no_context + gate_score_delta) if gate_active else gate_score_after,
@@ -546,15 +438,6 @@ def _collect_variant_rows(
         }
         for row in rows[task_row_start:]:
             row.update(support_diag)
-            if bool(row.get("support_gate_validation", False)):
-                row["support_gate_enabled"] = True
-                row["support_gate_accepted"] = gate_accepted
-                row["support_gate_selected"] = gate_selected
-                row["support_gate_metric"] = "support_validation_reward"
-                row["support_gate_score_no_context"] = gate_score_no_context
-                row["support_gate_score_before"] = gate_score_before
-                row["support_gate_score_after"] = float(gate_score_no_context + gate_score_delta)
-                row["support_gate_score_delta"] = gate_score_delta
 
         query_base_state = trainer.agent.snapshot_train_state()
         query_base_global_step = int(trainer.agent.global_step)
@@ -759,6 +642,9 @@ def _summarize_rows(rows: List[Dict[str, object]]) -> Dict[str, object]:
             "support_gate_no_support_rate": _mean(
                 float(row.get("support_gate_selected", "") == "no_support") for row in variant_rows
             ),
+            "support_gate_rollback_rate": _mean(
+                float(row.get("support_gate_selected", "") == "rollback") for row in variant_rows
+            ),
             "support_gate_adapted_rate": _mean(
                 float(row.get("support_gate_selected", "") == "adapted") for row in variant_rows
             ),
@@ -797,8 +683,11 @@ def _summarize_rows(rows: List[Dict[str, object]]) -> Dict[str, object]:
                 "pre_query_eval_before_support": True,
                 "support_train_adapts": True,
                 "support_gate_enabled": True,
-                "support_gate_rule": "select_best_of_no_support_context_only_adapted_using_support_validation_reward",
+                "support_gate_rule": "support_score_non_degradation_rollback_guard",
                 "query_used_by_gate": False,
+                "extra_support_rollouts": 0,
+                "extra_gradient_updates": 0,
+                "extra_query_evaluations": 0,
                 "query_eval_after_support": True,
                 "query_train_updates": False,
                 "matched_pre_post_eval_episode_seeds": True,

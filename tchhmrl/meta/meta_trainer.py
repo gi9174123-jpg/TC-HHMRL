@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import copy
 import math
+import time
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Dict, List
@@ -14,6 +15,7 @@ from tchhmrl.constraints.dual_layer import DualLayer
 from tchhmrl.envs.task_sampler import TaskSampler
 from tchhmrl.envs.task_contract import build_task_summary_v2, task_defaults_from_cfg
 from tchhmrl.envs.uw_slipt_env import MultiTxUwSliptEnv
+from tchhmrl.meta.support_gate import SupportGateDecision, SupportGateStats, evaluate_support_gate
 from tchhmrl.utils.config import resolve_device
 from tchhmrl.utils.logger import Logger
 from tchhmrl.utils.seed import set_seed
@@ -69,6 +71,13 @@ class MetaTrainer:
         self.outer_step_size = float(meta_cfg.get("outer_step_size", 0.15))
         self.query_updates_enabled = bool(meta_cfg.get("query_updates_enabled", True))
         self.query_context_updates_enabled = bool(meta_cfg.get("query_context_updates_enabled", True))
+        support_gate_cfg = meta_cfg.get("support_gate", {})
+        if not isinstance(support_gate_cfg, dict):
+            support_gate_cfg = {}
+        self.support_gate_cfg = copy.deepcopy(support_gate_cfg)
+        self.support_gate_enabled = bool(support_gate_cfg.get("enabled", False))
+        self.support_gate_role = str(support_gate_cfg.get("role", "rollback_guard"))
+        self.support_gate_rule = str(support_gate_cfg.get("rule", "support_score_non_degradation"))
         self.inner_warmup_steps = int(meta_cfg.get("inner_warmup_steps", max(self.agent.batch_size, 64)))
         self.inner_upper_warmup_steps = int(
             meta_cfg.get("inner_upper_warmup_steps", max(self.agent.batch_size // 2, 32))
@@ -178,6 +187,53 @@ class MetaTrainer:
                 ("lower", "q1_tgt"),
                 ("lower", "q2_tgt"),
             ],
+        )
+
+    @staticmethod
+    def _dual_delta_norm(reference: Dict, current: Dict) -> float:
+        ref = np.asarray(reference.get("values", []), dtype=np.float32).reshape(-1)
+        cur = np.asarray(current.get("values", []), dtype=np.float32).reshape(-1)
+        if ref.shape != cur.shape:
+            return float("inf")
+        diff = cur - ref
+        return float(np.sqrt(float(np.sum(diff * diff))))
+
+    @staticmethod
+    def _mean_gate_stats(stats: List[EpisodeStats]) -> SupportGateStats:
+        if not stats:
+            return SupportGateStats()
+        return SupportGateStats(
+            reward=float(np.mean([s.reward for s in stats])),
+            cost=float(np.mean([s.cost for s in stats])),
+            violation_rate=float(np.mean([s.violations for s in stats])),
+        )
+
+    @classmethod
+    def _support_gate_before_after(cls, stats: List[EpisodeStats]) -> tuple[SupportGateStats, SupportGateStats]:
+        if not stats:
+            empty = SupportGateStats()
+            return empty, empty
+        if len(stats) == 1:
+            one = cls._mean_gate_stats(stats)
+            return one, one
+        split = max(1, len(stats) // 2)
+        return cls._mean_gate_stats(stats[:split]), cls._mean_gate_stats(stats[split:])
+
+    def _support_gate_active(self) -> bool:
+        return bool(self.support_gate_enabled and self.explicit_inner_outer)
+
+    def _evaluate_support_gate(
+        self,
+        *,
+        support_stats: List[EpisodeStats],
+        parameter_delta: float,
+    ) -> SupportGateDecision:
+        before, after = self._support_gate_before_after(support_stats)
+        return evaluate_support_gate(
+            pre_support_stats=before,
+            post_support_stats=after,
+            parameter_delta=float(parameter_delta),
+            config=self.support_gate_cfg,
         )
 
     def _run_episode(self, env: MultiTxUwSliptEnv, train: bool, clear_context: bool = True) -> EpisodeStats:
@@ -399,6 +455,7 @@ class MetaTrainer:
             adapted_dual_states: List[Dict] = []
             inner_delta_norms: List[float] = []
             target_delta_norms: List[float] = []
+            support_gate_records: List[Dict[str, float | str | bool]] = []
             base_state = self.agent.snapshot_train_state() if self.explicit_inner_outer else None
             base_dual_state = copy.deepcopy(self.dual.state_dict()) if self.explicit_inner_outer else None
             shared_global_step = int(self.agent.global_step)
@@ -417,18 +474,135 @@ class MetaTrainer:
                 if self.explicit_inner_outer:
                     self.agent.clear_learning_buffers()
 
+                gate_active = self._support_gate_active()
+                rollback_state = self.agent.snapshot_mutable_state() if gate_active else None
+                rollback_dual_state = copy.deepcopy(self.dual.state_dict()) if gate_active else None
+                support_adapt_start = time.perf_counter()
                 task_support_stats: List[EpisodeStats] = []
                 for ep_idx in range(int(meta_cfg["support_episodes"])):
                     ep_stats = self._run_episode(env, train=True, clear_context=(ep_idx == 0))
                     support_stats.append(ep_stats)
                     task_support_stats.append(ep_stats)
+                support_adapt_latency_ms = float((time.perf_counter() - support_adapt_start) * 1000.0)
 
-                if self.explicit_inner_outer and self.dual_enabled and task_support_stats:
+                gate_accepted = True
+                gate_reason = "support_gate_disabled"
+                gate_score = 0.0
+                gate_threshold = 0.0
+                gate_reward_before = 0.0
+                gate_reward_after = 0.0
+                gate_reward_delta = 0.0
+                gate_cost_before = 0.0
+                gate_cost_after = 0.0
+                gate_cost_delta = 0.0
+                gate_violation_before = 0.0
+                gate_violation_after = 0.0
+                gate_violation_delta = 0.0
+                gate_parameter_delta_norm = 0.0
+                rollback_performed = False
+                rollback_residual = 0.0
+                rollback_dual_residual = 0.0
+                rollback_context_residual = 0
+                rollback_lower_replay_residual = 0
+                rollback_upper_replay_residual = 0
+                gate_latency_ms = 0.0
+                rollback_latency_ms = 0.0
+
+                if gate_active and rollback_state is not None and rollback_dual_state is not None:
+                    gate_start = time.perf_counter()
+                    candidate_state = self.agent.snapshot_train_state()
+                    gate_parameter_delta_norm = self._trainable_parameter_delta_norm(rollback_state, candidate_state)
+                    decision = self._evaluate_support_gate(
+                        support_stats=task_support_stats,
+                        parameter_delta=gate_parameter_delta_norm,
+                    )
+                    gate_accepted = bool(decision.accepted)
+                    gate_reason = str(decision.reason)
+                    gate_score = float(decision.gate_score)
+                    gate_threshold = float(decision.threshold)
+                    gate_reward_before = float(decision.support_stats_before.reward)
+                    gate_reward_after = float(decision.support_stats_after.reward)
+                    gate_reward_delta = float(decision.reward_delta)
+                    gate_cost_before = float(decision.support_stats_before.cost)
+                    gate_cost_after = float(decision.support_stats_after.cost)
+                    gate_cost_delta = float(decision.cost_delta)
+                    gate_violation_before = float(decision.support_stats_before.violation_rate)
+                    gate_violation_after = float(decision.support_stats_after.violation_rate)
+                    gate_violation_delta = float(decision.violation_delta)
+                    gate_latency_ms = float((time.perf_counter() - gate_start) * 1000.0)
+                    if not gate_accepted:
+                        rollback_start = time.perf_counter()
+                        self.agent.restore_mutable_state(rollback_state)
+                        self.dual.load_state_dict(copy.deepcopy(rollback_dual_state))
+                        rollback_performed = True
+                        rollback_latency_ms = float((time.perf_counter() - rollback_start) * 1000.0)
+                        restored_state = self.agent.snapshot_train_state()
+                        rollback_residual = self._trainable_parameter_delta_norm(rollback_state, restored_state)
+                        rollback_dual_residual = self._dual_delta_norm(
+                            rollback_dual_state,
+                            self.dual.state_dict(),
+                        )
+                        rollback_context_residual = abs(
+                            int(len(self.agent.episode))
+                            - int(len(rollback_state.get("episode", {}).get("items", [])))
+                        )
+                        rollback_lower_replay_residual = abs(
+                            int(len(self.agent.replay))
+                            - int(len(rollback_state.get("replay", {}).get("items", [])))
+                        )
+                        rollback_upper_replay_residual = abs(
+                            int(len(self.agent.upper_replay))
+                            - int(len(rollback_state.get("upper_replay", {}).get("items", [])))
+                        )
+
+                if self.explicit_inner_outer and self.dual_enabled and task_support_stats and gate_accepted:
                     task_support_mean_cost_vec = np.mean(
                         np.stack([s.cost_vec for s in task_support_stats], axis=0),
                         axis=0,
                     )
                     self.dual.update(task_support_mean_cost_vec)
+
+                support_gate_records.append(
+                    {
+                        "support_gate_enabled": bool(gate_active),
+                        "support_gate_accepted": bool(gate_accepted),
+                        "rollback_performed": bool(rollback_performed),
+                        "support_gate_reason": gate_reason,
+                        "support_gate_score": float(gate_score),
+                        "support_gate_threshold": float(gate_threshold),
+                        "support_reward_before": float(gate_reward_before),
+                        "support_reward_after": float(gate_reward_after),
+                        "support_reward_delta": float(gate_reward_delta),
+                        "support_cost_before": float(gate_cost_before),
+                        "support_cost_after": float(gate_cost_after),
+                        "support_cost_delta": float(gate_cost_delta),
+                        "support_violation_before": float(gate_violation_before),
+                        "support_violation_after": float(gate_violation_after),
+                        "support_violation_delta": float(gate_violation_delta),
+                        "support_parameter_delta_norm": float(gate_parameter_delta_norm),
+                        "rollback_parameter_residual": float(rollback_residual),
+                        "rollback_dual_residual": float(rollback_dual_residual),
+                        "rollback_context_residual": int(rollback_context_residual),
+                        "rollback_lower_replay_residual": int(rollback_lower_replay_residual),
+                        "rollback_upper_replay_residual": int(rollback_upper_replay_residual),
+                        "gate_latency_ms": float(gate_latency_ms),
+                        "rollback_latency_ms": float(rollback_latency_ms),
+                        "support_adaptation_latency_ms": float(support_adapt_latency_ms),
+                        "total_adaptation_latency_ms": float(
+                            support_adapt_latency_ms + gate_latency_ms + rollback_latency_ms
+                        ),
+                        "ungated_support_adaptation_latency_ms": float(support_adapt_latency_ms),
+                        "gated_support_adaptation_latency_ms": float(
+                            support_adapt_latency_ms + gate_latency_ms + rollback_latency_ms
+                        )
+                        if gate_active
+                        else 0.0,
+                        "extra_support_rollouts": 0,
+                        "extra_gradient_updates": 0,
+                        "extra_query_evaluations": 0,
+                        "query_leakage": False,
+                    }
+                )
 
                 for ep_idx in range(int(meta_cfg["query_episodes"])):
                     query_stats.append(
@@ -482,6 +656,28 @@ class MetaTrainer:
             else:
                 lambda_val = self.dual.update(mean_support_cost_vec)
 
+            def _gate_mean(key: str) -> float:
+                vals = [r[key] for r in support_gate_records if isinstance(r.get(key), (int, float, bool))]
+                return float(np.mean([float(v) for v in vals])) if vals else 0.0
+
+            gate_enabled_fraction = _gate_mean("support_gate_enabled")
+            gate_accept_rate = _gate_mean("support_gate_accepted") if support_gate_records else 0.0
+            gate_reject_rate = float(max(0.0, gate_enabled_fraction - gate_accept_rate))
+            accepted_update_count = int(
+                sum(1 for r in support_gate_records if bool(r.get("support_gate_enabled")) and bool(r.get("support_gate_accepted")))
+            )
+            rejected_update_count = int(
+                sum(1 for r in support_gate_records if bool(r.get("support_gate_enabled")) and not bool(r.get("support_gate_accepted")))
+            )
+            support_parameter_delta_logged = (
+                _gate_mean("support_parameter_delta_norm")
+                if gate_enabled_fraction > 0.0
+                else (float(np.mean(inner_delta_norms)) if inner_delta_norms else 0.0)
+            )
+            first_gate_reason = next(
+                (str(r.get("support_gate_reason", "")) for r in support_gate_records if str(r.get("support_gate_reason", ""))),
+                "",
+            )
             row = {
                 "iter": float(it),
                 "support_reward": float(np.mean([s.reward for s in support_stats])),
@@ -531,8 +727,54 @@ class MetaTrainer:
                 "query_updates_enabled": bool(self.query_updates_enabled),
                 "query_context_updates_enabled": bool(self.query_context_updates_enabled),
                 "heldout_query_evaluation": bool(self.explicit_inner_outer and not self.query_updates_enabled),
-                "support_parameter_delta_norm": float(np.mean(inner_delta_norms)) if inner_delta_norms else 0.0,
+                "support_gate_enabled": bool(gate_enabled_fraction > 0.0),
+                "support_gate_role": self.support_gate_role if gate_enabled_fraction > 0.0 else "",
+                "support_gate_rule": self.support_gate_rule if gate_enabled_fraction > 0.0 else "",
+                "support_update_acceptance": "support_side_gated" if gate_enabled_fraction > 0.0 else "unconditional",
+                "support_gate_uses_query": False,
+                "support_gate_extra_rollouts": 0,
+                "support_gate_extra_gradient_updates": 0,
+                "support_gate_extra_query_evaluations": 0,
+                "support_gate_accept_rate": gate_accept_rate,
+                "support_gate_reject_rate": gate_reject_rate,
+                "accepted_update_count": accepted_update_count,
+                "rejected_update_count": rejected_update_count,
+                "support_gate_accepted": bool(gate_accept_rate >= 0.5) if gate_enabled_fraction > 0.0 else True,
+                "support_gate_reason": first_gate_reason,
+                "support_gate_score": _gate_mean("support_gate_score"),
+                "support_gate_threshold": _gate_mean("support_gate_threshold"),
+                "support_reward_before": _gate_mean("support_reward_before"),
+                "support_reward_after": _gate_mean("support_reward_after"),
+                "support_reward_delta": _gate_mean("support_reward_delta"),
+                "support_cost_before": _gate_mean("support_cost_before"),
+                "support_cost_after": _gate_mean("support_cost_after"),
+                "support_cost_delta": _gate_mean("support_cost_delta"),
+                "support_violation_before": _gate_mean("support_violation_before"),
+                "support_violation_after": _gate_mean("support_violation_after"),
+                "support_violation_delta": _gate_mean("support_violation_delta"),
+                "support_parameter_delta_norm": float(support_parameter_delta_logged),
                 "support_target_parameter_delta_norm": float(np.mean(target_delta_norms)) if target_delta_norms else 0.0,
+                "support_gate_parameter_delta_norm": _gate_mean("support_parameter_delta_norm"),
+                "rollback_performed": bool(_gate_mean("rollback_performed") > 0.0),
+                "rollback_parameter_residual": _gate_mean("rollback_parameter_residual"),
+                "rollback_dual_residual": _gate_mean("rollback_dual_residual"),
+                "rollback_context_residual": _gate_mean("rollback_context_residual"),
+                "rollback_lower_replay_residual": _gate_mean("rollback_lower_replay_residual"),
+                "rollback_upper_replay_residual": _gate_mean("rollback_upper_replay_residual"),
+                "optimizer_state_restored": bool(gate_reject_rate == 0.0 or _gate_mean("rollback_parameter_residual") <= 1.0e-8),
+                "context_state_restored": bool(gate_reject_rate == 0.0 or _gate_mean("rollback_context_residual") == 0.0),
+                "dual_state_restored": bool(gate_reject_rate == 0.0 or _gate_mean("rollback_dual_residual") <= 1.0e-8),
+                "gate_latency_ms": _gate_mean("gate_latency_ms"),
+                "support_adaptation_latency_ms": _gate_mean("support_adaptation_latency_ms"),
+                "total_adaptation_latency_ms": _gate_mean("total_adaptation_latency_ms"),
+                "ungated_support_adaptation_latency_ms": _gate_mean("ungated_support_adaptation_latency_ms"),
+                "gated_support_adaptation_latency_ms": _gate_mean("gated_support_adaptation_latency_ms"),
+                "gate_only_latency_ms": _gate_mean("gate_latency_ms"),
+                "rollback_latency_ms": _gate_mean("rollback_latency_ms"),
+                "extra_support_rollouts": int(_gate_mean("extra_support_rollouts")),
+                "extra_gradient_updates": int(_gate_mean("extra_gradient_updates")),
+                "extra_query_evaluations": int(_gate_mean("extra_query_evaluations")),
+                "query_leakage": False,
                 "inner_warmup_steps": int(self.inner_warmup_steps),
                 "inner_upper_warmup_steps": int(self.inner_upper_warmup_steps),
                 "lower_batch_size": int(self.agent.batch_size),

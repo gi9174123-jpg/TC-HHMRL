@@ -14,11 +14,11 @@ from scripts.meta_adaptation_diagnostics import run_meta_adaptation_diagnostics
 DEFAULT_SEEDS = [101, 202, 303, 404, 505, 606, 707, 808, 909, 1001]
 DEFAULT_SCENARIOS = ["moderate_practical", "hard_stress"]
 VARIANT_ORDER = [
-    "hybrid_meta",
-    "hybrid_meta_no_support_adapt",
     "hybrid_meta_support_gated",
-    "hybrid_context_only",
+    "hybrid_meta",
     "hybrid_wo_meta",
+    "hybrid_meta_no_support_adapt",
+    "hybrid_context_only",
 ]
 PAIRWISE_METRICS = [
     "query_reward_after_support",
@@ -32,6 +32,7 @@ PAIRWISE_METRICS = [
     "support_gate_accept_rate",
     "support_gate_context_only_rate",
     "support_gate_no_support_rate",
+    "support_gate_rollback_rate",
     "support_gate_score_delta",
 ]
 
