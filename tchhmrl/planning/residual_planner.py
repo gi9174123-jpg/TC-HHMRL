@@ -508,6 +508,16 @@ class ResidualPlanner:
             ),
             "residual_planner_candidate_raw_distance": float(raw_distance[selected_idx].detach().cpu().item()),
             "residual_planner_candidate_exec_distance": float(exec_distance[selected_idx].detach().cpu().item()),
+            "residual_planner_raw_distance_mean": float(raw_distance.mean().detach().cpu().item()),
+            "residual_planner_raw_distance_p90": float(
+                torch.quantile(raw_distance.view(-1), 0.90).detach().cpu().item()
+            ),
+            "residual_planner_raw_distance_max": float(raw_distance.max().detach().cpu().item()),
+            "residual_planner_exec_distance_mean": float(exec_distance.mean().detach().cpu().item()),
+            "residual_planner_exec_distance_p90": float(
+                torch.quantile(exec_distance.view(-1), 0.90).detach().cpu().item()
+            ),
+            "residual_planner_exec_distance_max": float(exec_distance.max().detach().cpu().item()),
             "residual_planner_trust_region_rejected_count": int((~trust_valid[1:]).sum().detach().cpu().item())
             if self.trust_region_enabled
             else 0,

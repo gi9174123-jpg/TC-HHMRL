@@ -116,6 +116,12 @@ def test_agent_act_uses_residual_planner_after_start_iter():
     assert float(aux["residual_planner_probe_latency_ms"]) >= 0.0
     assert float(aux["residual_planner_candidate_search_latency_ms"]) >= 0.0
     assert float(aux["residual_planner_total_latency_ms"]) >= 0.0
+    assert float(aux["residual_planner_raw_distance_mean"]) >= 0.0
+    assert float(aux["residual_planner_raw_distance_p90"]) >= 0.0
+    assert float(aux["residual_planner_raw_distance_max"]) >= float(aux["residual_planner_raw_distance_p90"])
+    assert float(aux["residual_planner_exec_distance_mean"]) >= 0.0
+    assert float(aux["residual_planner_exec_distance_p90"]) >= 0.0
+    assert float(aux["residual_planner_exec_distance_max"]) >= float(aux["residual_planner_exec_distance_p90"])
     assert "residual_planner_thermal_risk" in aux
     assert "residual_planner_score_improvement" in aux
     assert np.asarray(aux["act_policy_raw"], dtype=np.float32).shape == (5,)
