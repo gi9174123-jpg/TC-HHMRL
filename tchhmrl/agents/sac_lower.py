@@ -198,6 +198,11 @@ class LowerSAC:
         mask = self._entropy_mask(boost, mode).to(dtype=logp_dim.dtype)
         return (logp_dim * mask).sum(dim=1, keepdim=True)
 
+    def _effective_target_entropy(self, boost: torch.Tensor, mode: torch.Tensor, dtype: torch.dtype) -> torch.Tensor:
+        active_dim = self._entropy_mask(boost, mode).sum(dim=1, keepdim=True).to(dtype=dtype)
+        per_dim_target = float(self.target_entropy) / float(max(self.act_dim, 1))
+        return active_dim * per_dim_target
+
     def _zero_physical_np(self) -> np.ndarray:
         return np.zeros((self.physical_dim,), dtype=np.float32)
 
@@ -540,8 +545,9 @@ class LowerSAC:
         self.actor_optim.step()
 
         alpha_loss_val = 0.0
+        target_entropy_eff = self._effective_target_entropy(boost, mode, dtype=logp_eff.dtype)
         if self.auto_alpha and self.alpha_optim is not None and self.log_alpha is not None:
-            alpha_loss = -(self.log_alpha * (logp_eff.detach() + self.target_entropy)).mean()
+            alpha_loss = -(self.log_alpha * (logp_eff.detach() + target_entropy_eff)).mean()
             self.alpha_optim.zero_grad()
             alpha_loss.backward()
             self.alpha_optim.step()
@@ -572,6 +578,7 @@ class LowerSAC:
             "entropy": float((-logp_eff).mean().item()),
             "entropy_unmasked": float((-logp).mean().item()),
             "entropy_mask_active_dim_mean": float(self._entropy_mask(boost, mode).sum(dim=1).detach().mean().item()),
+            "target_entropy_effective_mean": float(target_entropy_eff.detach().mean().item()),
             "alpha": float(alpha_t.detach().item()),
             "alpha_loss": float(alpha_loss_val),
             **constraint_batch_stats,

@@ -66,6 +66,25 @@ def test_lower_entropy_mask_matches_boost_and_mode_contract():
     assert np.allclose(mask[3], [1, 1, 1, 1, 1])  # full HY
 
 
+def test_lower_auto_alpha_target_entropy_uses_effective_action_dimensions():
+    cfg = _small_cfg()
+    cfg["lower_sac"]["auto_alpha"] = True
+    cfg["lower_sac"]["target_entropy"] = -5.0
+    safety = SafetyLayer(cfg)
+    sac = LowerSAC(cfg, safety, torch.device("cpu"))
+    batch = _dummy_lower_batch(cfg)
+    # Anchor-only PS leaves only total-current and rho latent dimensions active.
+    batch["boost_combo_exec"] = np.zeros_like(batch["boost_combo_exec"], dtype=np.float32)
+    batch["mode_exec"] = np.zeros_like(batch["mode_exec"], dtype=np.float32)
+    batch["boost_combo_exec_next"] = np.zeros_like(batch["boost_combo_exec_next"], dtype=np.float32)
+    batch["mode_exec_next"] = np.zeros_like(batch["mode_exec_next"], dtype=np.float32)
+
+    stats = sac.update(batch)
+
+    assert np.isclose(float(stats["entropy_mask_active_dim_mean"]), 2.0)
+    assert np.isclose(float(stats["target_entropy_effective_mean"]), -2.0)
+
+
 def _dummy_lower_batch(cfg: dict, batch_size: int = 4) -> dict:
     obs_dim = int(cfg["agent"]["obs_dim"])
     z_dim = int(cfg["agent"]["z_dim"])
