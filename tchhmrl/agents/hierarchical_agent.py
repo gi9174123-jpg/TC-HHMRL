@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import copy
 import random
+import warnings
 from pathlib import Path
 from typing import Callable, Dict, Optional, Tuple
 
@@ -102,6 +103,8 @@ class HierarchicalAgent:
         self.constraint_replay_boundary_fraction = float(constraint_replay_cfg.get("boundary_fraction", 0.30))
         self.constraint_replay_violation_fraction = float(constraint_replay_cfg.get("violation_fraction", 0.20))
         self.constraint_replay_importance_weighting = bool(constraint_replay_cfg.get("importance_weighting", True))
+        clip_cfg = constraint_replay_cfg.get("importance_weight_clip", [0.25, 4.0])
+        self.constraint_replay_importance_weight_clip = (float(clip_cfg[0]), float(clip_cfg[1]))
         self.constraint_replay_thresholds = {
             "thermal_headroom_threshold": constraint_replay_cfg.get("thermal_headroom_threshold", None),
             "qos_margin_threshold": constraint_replay_cfg.get("qos_margin_threshold", None),
@@ -109,7 +112,25 @@ class HierarchicalAgent:
             "projection_residual_threshold": constraint_replay_cfg.get("projection_residual_threshold", None),
             "constraint_cost_threshold": constraint_replay_cfg.get("constraint_cost_threshold", 1.0e-8),
             "temperature_slope_threshold": constraint_replay_cfg.get("temperature_slope_threshold", None),
+            "bus_current_max": float(self.safety.bus_current_max),
         }
+        self.constraint_replay_empty_bucket_warn_after = int(
+            constraint_replay_cfg.get("empty_bucket_warn_after", 20)
+        )
+        self.constraint_replay_empty_boundary_updates = 0
+        self.constraint_replay_empty_violation_updates = 0
+        if self.constraint_replay_enabled and bool(constraint_replay_cfg.get("require_boundary_thresholds", True)):
+            boundary_keys = (
+                "thermal_headroom_threshold",
+                "qos_margin_threshold",
+                "bus_utilization_threshold",
+                "projection_residual_threshold",
+                "temperature_slope_threshold",
+            )
+            if all(self.constraint_replay_thresholds.get(k) is None for k in boundary_keys):
+                raise ValueError(
+                    "constraint_replay.enabled requires at least one non-null boundary threshold"
+                )
 
         self.global_step = 0
         self.current_meta_iter = 0
@@ -512,8 +533,6 @@ class HierarchicalAgent:
             lower_raw,
             temps=temps,
             amb_temp=amb_temp,
-            gamma=gamma,
-            delta=delta,
             mem=self.safety_mem,
         )
 
@@ -778,6 +797,41 @@ class HierarchicalAgent:
                         violation_fraction=self.constraint_replay_violation_fraction,
                         thresholds=self.constraint_replay_thresholds,
                         importance_weighting=self.constraint_replay_importance_weighting,
+                        importance_weight_clip=self.constraint_replay_importance_weight_clip,
+                    )
+                    boundary_count = float(constraint_stats.get("constraint_batch_boundary_count", 0.0))
+                    violation_count = float(constraint_stats.get("constraint_batch_violation_count", 0.0))
+                    self.constraint_replay_empty_boundary_updates = (
+                        self.constraint_replay_empty_boundary_updates + 1 if boundary_count <= 0.0 else 0
+                    )
+                    self.constraint_replay_empty_violation_updates = (
+                        self.constraint_replay_empty_violation_updates + 1 if violation_count <= 0.0 else 0
+                    )
+                    if (
+                        self.constraint_replay_empty_bucket_warn_after > 0
+                        and self.constraint_replay_empty_boundary_updates == self.constraint_replay_empty_bucket_warn_after
+                    ):
+                        warnings.warn(
+                            "constraint replay boundary bucket has been empty for "
+                            f"{self.constraint_replay_empty_boundary_updates} consecutive lower updates",
+                            RuntimeWarning,
+                        )
+                    if (
+                        self.constraint_replay_empty_bucket_warn_after > 0
+                        and self.constraint_replay_empty_violation_updates == self.constraint_replay_empty_bucket_warn_after
+                    ):
+                        warnings.warn(
+                            "constraint replay violation bucket has been empty for "
+                            f"{self.constraint_replay_empty_violation_updates} consecutive lower updates",
+                            RuntimeWarning,
+                        )
+                    constraint_stats["constraint_empty_boundary_update"] = float(boundary_count <= 0.0)
+                    constraint_stats["constraint_empty_violation_update"] = float(violation_count <= 0.0)
+                    constraint_stats["constraint_empty_boundary_update_streak"] = float(
+                        self.constraint_replay_empty_boundary_updates
+                    )
+                    constraint_stats["constraint_empty_violation_update_streak"] = float(
+                        self.constraint_replay_empty_violation_updates
                     )
                 sac_stats = self.lower.update(lower_batch, constraint_batch=constraint_batch)
                 sac_stats.update(constraint_stats)

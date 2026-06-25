@@ -131,13 +131,16 @@ constraint_replay:
   uniform_fraction: 0.50
   boundary_fraction: 0.30
   violation_fraction: 0.20
-  thermal_headroom_threshold: null
+  thermal_headroom_threshold: 2.0
   qos_margin_threshold: null
-  bus_utilization_threshold: null
-  projection_residual_threshold: null
+  bus_utilization_threshold: 0.85
+  projection_residual_threshold: 0.10
   constraint_cost_threshold: 1.0e-8
-  temperature_slope_threshold: null
+  temperature_slope_threshold: 0.30
   importance_weighting: true
+  importance_weight_clip: [0.25, 4.0]
+  require_boundary_thresholds: true
+  empty_bucket_warn_after: 20
 
 residual_planner:
   enabled: true

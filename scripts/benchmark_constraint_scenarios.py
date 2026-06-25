@@ -244,6 +244,17 @@ def formal_metadata_snapshot(cfg: Dict, *, pre_alignment: bool | None = None, ta
         "constraint_replay_boundary_fraction": float(constraint_replay_cfg.get("boundary_fraction", 0.0) or 0.0),
         "constraint_replay_violation_fraction": float(constraint_replay_cfg.get("violation_fraction", 0.0) or 0.0),
         "constraint_replay_importance_weighting": bool(constraint_replay_cfg.get("importance_weighting", True)),
+        "constraint_replay_importance_weight_clip": list(
+            constraint_replay_cfg.get("importance_weight_clip", [0.25, 4.0])
+        ),
+        "constraint_replay_thermal_headroom_threshold": constraint_replay_cfg.get("thermal_headroom_threshold", None),
+        "constraint_replay_qos_margin_threshold": constraint_replay_cfg.get("qos_margin_threshold", None),
+        "constraint_replay_bus_utilization_threshold": constraint_replay_cfg.get("bus_utilization_threshold", None),
+        "constraint_replay_projection_residual_threshold": constraint_replay_cfg.get("projection_residual_threshold", None),
+        "constraint_replay_temperature_slope_threshold": constraint_replay_cfg.get("temperature_slope_threshold", None),
+        "constraint_replay_empty_bucket_warn_after": int(
+            constraint_replay_cfg.get("empty_bucket_warn_after", 0) or 0
+        ),
         "constraint_replay_reward_batch": "unchanged_reward_critic_batch",
         "constraint_replay_constraint_batch": "stratified_uniform_boundary_violation",
         "residual_planner_enabled": bool(planner_cfg.get("enabled", False)),
@@ -1811,6 +1822,9 @@ def _add_baseline_aux_diagnostics(row: Dict, aux: Dict) -> None:
         "residual_planner_effective_thermal_horizon",
         "residual_planner_selected_idx",
         "residual_planner_latency_ms",
+        "residual_planner_probe_latency_ms",
+        "residual_planner_candidate_search_latency_ms",
+        "residual_planner_total_latency_ms",
         "residual_planner_score",
         "residual_planner_score_improvement",
         "residual_planner_reward_value",

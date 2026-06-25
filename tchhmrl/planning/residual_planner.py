@@ -286,6 +286,7 @@ class ResidualPlanner:
             return np.asarray(policy_raw, dtype=np.float32), {"residual_planner_enabled": False}
 
         start = time.perf_counter()
+        probe_start = time.perf_counter()
         risk = self._policy_risk_probe(
             lower=lower,
             safety=safety,
@@ -301,6 +302,7 @@ class ResidualPlanner:
             amb_temp=amb_temp,
             previous_projection_residual=previous_projection_residual,
         )
+        probe_latency_ms = float((time.perf_counter() - probe_start) * 1000.0)
         budget_k, budget_reason = self._adaptive_budget(risk, global_step=global_step)
         if budget_k <= 0:
             latency_ms = float((time.perf_counter() - start) * 1000.0)
@@ -311,6 +313,9 @@ class ResidualPlanner:
                 "residual_planner_budget_reason": budget_reason,
                 "residual_planner_adaptive_budget_enabled": bool(self.adaptive_budget_enabled),
                 "residual_planner_latency_ms": latency_ms,
+                "residual_planner_probe_latency_ms": probe_latency_ms,
+                "residual_planner_candidate_search_latency_ms": 0.0,
+                "residual_planner_total_latency_ms": latency_ms,
                 "residual_planner_selected_idx": 0,
                 "residual_planner_effective_thermal_horizon": 0,
                 "residual_planner_score": 0.0,
@@ -351,6 +356,7 @@ class ResidualPlanner:
                 "residual_planner_previous_projection_residual_norm": risk["previous_projection_residual_norm"],
             }
 
+        candidate_search_start = time.perf_counter()
         candidates_np = self._candidate_raw(policy_raw, thermal_headroom=thermal_headroom, candidate_count=budget_k)
         k = int(candidates_np.shape[0])
         candidates = torch.as_tensor(candidates_np, dtype=torch.float32, device=self.device)
@@ -446,6 +452,7 @@ class ResidualPlanner:
             )
 
         latency_ms = float((time.perf_counter() - start) * 1000.0)
+        candidate_search_latency_ms = float((time.perf_counter() - candidate_search_start) * 1000.0)
         diagnostics = {
             "residual_planner_enabled": True,
             "residual_planner_candidate_count": k,
@@ -455,6 +462,9 @@ class ResidualPlanner:
             "residual_planner_effective_thermal_horizon": int(effective_thermal_horizon),
             "residual_planner_selected_idx": selected_idx,
             "residual_planner_latency_ms": latency_ms,
+            "residual_planner_probe_latency_ms": probe_latency_ms,
+            "residual_planner_candidate_search_latency_ms": candidate_search_latency_ms,
+            "residual_planner_total_latency_ms": latency_ms,
             "residual_planner_score": float(score[selected_idx].detach().cpu().item()),
             "residual_planner_score_improvement": score_improvement,
             "residual_planner_best_idx": best_idx,

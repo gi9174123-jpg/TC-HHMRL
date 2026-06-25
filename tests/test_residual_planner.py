@@ -81,6 +81,9 @@ def test_agent_act_uses_residual_planner_after_start_iter():
     assert int(aux["residual_planner_selected_idx"]) >= 0
     assert int(aux["residual_planner_effective_thermal_horizon"]) == 2
     assert float(aux["residual_planner_latency_ms"]) >= 0.0
+    assert float(aux["residual_planner_probe_latency_ms"]) >= 0.0
+    assert float(aux["residual_planner_candidate_search_latency_ms"]) >= 0.0
+    assert float(aux["residual_planner_total_latency_ms"]) >= 0.0
     assert "residual_planner_thermal_risk" in aux
     assert "residual_planner_score_improvement" in aux
     assert np.asarray(aux["act_policy_raw"], dtype=np.float32).shape == (5,)
@@ -225,6 +228,8 @@ def test_adaptive_planner_budget_selects_zero_for_very_low_risk_and_full_for_hig
     assert int(low_aux["residual_planner_budget"]) == 0
     assert int(low_aux["residual_planner_candidate_count"]) == 0
     assert low_aux["residual_planner_budget_reason"] == "very_low_risk_policy_only"
+    assert float(low_aux["residual_planner_probe_latency_ms"]) >= 0.0
+    assert float(low_aux["residual_planner_candidate_search_latency_ms"]) == 0.0
 
     _, high_aux = agent.act(
         obs=obs,
@@ -238,6 +243,8 @@ def test_adaptive_planner_budget_selects_zero_for_very_low_risk_and_full_for_hig
     assert int(high_aux["residual_planner_budget"]) == 24
     assert int(high_aux["residual_planner_candidate_count"]) == 24
     assert high_aux["residual_planner_budget_reason"] == "high_risk"
+    assert float(high_aux["residual_planner_probe_latency_ms"]) >= 0.0
+    assert float(high_aux["residual_planner_candidate_search_latency_ms"]) >= 0.0
 
 
 def test_residual_planner_preview_has_no_mutable_side_effects():

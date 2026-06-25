@@ -55,6 +55,13 @@ def test_default_safety_uses_corrected_action_mapping_and_main_projection():
     assert cfg["constraint_replay"]["uniform_fraction"] == 0.50
     assert cfg["constraint_replay"]["boundary_fraction"] == 0.30
     assert cfg["constraint_replay"]["violation_fraction"] == 0.20
+    assert cfg["constraint_replay"]["thermal_headroom_threshold"] == 2.0
+    assert cfg["constraint_replay"]["bus_utilization_threshold"] == 0.85
+    assert cfg["constraint_replay"]["projection_residual_threshold"] == 0.10
+    assert cfg["constraint_replay"]["temperature_slope_threshold"] == 0.30
+    assert cfg["constraint_replay"]["importance_weighting"] is True
+    assert cfg["constraint_replay"]["importance_weight_clip"] == [0.25, 4.0]
+    assert cfg["constraint_replay"]["require_boundary_thresholds"] is True
     assert cfg["upper_dqn"]["double_dqn"] is True
     assert cfg["upper_dqn"]["dueling"] is True
 
@@ -103,6 +110,12 @@ def test_formal_metadata_reports_model_aware_lower_components():
     assert meta["constraint_replay_uniform_fraction"] == 0.50
     assert meta["constraint_replay_boundary_fraction"] == 0.30
     assert meta["constraint_replay_violation_fraction"] == 0.20
+    assert meta["constraint_replay_importance_weighting"] is True
+    assert meta["constraint_replay_importance_weight_clip"] == [0.25, 4.0]
+    assert meta["constraint_replay_thermal_headroom_threshold"] == 2.0
+    assert meta["constraint_replay_bus_utilization_threshold"] == 0.85
+    assert meta["constraint_replay_projection_residual_threshold"] == 0.10
+    assert meta["constraint_replay_temperature_slope_threshold"] == 0.30
     assert meta["constraint_replay_reward_batch"] == "unchanged_reward_critic_batch"
     assert meta["constraint_replay_constraint_batch"] == "stratified_uniform_boundary_violation"
     assert meta["residual_planner_enabled"] is True
@@ -143,6 +156,9 @@ def test_moderate_config_keeps_model_aware_lower_components_enabled():
     assert cfg["constraint_replay"]["uniform_fraction"] == 0.50
     assert cfg["constraint_replay"]["boundary_fraction"] == 0.30
     assert cfg["constraint_replay"]["violation_fraction"] == 0.20
+    assert cfg["constraint_replay"]["thermal_headroom_threshold"] == 2.0
+    assert cfg["constraint_replay"]["bus_utilization_threshold"] == 0.85
+    assert cfg["constraint_replay"]["projection_residual_threshold"] == 0.10
     assert cfg["residual_planner"]["enabled"] is True
     assert int(cfg["residual_planner"]["candidate_count"]) == 24
     assert cfg["residual_planner"]["adaptive_budget_enabled"] is True

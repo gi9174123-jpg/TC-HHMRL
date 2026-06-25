@@ -403,9 +403,24 @@ class LowerSAC:
                 device=self.device,
             ).view(-1)
             constraint_loss = (per_item * weights).sum() / torch.clamp(weights.sum(), min=1.0)
+            bucket_id = torch.tensor(
+                cb.get("constraint_replay_bucket_id", np.zeros(c_batch_size, dtype=np.float32)),
+                dtype=torch.long,
+                device=self.device,
+            ).view(-1)
+
+            def _bucket_loss(bucket: int) -> float:
+                mask = bucket_id == int(bucket)
+                if not bool(mask.any().item()):
+                    return 0.0
+                return float(per_item[mask].detach().mean().item())
+
             constraint_batch_stats = {
                 "constraint_replay_weight_mean": float(weights.detach().mean().item()),
                 "constraint_replay_batch_size": float(c_batch_size),
+                "constraint_critic_loss_uniform": _bucket_loss(0),
+                "constraint_critic_loss_boundary": _bucket_loss(1),
+                "constraint_critic_loss_violation": _bucket_loss(2),
             }
         elif self.constraint_q is not None and constraint_target is not None:
             constraint_pred = self.constraint_q(obs_aug_q1, z, act_exec)

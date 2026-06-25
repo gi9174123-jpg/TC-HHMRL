@@ -4,7 +4,9 @@ import copy
 
 import numpy as np
 import torch
+import pytest
 
+from tchhmrl.agents.hierarchical_agent import HierarchicalAgent
 from tchhmrl.agents.sac_lower import LowerSAC
 from tchhmrl.buffers.replay_buffer import ReplayBuffer
 from tchhmrl.safety.safety_layer import SafetyLayer
@@ -73,8 +75,13 @@ def test_replay_buffer_stratified_constraint_sampling_tracks_buckets():
 
     assert batch["obs"].shape[0] == 12
     assert batch["constraint_replay_importance_weight"].shape == (12,)
+    assert batch["constraint_replay_bucket_id"].shape == (12,)
+    assert not np.allclose(batch["constraint_replay_importance_weight"], 1.0)
     assert stats["constraint_batch_violation_count"] > 0
     assert stats["constraint_batch_boundary_count"] > 0
+    assert stats["constraint_bucket_boundary_pool_count"] > 0
+    assert stats["constraint_bucket_violation_pool_count"] > 0
+    assert stats["constraint_replay_importance_weight_max"] > stats["constraint_replay_importance_weight_min"]
     assert (
         stats["constraint_batch_uniform_count"]
         + stats["constraint_batch_boundary_count"]
@@ -104,8 +111,27 @@ def test_replay_buffer_stratified_constraint_shortage_falls_back_to_uniform():
     )
 
     assert batch["obs"].shape[0] == 8
+    assert batch["constraint_replay_bucket_id"].shape == (8,)
     assert stats["constraint_batch_uniform_count"] == 8
     assert stats["constraint_bucket_total_count"] == 5
+
+
+def test_bus_current_fallback_is_normalized_for_boundary_detection():
+    cfg = _small_cfg()
+    tr = _transition(cfg, cost=0.0, residual=0.0, headroom=8.0)
+    tr["projected_current_total"] = np.float32(5.6)
+
+    violation, boundary = ReplayBuffer._constraint_flags(
+        tr,
+        {
+            "bus_utilization_threshold": 0.85,
+            "bus_current_max": 6.4,
+            "constraint_cost_threshold": 1.0e-8,
+        },
+    )
+
+    assert violation is False
+    assert boundary is True
 
 
 def test_lower_sac_accepts_separate_stratified_constraint_batch():
@@ -137,4 +163,22 @@ def test_lower_sac_accepts_separate_stratified_constraint_batch():
     assert stats["constraint_replay_batch_size"] == 4
     assert stats["constraint_replay_weight_mean"] == 1.0
     assert stats["constraint_batch_violation_count"] >= 1
+    assert "constraint_critic_loss_uniform" in stats
+    assert "constraint_critic_loss_boundary" in stats
+    assert "constraint_critic_loss_violation" in stats
     assert np.isfinite(stats["constraint_critic_loss"])
+
+
+def test_constraint_replay_requires_at_least_one_boundary_threshold():
+    cfg = _small_cfg()
+    for key in [
+        "thermal_headroom_threshold",
+        "qos_margin_threshold",
+        "bus_utilization_threshold",
+        "projection_residual_threshold",
+        "temperature_slope_threshold",
+    ]:
+        cfg["constraint_replay"][key] = None
+
+    with pytest.raises(ValueError, match="boundary threshold"):
+        HierarchicalAgent(cfg, torch.device("cpu"))
