@@ -50,11 +50,11 @@ class LowerSAC:
         constraint_cfg = cfg.get("constraint_critics", {}) or {}
         self.constraint_critics_enabled = bool(constraint_cfg.get("enabled", False))
         self.constraint_dim = int(constraint_cfg.get("out_dim", len(cfg.get("meta", {}).get("dual_names", [])) or 4))
-        default_reward_target = "raw_reward" if self.constraint_critics_enabled else "penalized_reward"
+        default_reward_target = "reward_task" if self.constraint_critics_enabled else "penalized_reward"
         self.reward_target_mode = str(constraint_cfg.get("reward_target", default_reward_target)).strip().lower()
-        if self.reward_target_mode not in {"raw_reward", "penalized_reward"}:
+        if self.reward_target_mode not in {"reward_task", "raw_reward", "penalized_reward"}:
             raise ValueError(
-                "constraint_critics.reward_target must be 'raw_reward' or 'penalized_reward', "
+                "constraint_critics.reward_target must be 'reward_task', 'raw_reward' or 'penalized_reward', "
                 f"got {self.reward_target_mode!r}"
             )
         self.constraint_target_nonnegative = bool(constraint_cfg.get("target_nonnegative", True))
@@ -163,6 +163,21 @@ class LowerSAC:
         mode_oh = F.one_hot(mode, num_classes=3).float()
         return torch.cat([boost_oh, mode_oh], dim=1)
 
+    def _entropy_mask(self, boost: torch.Tensor, mode: torch.Tensor) -> torch.Tensor:
+        boost = torch.clamp(boost.long().view(-1), 0, 3)
+        mode = torch.clamp(mode.long().view(-1), 0, 2)
+        mask = torch.zeros((boost.shape[0], self.act_dim), dtype=torch.float32, device=self.device)
+        mask[:, 0] = 1.0  # total-current latent is always meaningful.
+        mask[:, 1] = ((boost == 1) | (boost == 3)).float()
+        mask[:, 2] = ((boost == 2) | (boost == 3)).float()
+        mask[:, 3] = ((mode == 0) | (mode == 2)).float()
+        mask[:, 4] = ((mode == 1) | (mode == 2)).float()
+        return mask
+
+    def _masked_logp(self, logp_dim: torch.Tensor, boost: torch.Tensor, mode: torch.Tensor) -> torch.Tensor:
+        mask = self._entropy_mask(boost, mode).to(dtype=logp_dim.dtype)
+        return (logp_dim * mask).sum(dim=1, keepdim=True)
+
     def _zero_physical_np(self) -> np.ndarray:
         return np.zeros((self.physical_dim,), dtype=np.float32)
 
@@ -265,7 +280,12 @@ class LowerSAC:
         z = torch.tensor(batch["z"], dtype=torch.float32, device=self.device)
         validate_executed_action_shape(batch, batch_size=batch_size)
         act_exec = torch.tensor(batch["act_exec"], dtype=torch.float32, device=self.device)
-        reward_key = "reward_raw" if self.constraint_critics_enabled and self.reward_target_mode == "raw_reward" else "reward"
+        if self.constraint_critics_enabled and self.reward_target_mode == "reward_task":
+            reward_key = "reward_task"
+        elif self.constraint_critics_enabled and self.reward_target_mode == "raw_reward":
+            reward_key = "reward_raw"
+        else:
+            reward_key = "reward"
         if reward_key not in batch:
             raise KeyError(f"Missing {reward_key} required by lower reward critic schema")
         rew = torch.tensor(batch[reward_key], dtype=torch.float32, device=self.device).view(-1, 1)
@@ -321,7 +341,8 @@ class LowerSAC:
         alpha_t = self._alpha_tensor(dtype=obs.dtype)
 
         with torch.no_grad():
-            raw_next, logp_next = self.actor.sample(next_obs_aug_actor, z_next)
+            raw_next, logp_next, logp_next_dim = self.actor.sample(next_obs_aug_actor, z_next, return_log_prob_per_dim=True)
+            logp_next_eff = self._masked_logp(logp_next_dim, boost_next, mode_next)
             safe_next = self.safety.project_torch(raw_next, boost_next, mode_next, next_temps, amb)
             a_next = torch.cat(
                 [safe_next["currents_exec"], safe_next["rho_exec"], safe_next["tau_exec"]], dim=1
@@ -329,7 +350,7 @@ class LowerSAC:
             q_next = torch.min(
                 self.q1_tgt(next_obs_aug_q1_tgt, z_next, a_next),
                 self.q2_tgt(next_obs_aug_q2_tgt, z_next, a_next),
-            ) - alpha_t * logp_next
+            ) - alpha_t * logp_next_eff
             td_target = rew + self.gamma_rl * (1.0 - done) * q_next
             if self.constraint_q_tgt is not None and constraint_batch is None:
                 constraint_next = self.constraint_q_tgt(next_obs_aug_q1_tgt, z_next, a_next)
@@ -422,6 +443,16 @@ class LowerSAC:
                 "constraint_critic_loss_boundary": _bucket_loss(1),
                 "constraint_critic_loss_violation": _bucket_loss(2),
             }
+            with torch.no_grad():
+                abs_err = torch.abs(constraint_pred - constraint_target)
+                for j in range(int(self.constraint_dim)):
+                    target_j = constraint_target[:, j]
+                    err_j = abs_err[:, j]
+                    constraint_batch_stats[f"constraint_target_mean_{j}"] = float(target_j.mean().item())
+                    constraint_batch_stats[f"constraint_target_std_{j}"] = float(target_j.std(unbiased=False).item())
+                    constraint_batch_stats[f"constraint_mae_{j}"] = float(err_j.mean().item())
+                    constraint_batch_stats[f"constraint_max_{j}"] = float(target_j.max().item())
+                    constraint_batch_stats[f"constraint_positive_fraction_{j}"] = float((target_j > 0.0).float().mean().item())
         elif self.constraint_q is not None and constraint_target is not None:
             constraint_pred = self.constraint_q(obs_aug_q1, z, act_exec)
             constraint_loss = F.mse_loss(constraint_pred, constraint_target)
@@ -437,7 +468,8 @@ class LowerSAC:
         )
         self.critic_optim.step()
 
-        raw_pi, logp = self.actor.sample(obs_aug_actor, z)
+        raw_pi, logp, logp_dim = self.actor.sample(obs_aug_actor, z, return_log_prob_per_dim=True)
+        logp_eff = self._masked_logp(logp_dim, boost, mode)
         safe_pi = self.safety.project_torch(raw_pi, boost, mode, temps, amb)
         a_pi = torch.cat([safe_pi["currents_exec"], safe_pi["rho_exec"], safe_pi["tau_exec"]], dim=1)
         obs_aug_q1_pi = self._augment_torch(obs, boost, mode, physical, self.q1_phys)
@@ -451,7 +483,7 @@ class LowerSAC:
                 constraint_pi = torch.relu(constraint_pi)
             constraint_pi_weighted = (constraint_pi * self.constraint_actor_weights).sum(dim=1, keepdim=True)
             constraint_pi_mean = float(constraint_pi_weighted.detach().mean().item())
-        loss_pi = (alpha_t * logp - q_pi + constraint_pi_weighted).mean()
+        loss_pi = (alpha_t * logp_eff - q_pi + constraint_pi_weighted).mean()
 
         self.actor_optim.zero_grad()
         loss_pi.backward()
@@ -463,7 +495,7 @@ class LowerSAC:
 
         alpha_loss_val = 0.0
         if self.auto_alpha and self.alpha_optim is not None and self.log_alpha is not None:
-            alpha_loss = -(self.log_alpha * (logp.detach() + self.target_entropy)).mean()
+            alpha_loss = -(self.log_alpha * (logp_eff.detach() + self.target_entropy)).mean()
             self.alpha_optim.zero_grad()
             alpha_loss.backward()
             self.alpha_optim.step()
@@ -483,12 +515,15 @@ class LowerSAC:
             "q1_mean": float(q1.mean().item()),
             "q2_mean": float(q2.mean().item()),
             "reward_target_is_raw": float(reward_key == "reward_raw"),
+            "reward_target_is_task": float(reward_key == "reward_task"),
             "reward_target_mean": float(rew.detach().mean().item()),
             "critic_loss": float(loss_q.item()),
             "constraint_critic_loss": float(constraint_loss.detach().item()),
             "constraint_actor_penalty": float(constraint_pi_mean),
             "actor_loss": float(loss_pi.item()),
-            "entropy": float((-logp).mean().item()),
+            "entropy": float((-logp_eff).mean().item()),
+            "entropy_unmasked": float((-logp).mean().item()),
+            "entropy_mask_active_dim_mean": float(self._entropy_mask(boost, mode).sum(dim=1).detach().mean().item()),
             "alpha": float(alpha_t.detach().item()),
             "alpha_loss": float(alpha_loss_val),
             **constraint_batch_stats,

@@ -589,9 +589,8 @@ class MultiTxUwSliptEnv(gym.Env):
         cost = float(np.sum(cost_vec))
         cost_penalty = self.cost_weight * cost
         power_penalty_term = self.power_weight * power_penalty
-        reward = float(
-            id_term + eh_term + margin_reward - cost_penalty - power_penalty_term - smooth_penalty - switch_penalty
-        )
+        reward_task = float(id_term + eh_term + margin_reward - power_penalty_term - smooth_penalty - switch_penalty)
+        reward = float(reward_task - cost_penalty)
 
         if boost_combo == self.prev_boost:
             self.boost_hold_steps += 1
@@ -632,6 +631,9 @@ class MultiTxUwSliptEnv(gym.Env):
             "reward_id_term": float(id_term),
             "reward_cost_penalty": float(cost_penalty),
             "reward_power_penalty": float(power_penalty_term),
+            "reward_task": float(reward_task),
+            "reward_benchmark": float(reward),
+            "reward_fixed_constraint_penalty": float(cost_penalty),
             "penalty_cost_term": float(cost_penalty),
             "penalty_power_term": float(power_penalty_term),
             "penalty_smooth_term": float(smooth_penalty),

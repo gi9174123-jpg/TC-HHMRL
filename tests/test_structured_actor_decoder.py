@@ -34,6 +34,8 @@ def test_structured_current_decoder_masks_inactive_sources_to_zero():
     assert float(out["currents_exec"][1]) == 0.0
     assert float(out["currents_exec"][2]) == 0.0
     assert float(out["actor_inactive_allocation_sum"]) == 0.0
+    assert float(out["actor_total_current_requested"]) <= float(cfg["safety"]["current_max"][0]) + 1.0e-6
+    assert float(out["actor_active_current_capacity"]) == float(cfg["safety"]["current_max"][0])
     assert float(np.sum(out["currents_exec"])) <= float(cfg["safety"]["bus_current_max"]) + 1.0e-6
 
 
@@ -51,6 +53,7 @@ def test_structured_current_decoder_respects_single_source_limits_and_logs_clip(
     assert np.all(np.asarray(out["currents_exec"]) <= np.asarray(cfg["safety"]["current_max"]) + 1.0e-6)
     assert float(out["actor_per_source_clip_count"]) >= 1.0
     assert float(out["structured_actor_per_source_clip_rate"]) > 0.0
+    assert float(np.sum(out["current_requested"])) > float(cfg["safety"]["current_max"][0])
 
 
 def test_structured_decoder_preserves_mode_specific_receiver_semantics():
@@ -106,4 +109,4 @@ def test_formal_metadata_reports_structured_latent_entropy_contract():
     assert meta["current_decoder"] == "structured_total_allocation"
     assert meta["policy_distribution_space"] == "latent_structured_action"
     assert meta["critic_action_space"] == "executed_physical_action"
-    assert meta["entropy_space"] == "latent_action"
+    assert meta["entropy_space"] == "mode_boost_masked_latent_action"

@@ -51,6 +51,21 @@ def test_lower_sac_uses_physical_encoder_when_enabled():
     assert sac.obs_aug_dim == int(cfg["agent"]["obs_dim"]) + int(cfg["agent"]["lower_upper_ctx_dim"]) + 32
 
 
+def test_lower_entropy_mask_matches_boost_and_mode_contract():
+    cfg = _small_cfg()
+    safety = SafetyLayer(cfg)
+    sac = LowerSAC(cfg, safety, torch.device("cpu"))
+    boost = torch.tensor([0, 1, 2, 3], dtype=torch.long)
+    mode = torch.tensor([0, 1, 2, 2], dtype=torch.long)
+
+    mask = sac._entropy_mask(boost, mode).cpu().numpy()
+
+    assert np.allclose(mask[0], [1, 0, 0, 1, 0])  # anchor-only PS
+    assert np.allclose(mask[1], [1, 1, 0, 0, 1])  # anchor+LD1 TS
+    assert np.allclose(mask[2], [1, 0, 1, 1, 1])  # anchor+LD2 HY
+    assert np.allclose(mask[3], [1, 1, 1, 1, 1])  # full HY
+
+
 def _dummy_lower_batch(cfg: dict, batch_size: int = 4) -> dict:
     obs_dim = int(cfg["agent"]["obs_dim"])
     z_dim = int(cfg["agent"]["z_dim"])
@@ -62,6 +77,9 @@ def _dummy_lower_batch(cfg: dict, batch_size: int = 4) -> dict:
         "act_exec": np.random.randn(batch_size, 5).astype(np.float32),
         "reward": np.random.randn(batch_size).astype(np.float32),
         "reward_raw": np.random.randn(batch_size).astype(np.float32),
+        "reward_task": np.random.randn(batch_size).astype(np.float32),
+        "reward_benchmark": np.random.randn(batch_size).astype(np.float32),
+        "reward_dual_penalized": np.random.randn(batch_size).astype(np.float32),
         "next_obs": np.random.randn(batch_size, obs_dim).astype(np.float32),
         "z_next": np.random.randn(batch_size, z_dim).astype(np.float32),
         "done": np.zeros(batch_size, dtype=np.float32),
@@ -100,19 +118,20 @@ def test_lower_sac_trains_independent_constraint_critics():
     assert stats["constraint_actor_penalty"] >= 0.0
 
 
-def test_lower_reward_critic_uses_raw_reward_when_constraint_critics_are_enabled():
+def test_lower_reward_critic_uses_task_reward_when_constraint_critics_are_enabled():
     cfg = _small_cfg()
     safety = SafetyLayer(cfg)
     sac = LowerSAC(cfg, safety, torch.device("cpu"))
     batch = _dummy_lower_batch(cfg)
     batch["reward"] = np.full(batch["reward"].shape, -10.0, dtype=np.float32)
     batch["reward_raw"] = np.full(batch["reward"].shape, 2.0, dtype=np.float32)
+    batch["reward_task"] = np.full(batch["reward"].shape, 3.0, dtype=np.float32)
 
     stats = sac.update(batch)
 
-    assert sac.reward_target_mode == "raw_reward"
-    assert stats["reward_target_is_raw"] == 1.0
-    assert np.isclose(float(stats["reward_target_mean"]), 2.0)
+    assert sac.reward_target_mode == "reward_task"
+    assert stats["reward_target_is_task"] == 1.0
+    assert np.isclose(float(stats["reward_target_mean"]), 3.0)
 
 
 def test_lower_sac_strict_schema_rejects_missing_raw_reward_and_cost_vec():
@@ -121,10 +140,10 @@ def test_lower_sac_strict_schema_rejects_missing_raw_reward_and_cost_vec():
     sac = LowerSAC(cfg, safety, torch.device("cpu"))
     batch = _dummy_lower_batch(cfg)
 
-    missing_raw = dict(batch)
-    missing_raw.pop("reward_raw")
-    with pytest.raises(KeyError, match="reward_raw"):
-        sac.update(missing_raw)
+    missing_task = dict(batch)
+    missing_task.pop("reward_task")
+    with pytest.raises(KeyError, match="reward_task"):
+        sac.update(missing_task)
 
     missing_cost = dict(batch)
     missing_cost.pop("cost_vec")
@@ -157,6 +176,9 @@ def test_lower_update_uses_next_macro_for_target_projection():
         "act_exec": np.random.randn(b, 5).astype(np.float32),
         "reward": np.random.randn(b).astype(np.float32),
         "reward_raw": np.random.randn(b).astype(np.float32),
+        "reward_task": np.random.randn(b).astype(np.float32),
+        "reward_benchmark": np.random.randn(b).astype(np.float32),
+        "reward_dual_penalized": np.random.randn(b).astype(np.float32),
         "next_obs": np.random.randn(b, obs_dim).astype(np.float32),
         "z_next": np.random.randn(b, z_dim).astype(np.float32),
         "done": np.zeros(b, dtype=np.float32),

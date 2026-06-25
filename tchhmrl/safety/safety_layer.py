@@ -78,6 +78,7 @@ class SafetyLayer:
         self.current_decoder = str(safety_cfg.get("current_decoder", "per_source")).lower()
         if self.current_decoder not in {"per_source", "structured_total_allocation"}:
             raise ValueError(f"unsupported safety.current_decoder={self.current_decoder}")
+        self.allocation_logit_scale = float(safety_cfg.get("allocation_logit_scale", 1.0))
         self.inactive_source_mask_mode = str(safety_cfg.get("inactive_source_mask_mode", "hard_zero")).lower()
         if self.inactive_source_mask_mode not in {"hard_zero", "soft_floor"}:
             raise ValueError(f"unsupported safety.inactive_source_mask_mode={self.inactive_source_mask_mode}")
@@ -264,6 +265,67 @@ class SafetyLayer:
             return torch.sigmoid(lower_raw)
         return torch.clamp((lower_raw + 1.0) * 0.5, min=0.0, max=1.0)
 
+    def _static_cap_redistribute_np(
+        self,
+        *,
+        total_current: float,
+        allocation: np.ndarray,
+        active: np.ndarray,
+    ) -> np.ndarray:
+        cap = (self.current_max * (np.asarray(active, dtype=np.float32) > 0.0)).astype(np.float32)
+        currents = np.zeros_like(cap, dtype=np.float32)
+        remaining = float(min(max(total_current, 0.0), float(np.sum(cap)), self.bus_current_max))
+        weights = np.asarray(allocation, dtype=np.float32) * (cap > 0.0).astype(np.float32)
+        for _ in range(int(cap.size) + 1):
+            if remaining <= 1.0e-8:
+                break
+            room = np.maximum(cap - currents, 0.0).astype(np.float32)
+            unsat = (room > 1.0e-8).astype(np.float32)
+            w = weights * unsat
+            denom = float(np.sum(w))
+            if denom <= 1.0e-8:
+                w = unsat
+                denom = float(np.sum(w))
+            if denom <= 1.0e-8:
+                break
+            proposed = remaining * (w / denom)
+            add = np.minimum(proposed, room).astype(np.float32)
+            currents += add
+            remaining -= float(np.sum(add))
+        return currents.astype(np.float32)
+
+    def _static_cap_redistribute_torch(
+        self,
+        *,
+        total_current: torch.Tensor,
+        allocation: torch.Tensor,
+        active: torch.Tensor,
+        current_max: torch.Tensor,
+    ) -> torch.Tensor:
+        cap = current_max * (active > 0.0).to(allocation.dtype)
+        currents = torch.zeros_like(cap)
+        remaining = torch.minimum(
+            torch.clamp(total_current, min=0.0),
+            torch.minimum(
+                cap.sum(dim=1, keepdim=True),
+                torch.full_like(total_current, float(self.bus_current_max)),
+            ),
+        )
+        weights = allocation * (cap > 0.0).to(allocation.dtype)
+        for _ in range(int(cap.shape[1]) + 1):
+            room = torch.clamp(cap - currents, min=0.0)
+            unsat = (room > 1.0e-8).to(allocation.dtype)
+            w = weights * unsat
+            denom = w.sum(dim=1, keepdim=True)
+            w = torch.where(denom > 1.0e-8, w, unsat)
+            denom = w.sum(dim=1, keepdim=True)
+            proposed = remaining * w / torch.clamp(denom, min=1.0e-8)
+            add = torch.minimum(proposed, room)
+            add = torch.where((remaining > 1.0e-8) & (denom > 1.0e-8), add, torch.zeros_like(add))
+            currents = currents + add
+            remaining = remaining - add.sum(dim=1, keepdim=True)
+        return currents
+
     def _decode_current_request_np(
         self,
         lower_raw: np.ndarray,
@@ -285,8 +347,12 @@ class SafetyLayer:
                 "active_source_mask": active,
             }
 
-        total_requested = float(decoded[0]) * self.bus_current_max
-        logits = np.asarray([0.0, lower_raw[1], lower_raw[2]], dtype=np.float32)
+        active_capacity = float(min(self.bus_current_max, float(np.sum(active * self.current_max))))
+        total_requested = float(decoded[0]) * active_capacity
+        logits = np.asarray(
+            [0.0, self.allocation_logit_scale * lower_raw[1], self.allocation_logit_scale * lower_raw[2]],
+            dtype=np.float32,
+        )
         masked_logits = np.where(active > 0.0, logits, -1.0e9).astype(np.float32)
         shifted = masked_logits - np.max(masked_logits)
         exp_logits = np.exp(shifted) * active
@@ -296,14 +362,20 @@ class SafetyLayer:
             if denom <= 0.0
             else (exp_logits / denom).astype(np.float32)
         )
-        requested = (total_requested * allocation).astype(np.float32)
-        clipped = np.minimum(requested, self.current_max).astype(np.float32)
-        clip_count = float(np.sum(requested > (self.current_max + 1.0e-6)))
-        current_frac = (requested / np.maximum(self.current_max, 1.0e-6)).astype(np.float32)
+        requested_initial = (total_requested * allocation).astype(np.float32)
+        clipped = self._static_cap_redistribute_np(
+            total_current=total_requested,
+            allocation=allocation,
+            active=active,
+        )
+        clip_count = float(np.sum(requested_initial > (self.current_max + 1.0e-6)))
+        current_frac = (clipped / np.maximum(self.current_max, 1.0e-6)).astype(np.float32)
         inactive_sum = float(np.sum(allocation[active <= 0.0]))
         return clipped, current_frac, decoded, {
-            "current_requested": requested,
+            "current_requested": clipped.astype(np.float32),
+            "current_requested_pre_static_cap": requested_initial.astype(np.float32),
             "actor_total_current_requested": float(total_requested),
+            "actor_active_current_capacity": float(active_capacity),
             "actor_allocation": allocation.astype(np.float32),
             "actor_inactive_allocation_sum": inactive_sum,
             "actor_per_source_clip_count": clip_count,
@@ -341,18 +413,35 @@ class SafetyLayer:
                 "active_source_mask": active,
             }
 
-        total_requested = decoded[:, 0:1] * float(self.bus_current_max)
-        logits = torch.cat([torch.zeros_like(lower_raw[:, 1:2]), lower_raw[:, 1:3]], dim=1)
+        active_capacity = torch.minimum(
+            torch.full((lower_raw.shape[0], 1), float(self.bus_current_max), dtype=lower_raw.dtype, device=lower_raw.device),
+            (active * current_max).sum(dim=1, keepdim=True),
+        )
+        total_requested = decoded[:, 0:1] * active_capacity
+        logits = torch.cat(
+            [
+                torch.zeros_like(lower_raw[:, 1:2]),
+                self.allocation_logit_scale * lower_raw[:, 1:3],
+            ],
+            dim=1,
+        )
         masked_logits = torch.where(active > 0.0, logits, torch.full_like(logits, -1.0e9))
         allocation = torch.softmax(masked_logits, dim=1) * active
         allocation = allocation / torch.clamp(allocation.sum(dim=1, keepdim=True), min=1.0e-6)
-        requested = total_requested * allocation
-        clipped = torch.minimum(requested, current_max)
-        clip_count = (requested > (current_max + 1.0e-6)).to(lower_raw.dtype).sum(dim=1)
+        requested_initial = total_requested * allocation
+        clipped = self._static_cap_redistribute_torch(
+            total_current=total_requested,
+            allocation=allocation,
+            active=active,
+            current_max=current_max,
+        )
+        clip_count = (requested_initial > (current_max + 1.0e-6)).to(lower_raw.dtype).sum(dim=1)
         active_count = torch.clamp((active > 0.0).to(lower_raw.dtype).sum(dim=1), min=1.0)
-        return clipped, requested / torch.clamp(current_max, min=1.0e-6), decoded, {
-            "current_requested": requested,
+        return clipped, clipped / torch.clamp(current_max, min=1.0e-6), decoded, {
+            "current_requested": clipped,
+            "current_requested_pre_static_cap": requested_initial,
             "actor_total_current_requested": total_requested.view(-1),
+            "actor_active_current_capacity": active_capacity.view(-1),
             "actor_allocation": allocation,
             "actor_inactive_allocation_sum": (allocation * (active <= 0.0).to(lower_raw.dtype)).sum(dim=1),
             "actor_per_source_clip_count": clip_count,
@@ -691,6 +780,7 @@ class SafetyLayer:
             "projection_compression_ratio": projection_compression_ratio,
             "current_requested": current_requested.astype(np.float32),
             "actor_total_current_requested": float(current_aux["actor_total_current_requested"]),
+            "actor_active_current_capacity": float(current_aux.get("actor_active_current_capacity", self.bus_current_max)),
             "actor_allocation_anchor": float(np.asarray(current_aux["actor_allocation"])[0]),
             "actor_allocation_ld1": float(np.asarray(current_aux["actor_allocation"])[1]),
             "actor_allocation_ld2": float(np.asarray(current_aux["actor_allocation"])[2]),
@@ -871,6 +961,10 @@ class SafetyLayer:
             "projection_compression_ratio": projection_compression_ratio,
             "current_requested": current_requested,
             "actor_total_current_requested": current_aux["actor_total_current_requested"],
+            "actor_active_current_capacity": current_aux.get(
+                "actor_active_current_capacity",
+                torch.full((lower_raw.shape[0],), float(self.bus_current_max), dtype=lower_raw.dtype, device=device),
+            ),
             "actor_allocation": current_aux["actor_allocation"],
             "actor_inactive_allocation_sum": current_aux["actor_inactive_allocation_sum"],
             "actor_per_source_clip_count": current_aux["actor_per_source_clip_count"],

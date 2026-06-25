@@ -22,8 +22,11 @@ class ResidualPlanner:
         planner_cfg = cfg.get("residual_planner", {}) or {}
         self.enabled = bool(planner_cfg.get("enabled", False))
         self.candidate_count = int(planner_cfg.get("candidate_count", 24))
-        self.current_step = float(planner_cfg.get("current_step", 0.05))
-        self.ratio_step = float(planner_cfg.get("ratio_step", 0.05))
+        legacy_current_step = float(planner_cfg.get("current_step", 0.05)) * 2.0
+        legacy_ratio_step = float(planner_cfg.get("ratio_step", 0.05)) * 2.0
+        self.total_current_raw_step = float(planner_cfg.get("total_current_raw_step", legacy_current_step))
+        self.allocation_logit_raw_step = float(planner_cfg.get("allocation_logit_raw_step", legacy_current_step))
+        self.ratio_raw_step = float(planner_cfg.get("ratio_raw_step", legacy_ratio_step))
         self.disagreement_beta = float(planner_cfg.get("disagreement_beta", 0.10))
         self.projection_penalty = float(planner_cfg.get("projection_penalty", 0.10))
         self.constraint_beta = float(planner_cfg.get("constraint_beta", 1.0))
@@ -77,14 +80,20 @@ class ResidualPlanner:
         self,
         policy_raw: np.ndarray,
         *,
+        boost_combo: int,
+        mode: int,
         thermal_headroom: np.ndarray | None,
         candidate_count: int | None = None,
     ) -> np.ndarray:
         raw = np.asarray(policy_raw, dtype=np.float32).reshape(-1)[:5]
+        active = np.asarray([1.0, float(int(boost_combo) in {1, 3}), float(int(boost_combo) in {2, 3})], dtype=np.float32)
         basis = residual_basis(
             candidate_count=self.candidate_count if candidate_count is None else int(candidate_count),
-            current_step=self.current_step,
-            ratio_step=self.ratio_step,
+            total_current_raw_step=self.total_current_raw_step,
+            allocation_logit_raw_step=self.allocation_logit_raw_step,
+            ratio_raw_step=self.ratio_raw_step,
+            mode=int(mode),
+            active_source_mask=active,
             thermal_headroom=thermal_headroom,
         )
         candidates = raw.reshape(1, -1) + basis
@@ -156,7 +165,10 @@ class ResidualPlanner:
 
         diag = safety.thermal_diagnostics()
         gain_std_arr = np.asarray(
-            diag.get("effective_gain_std", diag.get("thermal_gain_std", np.zeros(3, dtype=np.float32))),
+            diag.get(
+                "effective_gain_uncertainty",
+                diag.get("effective_gain_std", diag.get("thermal_gain_std", np.zeros(3, dtype=np.float32))),
+            ),
             dtype=np.float32,
         ).reshape(-1)
         gain_std = float(np.nanmax(gain_std_arr)) if gain_std_arr.size else 0.0
@@ -357,7 +369,13 @@ class ResidualPlanner:
             }
 
         candidate_search_start = time.perf_counter()
-        candidates_np = self._candidate_raw(policy_raw, thermal_headroom=thermal_headroom, candidate_count=budget_k)
+        candidates_np = self._candidate_raw(
+            policy_raw,
+            boost_combo=int(boost_combo),
+            mode=int(mode),
+            thermal_headroom=thermal_headroom,
+            candidate_count=budget_k,
+        )
         k = int(candidates_np.shape[0])
         candidates = torch.as_tensor(candidates_np, dtype=torch.float32, device=self.device)
         boost_t = torch.full((k,), int(boost_combo), dtype=torch.long, device=self.device)

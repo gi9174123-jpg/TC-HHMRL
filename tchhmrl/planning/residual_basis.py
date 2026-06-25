@@ -6,8 +6,11 @@ import numpy as np
 def residual_basis(
     *,
     candidate_count: int,
-    current_step: float,
-    ratio_step: float,
+    total_current_raw_step: float,
+    allocation_logit_raw_step: float,
+    ratio_raw_step: float,
+    mode: int | None = None,
+    active_source_mask: np.ndarray | None = None,
     thermal_headroom: np.ndarray | None = None,
 ) -> np.ndarray:
     """Return residuals in structured lower latent-action space.
@@ -19,8 +22,18 @@ def residual_basis(
     current coordinates.
     """
     k = max(1, int(candidate_count))
-    current_delta = float(current_step) * 2.0
-    ratio_delta = float(ratio_step) * 2.0
+    total_delta = float(total_current_raw_step)
+    alloc_delta = float(allocation_logit_raw_step)
+    ratio_delta = float(ratio_raw_step)
+    mode_i = None if mode is None else int(np.clip(int(mode), 0, 2))
+    active = np.ones(3, dtype=np.float32)
+    if active_source_mask is not None:
+        active_arr = np.asarray(active_source_mask, dtype=np.float32).reshape(-1)
+        active[: min(3, active_arr.size)] = active_arr[:3]
+    ld1_active = bool(active[1] > 0.0)
+    ld2_active = bool(active[2] > 0.0)
+    rho_valid = mode_i is None or mode_i in {0, 2}
+    tau_valid = mode_i is None or mode_i in {1, 2}
 
     rows: list[np.ndarray] = []
 
@@ -28,9 +41,9 @@ def residual_basis(
         rows.append(
             np.asarray(
                 [
-                    total * current_delta,
-                    ld1 * current_delta,
-                    ld2 * current_delta,
+                    total * total_delta,
+                    ld1 * alloc_delta,
+                    ld2 * alloc_delta,
                     rho * ratio_delta,
                     tau * ratio_delta,
                 ],
@@ -39,26 +52,41 @@ def residual_basis(
         )
 
     add()
-    add(total=1.0)
-    add(total=-1.0)
-    add(ld1=1.0)
-    add(ld1=-1.0)
-    add(ld2=1.0)
-    add(ld2=-1.0)
-    add(ld1=1.0, ld2=1.0)      # anchor -> LDs
-    add(ld1=-1.0, ld2=-1.0)    # LDs -> anchor
-    add(ld1=1.0, ld2=-1.0)     # LD2 -> LD1
-    add(ld1=-1.0, ld2=1.0)     # LD1 -> LD2
-    add(total=1.0, ld1=1.0, ld2=1.0)
-    add(total=-1.0, ld1=-1.0, ld2=-1.0)
-    add(rho=1.0)
-    add(rho=-1.0)
-    add(tau=1.0)
-    add(tau=-1.0)
-    add(rho=1.0, tau=1.0)
-    add(rho=1.0, tau=-1.0)
-    add(rho=-1.0, tau=1.0)
-    add(rho=-1.0, tau=-1.0)
+    pairs: list[tuple[tuple[float, float, float, float, float], tuple[float, float, float, float, float]]] = []
+
+    def pair(total: float = 0.0, ld1: float = 0.0, ld2: float = 0.0, rho: float = 0.0, tau: float = 0.0) -> None:
+        pairs.append(((total, ld1, ld2, rho, tau), (-total, -ld1, -ld2, -rho, -tau)))
+
+    pair(total=1.0)
+    if ld1_active:
+        pair(ld1=1.0)
+    if ld2_active:
+        pair(ld2=1.0)
+    if ld1_active and ld2_active:
+        pair(ld1=1.0, ld2=-1.0)
+        pair(ld1=1.0, ld2=1.0)
+    if rho_valid:
+        pair(rho=1.0)
+    if tau_valid:
+        pair(tau=1.0)
+    if rho_valid and tau_valid:
+        pair(rho=1.0, tau=-1.0)
+        pair(rho=1.0, tau=1.0)
+    if ld1_active or ld2_active:
+        pair(total=1.0, ld1=1.0 if ld1_active else 0.0, ld2=1.0 if ld2_active else 0.0)
+
+    pair_slots = max(0, (k - 2) // 2)
+    pair_idx = 0
+    scale = 1.0
+    while len(rows) < 1 + 2 * pair_slots and pairs:
+        pos, neg = pairs[pair_idx % len(pairs)]
+        add(*(scale * np.asarray(pos, dtype=np.float32)))
+        if len(rows) >= 1 + 2 * pair_slots:
+            break
+        add(*(scale * np.asarray(neg, dtype=np.float32)))
+        pair_idx += 1
+        if pair_idx % len(pairs) == 0:
+            scale *= 0.5
 
     if thermal_headroom is not None:
         headroom = np.asarray(thermal_headroom, dtype=np.float32).reshape(-1)[:3]
@@ -75,9 +103,12 @@ def residual_basis(
 
             cool_ld1, cool_ld2 = source_shift(cool, 1.0)
             hot_ld1, hot_ld2 = source_shift(hot, -1.0)
-            add(ld1=cool_ld1 + hot_ld1, ld2=cool_ld2 + hot_ld2)
-            add(ld1=-(cool_ld1 + hot_ld1), ld2=-(cool_ld2 + hot_ld2))
-            add(total=-1.0, ld1=hot_ld1, ld2=hot_ld2)
+            guided_ld1 = cool_ld1 + hot_ld1 if ld1_active else 0.0
+            guided_ld2 = cool_ld2 + hot_ld2 if ld2_active else 0.0
+            add(total=-1.0 if float(np.min(headroom)) < 1.0 else 0.0, ld1=guided_ld1, ld2=guided_ld2)
+
+    if len(rows) < k:
+        add(total=-1.0)
 
     if len(rows) < k:
         base = list(rows[1:])

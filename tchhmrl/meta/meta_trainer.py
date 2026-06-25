@@ -24,6 +24,9 @@ from tchhmrl.utils.seed import set_seed
 @dataclass
 class EpisodeStats:
     reward: float
+    reward_task: float
+    reward_benchmark: float
+    reward_dual_penalized: float
     se: float
     eh: float
     cost: float
@@ -361,6 +364,9 @@ class MetaTrainer:
         self.agent.reset_rollout_state(clear_context=clear_context)
 
         ep_reward = 0.0
+        ep_reward_task = 0.0
+        ep_reward_benchmark = 0.0
+        ep_reward_dual_penalized = 0.0
         ep_se = 0.0
         ep_eh = 0.0
         ep_cost = 0.0
@@ -426,15 +432,20 @@ class MetaTrainer:
             cost = float(info["cost"])
             cost_vec = np.asarray(info.get("cost_vec", [cost]), dtype=np.float32).reshape(-1)
             dual_penalty = self.dual.penalty(cost_vec) if self.dual_enabled else 0.0
-            penalized_reward = float(reward - dual_penalty)
+            reward_benchmark = float(info.get("reward_benchmark", reward))
+            reward_task = float(info.get("reward_task", reward_benchmark + float(info.get("reward_cost_penalty", 0.0))))
+            reward_dual_penalized = float(reward_task - dual_penalty)
 
             lower_transition = {
                 "obs": obs.astype(np.float32),
                 "next_obs": next_obs.astype(np.float32),
                 "upper_idx_raw": float(aux["upper_idx_raw"]),
                 "upper_idx_exec": float(aux["upper_idx_exec"]),
-                "reward": penalized_reward,
-                "reward_raw": float(reward),
+                "reward": reward_dual_penalized,
+                "reward_raw": reward_benchmark,
+                "reward_task": reward_task,
+                "reward_benchmark": reward_benchmark,
+                "reward_dual_penalized": reward_dual_penalized,
                 "done": float(done),
                 "z": z.astype(np.float32),
                 "act_exec": aux["act_exec"].astype(np.float32),
@@ -496,7 +507,7 @@ class MetaTrainer:
                 macro_reward = 0.0
                 macro_steps = 0
 
-            macro_reward += penalized_reward
+                macro_reward += reward_dual_penalized
             macro_steps += 1
             macro_done = bool(done)
             macro_end = macro_done or (int(aux.get("hold_left", 0)) <= 0)
@@ -570,6 +581,9 @@ class MetaTrainer:
                         "act_exec": lower_transition["act_exec"],
                         "reward": lower_transition["reward"],
                         "reward_raw": lower_transition["reward_raw"],
+                        "reward_task": lower_transition["reward_task"],
+                        "reward_benchmark": lower_transition["reward_benchmark"],
+                        "reward_dual_penalized": lower_transition["reward_dual_penalized"],
                         "cost": lower_transition["cost"],
                         "cost_vec": lower_transition["cost_vec"],
                         "task_params": np.asarray(
@@ -579,7 +593,10 @@ class MetaTrainer:
                     }
                 )
 
-            ep_reward += penalized_reward
+            ep_reward += reward_benchmark
+            ep_reward_task += reward_task
+            ep_reward_benchmark += reward_benchmark
+            ep_reward_dual_penalized += reward_dual_penalized
             ep_se += float(info["se"])
             ep_eh += float(info["eh"])
             ep_cost += cost
@@ -612,6 +629,9 @@ class MetaTrainer:
 
         return EpisodeStats(
             reward=ep_reward,
+            reward_task=ep_reward_task,
+            reward_benchmark=ep_reward_benchmark,
+            reward_dual_penalized=ep_reward_dual_penalized,
             se=ep_se / max(ep_len, 1),
             eh=ep_eh / max(ep_len, 1),
             cost=ep_cost / max(ep_len, 1),
@@ -949,6 +969,11 @@ class MetaTrainer:
             row = {
                 "iter": float(it),
                 "support_reward": float(np.mean([s.reward for s in support_stats])),
+                "support_reward_task": float(np.mean([s.reward_task for s in support_stats])),
+                "support_reward_benchmark": float(np.mean([s.reward_benchmark for s in support_stats])),
+                "support_reward_dual_penalized": float(
+                    np.mean([s.reward_dual_penalized for s in support_stats])
+                ),
                 "support_se": float(np.mean([s.se for s in support_stats])),
                 "support_eh": float(np.mean([s.eh for s in support_stats])),
                 "support_cost": mean_support_cost,
@@ -1001,6 +1026,15 @@ class MetaTrainer:
                     np.mean([s.residual_planner_budget_k24_rate for s in support_stats])
                 ),
                 "query_reward": float(np.mean([s.reward for s in query_stats])) if query_stats else 0.0,
+                "query_reward_task": float(np.mean([s.reward_task for s in query_stats])) if query_stats else 0.0,
+                "query_reward_benchmark": float(np.mean([s.reward_benchmark for s in query_stats]))
+                if query_stats
+                else 0.0,
+                "query_reward_dual_penalized": float(
+                    np.mean([s.reward_dual_penalized for s in query_stats])
+                )
+                if query_stats
+                else 0.0,
                 "query_se": float(np.mean([s.se for s in query_stats])) if query_stats else 0.0,
                 "query_eh": float(np.mean([s.eh for s in query_stats])) if query_stats else 0.0,
                 "query_cost": float(np.mean([s.cost for s in query_stats])) if query_stats else 0.0,

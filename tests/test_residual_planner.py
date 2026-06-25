@@ -46,8 +46,11 @@ def _cfg() -> dict:
 def test_residual_basis_returns_policy_centered_structured_candidates():
     basis = residual_basis(
         candidate_count=24,
-        current_step=0.05,
-        ratio_step=0.05,
+        total_current_raw_step=0.10,
+        allocation_logit_raw_step=0.10,
+        ratio_raw_step=0.10,
+        mode=2,
+        active_source_mask=np.asarray([1.0, 1.0, 1.0], dtype=np.float32),
         thermal_headroom=np.asarray([10.0, 1.0, 5.0], dtype=np.float32),
     )
 
@@ -55,6 +58,35 @@ def test_residual_basis_returns_policy_centered_structured_candidates():
     assert np.allclose(basis[0], np.zeros(5, dtype=np.float32))
     assert np.any(np.abs(basis[:, :3]).sum(axis=1) > 0.0)
     assert np.any(np.abs(basis[:, 3:]).sum(axis=1) > 0.0)
+
+
+def test_residual_basis_masks_invalid_mode_and_inactive_source_dimensions():
+    ps_anchor = residual_basis(
+        candidate_count=8,
+        total_current_raw_step=0.10,
+        allocation_logit_raw_step=0.10,
+        ratio_raw_step=0.10,
+        mode=0,
+        active_source_mask=np.asarray([1.0, 0.0, 0.0], dtype=np.float32),
+        thermal_headroom=np.asarray([3.0, 3.0, 3.0], dtype=np.float32),
+    )
+    assert ps_anchor.shape == (8, 5)
+    assert np.allclose(ps_anchor[:, 1], 0.0)
+    assert np.allclose(ps_anchor[:, 2], 0.0)
+    assert np.allclose(ps_anchor[:, 4], 0.0)
+
+    ts_ld1 = residual_basis(
+        candidate_count=8,
+        total_current_raw_step=0.10,
+        allocation_logit_raw_step=0.10,
+        ratio_raw_step=0.10,
+        mode=1,
+        active_source_mask=np.asarray([1.0, 1.0, 0.0], dtype=np.float32),
+        thermal_headroom=np.asarray([3.0, 1.0, 3.0], dtype=np.float32),
+    )
+    assert np.any(np.abs(ts_ld1[:, 1]) > 0.0)
+    assert np.allclose(ts_ld1[:, 2], 0.0)
+    assert np.allclose(ts_ld1[:, 3], 0.0)
 
 
 def test_agent_act_uses_residual_planner_after_start_iter():
@@ -209,6 +241,7 @@ def test_adaptive_planner_budget_selects_zero_for_very_low_risk_and_full_for_hig
     cfg = _cfg()
     cfg["residual_planner"]["adaptive_budget_enabled"] = True
     cfg["residual_planner"]["budget_low_periodic_interval"] = 0
+    cfg["adaptive_thermal"]["initial_std"] = 0.0
     agent = HierarchicalAgent(cfg, torch.device("cpu"))
     agent.set_meta_iter(1)
 

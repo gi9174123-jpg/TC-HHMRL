@@ -35,6 +35,7 @@ def test_default_safety_uses_corrected_action_mapping_and_main_projection():
     assert cfg["safety"]["projection_mode"] == "thermal_cap"
     assert cfg["safety"]["action_decode_mode"] == "tanh_affine"
     assert cfg["safety"]["current_decoder"] == "structured_total_allocation"
+    assert cfg["safety"]["allocation_logit_scale"] == 2.0
     assert cfg["safety"]["inactive_source_mask_mode"] == "hard_zero"
     assert float(cfg["safety"]["smooth_relaxed_margin_c"]) == 1.0
     assert float(cfg["safety"]["thermal_cap_margin_c"]) == 0.5
@@ -43,6 +44,7 @@ def test_default_safety_uses_corrected_action_mapping_and_main_projection():
     assert float(cfg["adaptive_thermal"]["uncertainty_beta_min"]) <= float(
         cfg["adaptive_thermal"]["uncertainty_beta_max"]
     )
+    assert float(cfg["adaptive_thermal"]["initial_std"]) == 0.5
     assert np.allclose(cfg["adaptive_thermal"]["initial_effective_gain"], cfg["safety"]["effective_gain_initial"])
     assert cfg["physical_context"]["enabled"] is True
     assert int(cfg["physical_context"]["input_dim"]) == 18
@@ -99,11 +101,14 @@ def test_formal_metadata_reports_model_aware_lower_components():
     assert meta["inactive_source_mask_mode"] == "hard_zero"
     assert meta["policy_distribution_space"] == "latent_structured_action"
     assert meta["critic_action_space"] == "executed_physical_action"
-    assert meta["entropy_space"] == "latent_action"
+    assert meta["entropy_space"] == "mode_boost_masked_latent_action"
     assert meta["physical_context_enabled"] is True
     assert meta["constraint_critics_enabled"] is True
     assert meta["constraint_critic_dim"] == 4
-    assert meta["constraint_reward_target"] == "raw_reward"
+    assert meta["constraint_reward_target"] == "reward_task"
+    assert meta["reward_training_target"] == "reward_task"
+    assert meta["reward_benchmark_includes_fixed_cost_penalty"] is True
+    assert meta["reward_critic_uses_fixed_cost_penalty"] is False
     assert meta["constraint_actor_weights"] == [0.05, 0.10, 0.10, 0.10]
     assert meta["constraint_actor_penalty_nonnegative"] is True
     assert meta["constraint_replay_enabled"] is True
@@ -128,12 +133,16 @@ def test_formal_metadata_reports_model_aware_lower_components():
     assert meta["residual_planner_start_meta_iter"] == 60
     assert meta["residual_planner_thermal_horizon_start_meta_iter"] == 86
     assert meta["transition_schema_version"] == "transition_schema_v2_fail_fast"
-    assert meta["reward_schema_version"] == "raw_reward_plus_constraint_cost_vec_v1"
+    assert meta["reward_schema_version"] == "reward_task_plus_benchmark_and_constraint_cost_vec_v2"
     assert meta["action_contract_version"] == "policy_planner_executed_action_v1"
     assert meta["residual_planner_scoring"] == "target_critics_plus_constraint_incremental_h2_risk"
     assert meta["residual_planner_trust_region_enabled"] is True
     assert meta["residual_planner_replacement_margin_mode"] == "normalized"
     assert meta["residual_planner_replacement_margin"] is None
+    assert meta["residual_planner_total_current_raw_step"] == 0.10
+    assert meta["residual_planner_allocation_logit_raw_step"] == 0.10
+    assert meta["residual_planner_ratio_raw_step"] == 0.10
+    assert meta["residual_planner_trust_region_effective"] is False
     assert meta["residual_planner_normalized_margin_factor"] == 0.25
     assert meta["residual_planner_constraint_non_degradation"] is True
     assert meta["residual_planner_h2_veto_enabled"] is True
@@ -151,7 +160,7 @@ def test_moderate_config_keeps_model_aware_lower_components_enabled():
     assert int(cfg["physical_context"]["input_dim"]) == 18
     assert cfg["constraint_critics"]["enabled"] is True
     assert int(cfg["constraint_critics"]["out_dim"]) == 4
-    assert cfg["constraint_critics"]["reward_target"] == "raw_reward"
+    assert cfg["constraint_critics"]["reward_target"] == "reward_task"
     assert cfg["constraint_replay"]["enabled"] is True
     assert cfg["constraint_replay"]["uniform_fraction"] == 0.50
     assert cfg["constraint_replay"]["boundary_fraction"] == 0.30

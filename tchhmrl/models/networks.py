@@ -73,15 +73,17 @@ class GaussianTanhPolicy(nn.Module):
         log_std = torch.clamp(self.log_std(h), min=-5.0, max=2.0)
         return mu, log_std
 
-    def sample(self, obs: torch.Tensor, z: torch.Tensor):
+    def sample(self, obs: torch.Tensor, z: torch.Tensor, return_log_prob_per_dim: bool = False):
         mu, log_std = self.forward(obs, z)
         std = log_std.exp()
         dist = Normal(mu, std)
         pre_tanh = dist.rsample()
         action = torch.tanh(pre_tanh)
 
-        log_prob = dist.log_prob(pre_tanh) - torch.log(1 - action.pow(2) + 1e-6)
-        log_prob = log_prob.sum(dim=-1, keepdim=True)
+        log_prob_dim = dist.log_prob(pre_tanh) - torch.log(1 - action.pow(2) + 1e-6)
+        log_prob = log_prob_dim.sum(dim=-1, keepdim=True)
+        if return_log_prob_per_dim:
+            return action, log_prob, log_prob_dim
         return action, log_prob
 
     def deterministic(self, obs: torch.Tensor, z: torch.Tensor):

@@ -194,10 +194,10 @@ class HierarchicalAgent:
         return np.concatenate([boost_oh, mode_oh]).astype(np.float32)
 
     def _context_feedback(self, tr: Dict) -> np.ndarray:
-        reward_raw = float(tr.get("reward_raw", tr.get("reward", 0.0)))
+        reward_signal = float(tr.get("reward_task", tr.get("reward_raw", tr.get("reward", 0.0))))
         return np.concatenate(
             [
-                np.asarray([reward_raw], dtype=np.float32),
+                np.asarray([reward_signal], dtype=np.float32),
                 self._context_cost_vec(tr),
             ]
         ).astype(np.float32)
@@ -316,7 +316,17 @@ class HierarchicalAgent:
     def current_physical_features(self, temps: np.ndarray | None = None) -> np.ndarray:
         diag = self.safety.thermal_diagnostics()
         gain_mean = np.asarray(diag.get("thermal_gain_mean", np.ones(3)), dtype=np.float32).reshape(-1)[:3]
-        gain_std = np.asarray(diag.get("thermal_gain_std", np.zeros(3)), dtype=np.float32).reshape(-1)[:3]
+        gain_std = np.asarray(
+            diag.get("thermal_gain_uncertainty", diag.get("thermal_gain_std", np.zeros(3))),
+            dtype=np.float32,
+        ).reshape(-1)[:3]
+        nominal = np.asarray(
+            self.cfg.get("safety", {}).get("effective_gain_initial", np.ones(3)),
+            dtype=np.float32,
+        ).reshape(-1)[:3]
+        nominal = np.maximum(nominal, 1.0e-6)
+        gain_mean = np.clip(gain_mean / nominal, 0.0, 3.0).astype(np.float32)
+        gain_std = np.clip(gain_std / nominal, 0.0, 2.0).astype(np.float32)
         temp_slope = np.asarray(diag.get("temperature_slope", np.zeros(3)), dtype=np.float32).reshape(-1)[:3] / 10.0
         if temps is None:
             headroom = np.asarray(diag.get("thermal_headroom", np.zeros(3)), dtype=np.float32).reshape(-1)[:3]
@@ -695,6 +705,9 @@ class HierarchicalAgent:
                 "executed_action": transition["executed_action"],
                 "reward": transition["reward"],
                 "reward_raw": transition.get("reward_raw", transition["reward"]),
+                "reward_task": transition.get("reward_task", transition.get("reward_raw", transition["reward"])),
+                "reward_benchmark": transition.get("reward_benchmark", transition.get("reward_raw", transition["reward"])),
+                "reward_dual_penalized": transition.get("reward_dual_penalized", transition["reward"]),
                 "cost": transition.get("cost", 0.0),
                 "cost_vec": self._context_cost_vec(transition),
                 "task_params": task_params,

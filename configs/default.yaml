@@ -81,6 +81,7 @@ safety:
   effective_gain_initial: [5.6, 8.3, 8.3]
   action_decode_mode: tanh_affine
   current_decoder: structured_total_allocation
+  allocation_logit_scale: 2.0
   inactive_source_mask_mode: hard_zero
   min_dwell_steps: 2
   soft_alpha: 0.22
@@ -104,7 +105,7 @@ adaptive_thermal:
   min_gain: 1.0
   max_gain: 16.0
   initial_effective_gain: [5.6, 8.3, 8.3]
-  initial_std: 0.0
+  initial_std: 0.5
 
 physical_context:
   enabled: true
@@ -121,7 +122,7 @@ physical_context:
 constraint_critics:
   enabled: true
   out_dim: 4
-  reward_target: raw_reward
+  reward_target: reward_task
   actor_weights: [0.05, 0.10, 0.10, 0.10]
   target_nonnegative: true
   actor_penalty_nonnegative: true
@@ -145,8 +146,9 @@ constraint_replay:
 residual_planner:
   enabled: true
   candidate_count: 24
-  current_step: 0.05
-  ratio_step: 0.05
+  total_current_raw_step: 0.10
+  allocation_logit_raw_step: 0.10
+  ratio_raw_step: 0.10
   disagreement_beta: 0.10
   projection_penalty: 0.10
   constraint_beta: 1.0

@@ -31,6 +31,9 @@ def _transition(cfg: dict, *, cost: float = 0.0, residual: float = 0.0, headroom
         "act_exec": np.random.randn(5).astype(np.float32),
         "reward": np.float32(np.random.randn()),
         "reward_raw": np.float32(np.random.randn()),
+        "reward_task": np.float32(np.random.randn()),
+        "reward_benchmark": np.float32(np.random.randn()),
+        "reward_dual_penalized": np.float32(np.random.randn()),
         "next_obs": np.random.randn(obs_dim).astype(np.float32),
         "z_next": np.random.randn(z_dim).astype(np.float32),
         "done": np.float32(0.0),
@@ -166,6 +169,12 @@ def test_lower_sac_accepts_separate_stratified_constraint_batch():
     assert "constraint_critic_loss_uniform" in stats
     assert "constraint_critic_loss_boundary" in stats
     assert "constraint_critic_loss_violation" in stats
+    for j in range(int(cfg["constraint_critics"]["out_dim"])):
+        assert f"constraint_target_mean_{j}" in stats
+        assert f"constraint_target_std_{j}" in stats
+        assert f"constraint_mae_{j}" in stats
+        assert f"constraint_max_{j}" in stats
+        assert f"constraint_positive_fraction_{j}" in stats
     assert np.isfinite(stats["constraint_critic_loss"])
 
 

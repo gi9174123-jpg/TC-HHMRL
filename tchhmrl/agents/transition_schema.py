@@ -6,11 +6,12 @@ import numpy as np
 
 
 TRANSITION_SCHEMA_VERSION = "transition_schema_v2_fail_fast"
-REWARD_SCHEMA_VERSION = "raw_reward_plus_constraint_cost_vec_v1"
+REWARD_SCHEMA_VERSION = "reward_task_plus_benchmark_and_constraint_cost_vec_v2"
 ACTION_CONTRACT_VERSION = "policy_planner_executed_action_v1"
 
 STRICT_LOWER_REQUIRED_KEYS: tuple[str, ...] = (
     "reward_raw",
+    "reward_task",
     "cost_vec",
     "act_exec",
     "physical_features",
@@ -25,7 +26,7 @@ def require_transition_keys(batch: Mapping[str, object], keys: Sequence[str] = S
             "Missing strict lower-transition field(s): "
             + ", ".join(missing)
             + f" required by {TRANSITION_SCHEMA_VERSION}. "
-            "Do not silently fall back from reward_raw to reward or from cost_vec to zeros."
+            "Do not silently fall back from reward_task/reward_raw to reward or from cost_vec to zeros."
         )
 
 

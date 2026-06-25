@@ -57,6 +57,9 @@ def test_lower_sac_update_does_not_require_gamma_delta_env_fields():
         "act_exec": np.random.randn(batch_size, 5).astype(np.float32),
         "reward": np.random.randn(batch_size).astype(np.float32),
         "reward_raw": np.random.randn(batch_size).astype(np.float32),
+        "reward_task": np.random.randn(batch_size).astype(np.float32),
+        "reward_benchmark": np.random.randn(batch_size).astype(np.float32),
+        "reward_dual_penalized": np.random.randn(batch_size).astype(np.float32),
         "next_obs": np.random.randn(batch_size, obs_dim).astype(np.float32),
         "z_next": np.random.randn(batch_size, z_dim).astype(np.float32),
         "done": np.zeros(batch_size, dtype=np.float32),
@@ -74,7 +77,7 @@ def test_lower_sac_update_does_not_require_gamma_delta_env_fields():
 
     stats = sac.update(batch)
 
-    assert stats["reward_target_is_raw"] == 1.0
+    assert stats["reward_target_is_task"] == 1.0
     assert np.isfinite(stats["critic_loss"])
 
 

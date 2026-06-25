@@ -52,7 +52,7 @@ class ThermalGainEstimator:
         self.uncertainty_beta_max = float(self.cfg.get("uncertainty_beta_max", 1.5))
         self.min_gain = float(self.cfg.get("min_gain", 0.5))
         self.max_gain = float(self.cfg.get("max_gain", 16.0))
-        initial_std = float(self.cfg.get("initial_std", 0.0))
+        self.prior_std = float(self.cfg.get("initial_std", 0.0))
         if initial_effective_gain is None:
             configured = self.cfg.get("initial_effective_gain", self.cfg.get("initial_mean", 1.0))
             initial_effective_gain = np.asarray(configured, dtype=np.float32)
@@ -63,7 +63,7 @@ class ThermalGainEstimator:
             raise ValueError("adaptive_thermal.initial_effective_gain must be scalar or length n_tx")
 
         self.gain_mean = np.clip(initial_effective_gain, self.min_gain, self.max_gain).astype(np.float32)
-        self.gain_var = np.full((self.n_tx,), max(initial_std, 0.0) ** 2, dtype=np.float32)
+        self.gain_var = np.zeros((self.n_tx,), dtype=np.float32)
         self.valid_count = np.zeros((self.n_tx,), dtype=np.int64)
         self.temperature_slope = np.zeros((self.n_tx,), dtype=np.float32)
         self.last_headroom = np.full((self.n_tx,), np.nan, dtype=np.float32)
@@ -101,10 +101,14 @@ class ThermalGainEstimator:
     def gain_std(self) -> np.ndarray:
         return np.sqrt(np.maximum(self.gain_var, 0.0)).astype(np.float32)
 
+    def gain_uncertainty(self) -> np.ndarray:
+        prior = max(float(self.prior_std), 0.0) / np.sqrt(self.valid_count.astype(np.float32) + 1.0)
+        return (self.gain_std() + prior).astype(np.float32)
+
     def effective_gain_safe(self) -> np.ndarray:
         if not self.enabled:
             return self.gain_mean.astype(np.float32).copy()
-        safe = self.gain_mean + self.beta() * self.gain_std()
+        safe = self.gain_mean + self.beta() * self.gain_uncertainty()
         return np.clip(safe, self.min_gain, self.max_gain).astype(np.float32)
 
     def safe_gain_scale(self) -> np.ndarray:
@@ -122,9 +126,11 @@ class ThermalGainEstimator:
             "adaptive_thermal_enabled": bool(self.enabled),
             "thermal_gain_mean": self.gain_mean.astype(np.float32).copy(),
             "thermal_gain_std": self.gain_std(),
+            "thermal_gain_uncertainty": self.gain_uncertainty(),
             "thermal_gain_safe_scale": self.effective_gain_safe(),
             "effective_gain_mean": self.gain_mean.astype(np.float32).copy(),
             "effective_gain_std": self.gain_std(),
+            "effective_gain_uncertainty": self.gain_uncertainty(),
             "effective_gain_safe": self.effective_gain_safe(),
             "thermal_gain_beta": self.beta(),
             "thermal_gain_valid_count": self.valid_count.astype(np.float32).copy(),

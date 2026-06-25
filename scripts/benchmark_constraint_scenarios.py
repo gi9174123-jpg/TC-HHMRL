@@ -225,7 +225,7 @@ def formal_metadata_snapshot(cfg: Dict, *, pre_alignment: bool | None = None, ta
         if str(safety_cfg.get("current_decoder", "per_source")) == "structured_total_allocation"
         else "raw_lower_action",
         "critic_action_space": "executed_physical_action",
-        "entropy_space": "latent_action",
+        "entropy_space": "mode_boost_masked_latent_action",
         "adaptive_thermal_extra_rollouts": 0,
         "adaptive_thermal_extra_gradient_updates": 0,
         "physical_context_enabled": bool(physical_cfg.get("enabled", False)),
@@ -237,6 +237,9 @@ def formal_metadata_snapshot(cfg: Dict, *, pre_alignment: bool | None = None, ta
         "action_contract_version": ACTION_CONTRACT_VERSION,
         "constraint_critic_dim": int(constraint_cfg.get("out_dim", 0) or 0),
         "constraint_reward_target": str(constraint_cfg.get("reward_target", "raw_reward")),
+        "reward_training_target": str(constraint_cfg.get("reward_target", "raw_reward")),
+        "reward_benchmark_includes_fixed_cost_penalty": True,
+        "reward_critic_uses_fixed_cost_penalty": str(constraint_cfg.get("reward_target", "raw_reward")) != "reward_task",
         "constraint_actor_weights": list(constraint_cfg.get("actor_weights", [])),
         "constraint_actor_penalty_nonnegative": bool(constraint_cfg.get("actor_penalty_nonnegative", True)),
         "constraint_replay_enabled": bool(constraint_replay_cfg.get("enabled", False)),
@@ -280,12 +283,20 @@ def formal_metadata_snapshot(cfg: Dict, *, pre_alignment: bool | None = None, ta
         "residual_planner_replacement_margin_mode": str(planner_cfg.get("replacement_margin_mode", "")),
         "residual_planner_replacement_margin": planner_cfg.get("replacement_margin", None),
         "residual_planner_normalized_margin_factor": planner_cfg.get("normalized_margin_factor", None),
+        "residual_planner_total_current_raw_step": planner_cfg.get("total_current_raw_step", None),
+        "residual_planner_allocation_logit_raw_step": planner_cfg.get("allocation_logit_raw_step", None),
+        "residual_planner_ratio_raw_step": planner_cfg.get("ratio_raw_step", None),
         "residual_planner_constraint_non_degradation": True,
         "residual_planner_h2_veto_enabled": bool(planner_cfg.get("h2_veto_enabled", True)),
         "residual_planner_h2_increment_beta": float(
             planner_cfg.get("h2_increment_beta", planner_cfg.get("thermal_risk_beta", 0.0)) or 0.0
         ),
         "residual_planner_uses_env_reward_model": False,
+        "residual_planner_trust_region_effective": bool(planner_cfg.get("trust_region_enabled", False))
+        and (
+            planner_cfg.get("trust_region_raw_l2", None) is not None
+            or planner_cfg.get("trust_region_exec_l2", None) is not None
+        ),
         "upper_double_dqn": bool(upper_cfg.get("double_dqn", False)),
         "upper_dueling_dqn": bool(upper_cfg.get("dueling", False)),
         "upper_physical_context_enabled": bool(physical_cfg.get("enabled", False)),
@@ -1800,6 +1811,9 @@ def _add_baseline_aux_diagnostics(row: Dict, aux: Dict) -> None:
         "predicted_eh_metric",
         "predicted_snr",
         "predicted_bus_utilization",
+        "reward_task",
+        "reward_benchmark",
+        "reward_dual_penalized",
         "qos_threshold",
         "eh_threshold",
         "ads_balanced_predicted_qos_rate",
@@ -1855,6 +1869,7 @@ def _add_baseline_aux_diagnostics(row: Dict, aux: Dict) -> None:
         "residual_planner_target_constraint_value",
         "residual_planner_previous_projection_residual_norm",
         "actor_total_current_requested",
+        "actor_active_current_capacity",
         "actor_allocation_anchor",
         "actor_allocation_ld1",
         "actor_allocation_ld2",
@@ -2050,6 +2065,9 @@ def collect_env_data(
                         "act_exec": aux["act_exec"].astype(np.float32),
                         "reward": float(reward),
                         "reward_raw": float(reward),
+                        "reward_task": float(info.get("reward_task", reward)),
+                        "reward_benchmark": float(info.get("reward_benchmark", reward)),
+                        "reward_dual_penalized": float(info.get("reward_task", reward)),
                         "cost": float(info["cost"]),
                         "cost_vec": np.asarray(info.get("cost_vec", [float(info["cost"])]), dtype=np.float32),
                         "task_params": build_context_task_summary_v2(
@@ -2460,7 +2478,9 @@ class SacLagrangianBaseline:
             cost = float(info["cost"])
             cost_vec = np.asarray(info.get("cost_vec", [cost]), dtype=np.float32).reshape(-1)
             dual_penalty = self.dual.penalty(cost_vec) if self.dual_enabled else 0.0
-            penalized_reward = float(reward - dual_penalty)
+            reward_benchmark = float(info.get("reward_benchmark", reward))
+            reward_task = float(info.get("reward_task", reward_benchmark + float(info.get("reward_cost_penalty", 0.0))))
+            penalized_reward = float(reward_task - dual_penalty)
             physical_dim = int(self.cfg.get("physical_context", {}).get("input_dim", 18))
             zero_physical = np.zeros(physical_dim, dtype=np.float32)
 
@@ -2472,7 +2492,10 @@ class SacLagrangianBaseline:
                 "upper_idx_train": float(aux.get("upper_idx_train", aux["upper_idx_exec"])),
                 "upper_idx_safety_raw": float(aux.get("upper_idx_safety_raw", aux["upper_idx_raw"])),
                 "reward": penalized_reward,
-                "reward_raw": float(reward),
+                "reward_raw": reward_benchmark,
+                "reward_task": reward_task,
+                "reward_benchmark": reward_benchmark,
+                "reward_dual_penalized": penalized_reward,
                 "done": float(done),
                 "z": self._empty_latent(),
                 "act_exec": aux["act_exec"].astype(np.float32),
@@ -3125,6 +3148,9 @@ def _run_heuristic_episode(trainer: MetaTrainer, env: MultiTxUwSliptEnv) -> Dict
                 "act_exec": aux["act_exec"].astype(np.float32),
                 "reward": float(reward),
                 "reward_raw": float(reward),
+                "reward_task": float(info.get("reward_task", reward)),
+                "reward_benchmark": float(info.get("reward_benchmark", reward)),
+                "reward_dual_penalized": float(info.get("reward_task", reward)),
                 "cost": float(info["cost"]),
                 "cost_vec": np.asarray(info.get("cost_vec", [float(info["cost"])]), dtype=np.float32),
                 "task_params": build_context_task_summary_v2(
