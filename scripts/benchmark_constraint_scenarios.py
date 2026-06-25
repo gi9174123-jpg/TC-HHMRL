@@ -218,6 +218,13 @@ def formal_metadata_snapshot(cfg: Dict, *, pre_alignment: bool | None = None, ta
         "controller_uses_task_gamma_delta": False,
         "gamma_nominal": float(safety_cfg.get("gamma_nominal", cfg.get("env", {}).get("gamma", 0.0))),
         "effective_gain_initial": list(safety_cfg.get("effective_gain_initial", [])),
+        "current_decoder": str(safety_cfg.get("current_decoder", "per_source")),
+        "inactive_source_mask_mode": str(safety_cfg.get("inactive_source_mask_mode", "hard_zero")),
+        "policy_distribution_space": "latent_structured_action"
+        if str(safety_cfg.get("current_decoder", "per_source")) == "structured_total_allocation"
+        else "raw_lower_action",
+        "critic_action_space": "executed_physical_action",
+        "entropy_space": "latent_action",
         "adaptive_thermal_extra_rollouts": 0,
         "adaptive_thermal_extra_gradient_updates": 0,
         "physical_context_enabled": bool(physical_cfg.get("enabled", False)),
@@ -562,6 +569,8 @@ def paper_baseline_explanation(baseline_family: str) -> Dict[str, str]:
 
 def apply_baseline_overrides(cfg: Dict, baseline: str) -> None:
     baseline = str(baseline)
+    cfg.setdefault("safety", {})["current_decoder"] = "per_source"
+    cfg.setdefault("safety", {})["inactive_source_mask_mode"] = "hard_zero"
     if baseline == "sac_lagrangian":
         cfg.setdefault("context", {})["enabled"] = False
         cfg.setdefault("agent", {})["z_dim"] = 0
@@ -1806,6 +1815,15 @@ def _add_baseline_aux_diagnostics(row: Dict, aux: Dict) -> None:
         "residual_planner_h2_max_temperature",
         "residual_planner_h2_veto",
         "residual_planner_trust_region_rejected",
+        "actor_total_current_requested",
+        "actor_allocation_anchor",
+        "actor_allocation_ld1",
+        "actor_allocation_ld2",
+        "actor_inactive_allocation_sum",
+        "actor_per_source_clip_count",
+        "structured_actor_per_source_clip_rate",
+        "structured_actor_bus_clip_rate",
+        "mode_effective_latent_dim",
     ]
     string_keys = [
         "selected_template",
@@ -1822,6 +1840,7 @@ def _add_baseline_aux_diagnostics(row: Dict, aux: Dict) -> None:
         "receiver_ratio_rule",
         "dimming_type",
         "residual_planner_replacement_margin_mode",
+        "current_decoder",
     ]
     for key in numeric_keys:
         if key in aux:

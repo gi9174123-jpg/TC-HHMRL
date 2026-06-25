@@ -75,6 +75,12 @@ class SafetyLayer:
         self.action_decode_mode = str(safety_cfg.get("action_decode_mode", "tanh_affine")).lower()
         if self.action_decode_mode not in {"tanh_affine", "sigmoid_logit"}:
             raise ValueError(f"unsupported safety.action_decode_mode={self.action_decode_mode}")
+        self.current_decoder = str(safety_cfg.get("current_decoder", "per_source")).lower()
+        if self.current_decoder not in {"per_source", "structured_total_allocation"}:
+            raise ValueError(f"unsupported safety.current_decoder={self.current_decoder}")
+        self.inactive_source_mask_mode = str(safety_cfg.get("inactive_source_mask_mode", "hard_zero")).lower()
+        if self.inactive_source_mask_mode not in {"hard_zero", "soft_floor"}:
+            raise ValueError(f"unsupported safety.inactive_source_mask_mode={self.inactive_source_mask_mode}")
         self.min_dwell_steps = int(safety_cfg["min_dwell_steps"])
         self.soft_alpha = float(safety_cfg["soft_alpha"])
         self.smooth_relaxed_margin_c = float(safety_cfg.get("smooth_relaxed_margin_c", 1.0))
@@ -257,6 +263,102 @@ class SafetyLayer:
         if self.action_decode_mode == "sigmoid_logit":
             return torch.sigmoid(lower_raw)
         return torch.clamp((lower_raw + 1.0) * 0.5, min=0.0, max=1.0)
+
+    def _decode_current_request_np(
+        self,
+        lower_raw: np.ndarray,
+        *,
+        exec_boost: int,
+    ) -> Tuple[np.ndarray, np.ndarray, np.ndarray, Dict[str, np.ndarray | float]]:
+        decoded = self._decode_frac_np(lower_raw[:5])
+        active = (self._boost_mask(exec_boost) * self.tx_enabled).astype(np.float32)
+        if self.current_decoder != "structured_total_allocation":
+            current_frac = decoded[:3].astype(np.float32)
+            currents = (current_frac * self.current_max).astype(np.float32)
+            return currents, current_frac, decoded, {
+                "current_requested": currents.copy(),
+                "actor_total_current_requested": float(np.sum(currents)),
+                "actor_allocation": np.full(3, np.nan, dtype=np.float32),
+                "actor_inactive_allocation_sum": 0.0,
+                "actor_per_source_clip_count": 0.0,
+                "structured_actor_per_source_clip_rate": 0.0,
+                "active_source_mask": active,
+            }
+
+        total_requested = float(decoded[0]) * self.bus_current_max
+        logits = np.asarray([0.0, lower_raw[1], lower_raw[2]], dtype=np.float32)
+        masked_logits = np.where(active > 0.0, logits, -1.0e9).astype(np.float32)
+        shifted = masked_logits - np.max(masked_logits)
+        exp_logits = np.exp(shifted) * active
+        denom = float(np.sum(exp_logits))
+        allocation = (
+            np.asarray([1.0, 0.0, 0.0], dtype=np.float32)
+            if denom <= 0.0
+            else (exp_logits / denom).astype(np.float32)
+        )
+        requested = (total_requested * allocation).astype(np.float32)
+        clipped = np.minimum(requested, self.current_max).astype(np.float32)
+        clip_count = float(np.sum(requested > (self.current_max + 1.0e-6)))
+        current_frac = (requested / np.maximum(self.current_max, 1.0e-6)).astype(np.float32)
+        inactive_sum = float(np.sum(allocation[active <= 0.0]))
+        return clipped, current_frac, decoded, {
+            "current_requested": requested,
+            "actor_total_current_requested": float(total_requested),
+            "actor_allocation": allocation.astype(np.float32),
+            "actor_inactive_allocation_sum": inactive_sum,
+            "actor_per_source_clip_count": clip_count,
+            "structured_actor_per_source_clip_rate": float(clip_count / max(float(np.sum(active > 0.0)), 1.0)),
+            "active_source_mask": active,
+        }
+
+    def _decode_current_request_torch(
+        self,
+        lower_raw: torch.Tensor,
+        *,
+        boost_combo: torch.Tensor,
+        current_max: torch.Tensor,
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, Dict[str, torch.Tensor]]:
+        decoded = self._decode_frac_torch(lower_raw[:, :5])
+        table = torch.tensor(
+            [[1.0, 0.0, 0.0], [1.0, 1.0, 0.0], [1.0, 0.0, 1.0], [1.0, 1.0, 1.0]],
+            device=lower_raw.device,
+            dtype=lower_raw.dtype,
+        )
+        boost_idx = torch.clamp(boost_combo.long().view(-1), 0, table.shape[0] - 1)
+        active = table.index_select(0, boost_idx)
+        tx_enabled = torch.as_tensor(self.tx_enabled, dtype=lower_raw.dtype, device=lower_raw.device).view(1, -1)
+        active = active * tx_enabled
+        if self.current_decoder != "structured_total_allocation":
+            current_frac = decoded[:, :3]
+            currents = current_frac * current_max
+            return currents, current_frac, decoded, {
+                "current_requested": currents,
+                "actor_total_current_requested": currents.sum(dim=1),
+                "actor_allocation": torch.full_like(currents, float("nan")),
+                "actor_inactive_allocation_sum": torch.zeros((lower_raw.shape[0],), dtype=lower_raw.dtype, device=lower_raw.device),
+                "actor_per_source_clip_count": torch.zeros((lower_raw.shape[0],), dtype=lower_raw.dtype, device=lower_raw.device),
+                "structured_actor_per_source_clip_rate": torch.zeros((lower_raw.shape[0],), dtype=lower_raw.dtype, device=lower_raw.device),
+                "active_source_mask": active,
+            }
+
+        total_requested = decoded[:, 0:1] * float(self.bus_current_max)
+        logits = torch.cat([torch.zeros_like(lower_raw[:, 1:2]), lower_raw[:, 1:3]], dim=1)
+        masked_logits = torch.where(active > 0.0, logits, torch.full_like(logits, -1.0e9))
+        allocation = torch.softmax(masked_logits, dim=1) * active
+        allocation = allocation / torch.clamp(allocation.sum(dim=1, keepdim=True), min=1.0e-6)
+        requested = total_requested * allocation
+        clipped = torch.minimum(requested, current_max)
+        clip_count = (requested > (current_max + 1.0e-6)).to(lower_raw.dtype).sum(dim=1)
+        active_count = torch.clamp((active > 0.0).to(lower_raw.dtype).sum(dim=1), min=1.0)
+        return clipped, requested / torch.clamp(current_max, min=1.0e-6), decoded, {
+            "current_requested": requested,
+            "actor_total_current_requested": total_requested.view(-1),
+            "actor_allocation": allocation,
+            "actor_inactive_allocation_sum": (allocation * (active <= 0.0).to(lower_raw.dtype)).sum(dim=1),
+            "actor_per_source_clip_count": clip_count,
+            "structured_actor_per_source_clip_rate": clip_count / active_count,
+            "active_source_mask": active,
+        }
 
     def _thermal_coupling_term_np(self, temps: np.ndarray) -> np.ndarray:
         temps = np.asarray(temps, dtype=np.float32)
@@ -466,13 +568,15 @@ class SafetyLayer:
         exec_boost, mem = self._apply_dwell(desired_boost, mem)
 
         lower_raw = np.asarray(lower_raw, dtype=np.float32)
-        decoded = self._decode_frac_np(lower_raw[:5])
-        current_frac = decoded[:3].astype(np.float32)
-        currents = current_frac * self.current_max
+        currents, current_frac, decoded, current_aux = self._decode_current_request_np(lower_raw, exec_boost=exec_boost)
+        current_requested = np.asarray(current_aux["current_requested"], dtype=np.float32)
         raw_current_total = float(np.sum(currents))
 
         mask = self._boost_mask(exec_boost)
-        if self.projection_mode in {"smooth", "smooth_relaxed", "thermal_cap", "dalal_safe"}:
+        if (
+            self.inactive_source_mask_mode == "soft_floor"
+            and self.projection_mode in {"smooth", "smooth_relaxed", "thermal_cap", "dalal_safe"}
+        ):
             mask = self.mask_floor + (1.0 - self.mask_floor) * mask
         mask = self.tx_enabled * mask
         currents *= mask.astype(np.float32)
@@ -570,6 +674,8 @@ class SafetyLayer:
             "thermal_model": self.thermal_model,
             "thermal_parameter_source": self.thermal_parameter_source,
             "gamma_nominal": float(self.gamma_nominal),
+            "current_decoder": self.current_decoder,
+            "inactive_source_mask_mode": self.inactive_source_mask_mode,
             "thermal_coupling_matrix_hash": self.thermal_coupling_matrix_hash,
             "safety_projection_version": self.safety_projection_version,
             "thermal_margin": thermal_margin,
@@ -583,6 +689,16 @@ class SafetyLayer:
             "bus_projected_current_total": bus_projected_current_total,
             "projected_current_total": projected_current_total,
             "projection_compression_ratio": projection_compression_ratio,
+            "current_requested": current_requested.astype(np.float32),
+            "actor_total_current_requested": float(current_aux["actor_total_current_requested"]),
+            "actor_allocation_anchor": float(np.asarray(current_aux["actor_allocation"])[0]),
+            "actor_allocation_ld1": float(np.asarray(current_aux["actor_allocation"])[1]),
+            "actor_allocation_ld2": float(np.asarray(current_aux["actor_allocation"])[2]),
+            "actor_inactive_allocation_sum": float(current_aux["actor_inactive_allocation_sum"]),
+            "actor_per_source_clip_count": float(current_aux["actor_per_source_clip_count"]),
+            "structured_actor_per_source_clip_rate": float(current_aux["structured_actor_per_source_clip_rate"]),
+            "structured_actor_bus_clip_rate": float(raw_current_total > self.bus_current_max + 1.0e-6),
+            "mode_effective_latent_dim": float(4 if mode in {0, 1} else 5),
         }
         diag = self.thermal_diagnostics()
         local_headroom = (self.thermal_safe - temps).astype(np.float32)
@@ -609,12 +725,14 @@ class SafetyLayer:
         device = lower_raw.device
 
         current_max = torch.as_tensor(self.current_max, device=device, dtype=lower_raw.dtype).view(1, -1)
-        decoded = self._decode_frac_torch(lower_raw[:, :5])
-        current_frac = decoded[:, :3]
-        currents = current_frac * current_max
-        raw_current_total = currents.sum(dim=1)
-
         boost_combo = boost_combo.long().view(-1)
+        currents, current_frac, decoded, current_aux = self._decode_current_request_torch(
+            lower_raw,
+            boost_combo=boost_combo,
+            current_max=current_max,
+        )
+        current_requested = current_aux["current_requested"]
+        raw_current_total = currents.sum(dim=1)
 
         table = torch.tensor(
             [[1.0, 0.0, 0.0], [1.0, 1.0, 0.0], [1.0, 0.0, 1.0], [1.0, 1.0, 1.0]],
@@ -623,7 +741,10 @@ class SafetyLayer:
         )
         boost_combo = torch.clamp(boost_combo, 0, table.shape[0] - 1)
         mask = table.index_select(0, boost_combo)
-        if self.projection_mode in {"smooth", "smooth_relaxed", "thermal_cap", "dalal_safe"}:
+        if (
+            self.inactive_source_mask_mode == "soft_floor"
+            and self.projection_mode in {"smooth", "smooth_relaxed", "thermal_cap", "dalal_safe"}
+        ):
             mask = self.mask_floor + (1.0 - self.mask_floor) * mask
         tx_enabled = torch.as_tensor(self.tx_enabled, dtype=lower_raw.dtype, device=device).view(1, -1)
         mask = tx_enabled * mask
@@ -735,6 +856,7 @@ class SafetyLayer:
             "thermal_model": self.thermal_model,
             "thermal_parameter_source": self.thermal_parameter_source,
             "gamma_nominal": torch.full((lower_raw.shape[0],), float(self.gamma_nominal), dtype=lower_raw.dtype, device=device),
+            "current_decoder": self.current_decoder,
             "thermal_coupling_matrix_hash": self.thermal_coupling_matrix_hash,
             "safety_projection_version": self.safety_projection_version,
             "thermal_margin": thermal_margin,
@@ -747,6 +869,18 @@ class SafetyLayer:
             "bus_projected_current_total": bus_projected_current_total,
             "projected_current_total": projected_current_total,
             "projection_compression_ratio": projection_compression_ratio,
+            "current_requested": current_requested,
+            "actor_total_current_requested": current_aux["actor_total_current_requested"],
+            "actor_allocation": current_aux["actor_allocation"],
+            "actor_inactive_allocation_sum": current_aux["actor_inactive_allocation_sum"],
+            "actor_per_source_clip_count": current_aux["actor_per_source_clip_count"],
+            "structured_actor_per_source_clip_rate": current_aux["structured_actor_per_source_clip_rate"],
+            "structured_actor_bus_clip_rate": (raw_current_total > float(self.bus_current_max + 1.0e-6)).to(lower_raw.dtype),
+            "mode_effective_latent_dim": torch.where(
+                torch.clamp(mode.long().view(-1), 0, 2) == 2,
+                torch.full((lower_raw.shape[0],), 5.0, dtype=lower_raw.dtype, device=device),
+                torch.full((lower_raw.shape[0],), 4.0, dtype=lower_raw.dtype, device=device),
+            ),
         }
         diag = self.thermal_diagnostics()
         for key, val in diag.items():
@@ -790,6 +924,12 @@ class SafetyLayer:
                 grad_i = float(2.0 * effective_gain[idx] * currents[idx])
                 step = float(g_temp / (grad_i * grad_i + self._dalal_eps))
                 currents[idx] = float(np.clip(currents[idx] - step * grad_i, 0.0, self.current_max[idx]))
+        base, _ = self._thermal_base_np(temps, amb_temp)
+        effective_gain = self._safe_thermal_coeff_np()
+        cap = np.sqrt(
+            np.maximum((self.thermal_safe - base) / np.maximum(effective_gain, 1.0e-6), 0.0)
+        ).astype(np.float32)
+        currents = np.minimum(currents, np.minimum(cap, self.current_max)).astype(np.float32)
         return currents.astype(np.float32)
 
     def _dalal_correct_currents_torch(
@@ -816,4 +956,7 @@ class SafetyLayer:
             grad_temp = 2.0 * effective_gain * currents
             step_temp = g_temp / (grad_temp.square() + eps)
             currents = torch.minimum(torch.clamp(currents - step_temp * grad_temp, min=0.0), current_max)
+        base, _ = self._thermal_base_torch(temps, amb_temp)
+        cap = torch.sqrt(torch.clamp((self.thermal_safe - base) / torch.clamp(effective_gain, min=1.0e-6), min=0.0))
+        currents = torch.minimum(currents, torch.minimum(cap, current_max))
         return currents

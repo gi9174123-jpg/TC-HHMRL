@@ -75,9 +75,15 @@ class ResidualPlanner:
         return torch.cat([safe["currents_exec"], safe["rho_exec"], safe["tau_exec"]], dim=1)
 
     def _projection_residual_norm(self, *, lower_raw: torch.Tensor, safe: Dict[str, torch.Tensor], safety) -> torch.Tensor:
-        decoded = safety._decode_frac_torch(lower_raw[:, :5])
         current_max = torch.as_tensor(safety.current_max, dtype=lower_raw.dtype, device=lower_raw.device).view(1, -1)
-        desired = torch.cat([decoded[:, :3] * current_max, decoded[:, 3:4], decoded[:, 4:5]], dim=1)
+        requested_current = safe.get("current_requested")
+        if requested_current is None:
+            decoded = safety._decode_frac_torch(lower_raw[:, :5])
+            requested_current = decoded[:, :3] * current_max
+            requested_rho_tau = decoded[:, 3:5]
+        else:
+            requested_rho_tau = torch.cat([safe["rho_raw_decoded"], safe["tau_raw_decoded"]], dim=1)
+        desired = torch.cat([requested_current, requested_rho_tau], dim=1)
         executed = self._executed_action(safe)
         residual = executed - desired
         residual_current = residual[:, :3] / torch.clamp(current_max, min=1.0e-6)

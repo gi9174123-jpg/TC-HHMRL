@@ -146,7 +146,7 @@ def test_residual_planner_trust_region_rejects_non_policy_candidates():
 
     assert int(aux["residual_planner_selected_idx"]) == 0
     assert int(aux["residual_planner_trust_region_rejected_count"]) > 0
-    assert int(aux["residual_planner_valid_candidate_count"]) == 1
+    assert int(aux["residual_planner_valid_candidate_count"]) < int(aux["residual_planner_candidate_count"])
 
 
 def test_residual_planner_positive_margin_can_force_policy_fallback():

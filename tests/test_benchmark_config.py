@@ -34,6 +34,8 @@ def test_default_safety_uses_corrected_action_mapping_and_main_projection():
     assert cfg["physics"]["safety_projection_version"] == "independent_thermal_cap_v1"
     assert cfg["safety"]["projection_mode"] == "thermal_cap"
     assert cfg["safety"]["action_decode_mode"] == "tanh_affine"
+    assert cfg["safety"]["current_decoder"] == "structured_total_allocation"
+    assert cfg["safety"]["inactive_source_mask_mode"] == "hard_zero"
     assert float(cfg["safety"]["smooth_relaxed_margin_c"]) == 1.0
     assert float(cfg["safety"]["thermal_cap_margin_c"]) == 0.5
     assert cfg["adaptive_thermal"]["enabled"] is True
@@ -82,6 +84,11 @@ def test_formal_metadata_reports_model_aware_lower_components():
     assert meta["thermal_parameter_source"] == "nominal_plus_online_effective_gain"
     assert meta["controller_uses_task_gamma_delta"] is False
     assert np.allclose(meta["effective_gain_initial"], cfg["safety"]["effective_gain_initial"])
+    assert meta["current_decoder"] == "structured_total_allocation"
+    assert meta["inactive_source_mask_mode"] == "hard_zero"
+    assert meta["policy_distribution_space"] == "latent_structured_action"
+    assert meta["critic_action_space"] == "executed_physical_action"
+    assert meta["entropy_space"] == "latent_action"
     assert meta["physical_context_enabled"] is True
     assert meta["constraint_critics_enabled"] is True
     assert meta["constraint_critic_dim"] == 4

@@ -57,6 +57,8 @@ safety:
   thermal_parameter_source: nominal_plus_online_effective_gain
   gamma_nominal: 0.055
   effective_gain_initial: [4.4, 6.0, 6.0]
+  current_decoder: structured_total_allocation
+  inactive_source_mask_mode: hard_zero
   min_dwell_steps: 2
   soft_alpha: 0.28
   cutoff_alpha: 0.36

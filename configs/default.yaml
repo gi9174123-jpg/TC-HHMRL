@@ -80,6 +80,8 @@ safety:
   gamma_nominal: 0.070
   effective_gain_initial: [5.6, 8.3, 8.3]
   action_decode_mode: tanh_affine
+  current_decoder: structured_total_allocation
+  inactive_source_mask_mode: hard_zero
   min_dwell_steps: 2
   soft_alpha: 0.22
   smooth_relaxed_margin_c: 1.0

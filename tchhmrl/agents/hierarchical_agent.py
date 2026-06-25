@@ -514,7 +514,10 @@ class HierarchicalAgent:
         exec_vec = np.concatenate(
             [safe["currents_exec"], np.asarray([safe["rho_exec"], safe["tau_exec"]], dtype=np.float32)]
         ).astype(np.float32)
-        desired_currents = np.asarray(safe["raw_current_frac"], dtype=np.float32) * self.safety.current_max
+        desired_currents = np.asarray(
+            safe.get("current_requested", np.asarray(safe["raw_current_frac"], dtype=np.float32) * self.safety.current_max),
+            dtype=np.float32,
+        )
         desired_vec = np.concatenate(
             [
                 desired_currents.astype(np.float32),
@@ -565,6 +568,17 @@ class HierarchicalAgent:
             "rho_raw_decoded": safe.get("rho_raw_decoded"),
             "tau_raw_decoded": safe.get("tau_raw_decoded"),
             "raw_current_total": safe.get("raw_current_total"),
+            "current_decoder": safe.get("current_decoder"),
+            "current_requested": safe.get("current_requested"),
+            "actor_total_current_requested": safe.get("actor_total_current_requested"),
+            "actor_allocation_anchor": safe.get("actor_allocation_anchor"),
+            "actor_allocation_ld1": safe.get("actor_allocation_ld1"),
+            "actor_allocation_ld2": safe.get("actor_allocation_ld2"),
+            "actor_inactive_allocation_sum": safe.get("actor_inactive_allocation_sum"),
+            "actor_per_source_clip_count": safe.get("actor_per_source_clip_count"),
+            "structured_actor_per_source_clip_rate": safe.get("structured_actor_per_source_clip_rate"),
+            "structured_actor_bus_clip_rate": safe.get("structured_actor_bus_clip_rate"),
+            "mode_effective_latent_dim": safe.get("mode_effective_latent_dim"),
             "masked_current_total": safe.get("masked_current_total"),
             "bus_projected_current_total": safe.get("bus_projected_current_total"),
             "projected_current_total": safe.get("projected_current_total"),
