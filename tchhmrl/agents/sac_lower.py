@@ -255,9 +255,11 @@ class LowerSAC:
             alpha_val = self.alpha_start + frac * (self.alpha_end - self.alpha_start)
         return torch.tensor(alpha_val, dtype=dtype, device=self.device)
 
-    def update(self, batch: Dict[str, np.ndarray]) -> Dict[str, float]:
+    def update(self, batch: Dict[str, np.ndarray], constraint_batch: Dict[str, np.ndarray] | None = None) -> Dict[str, float]:
         if self.constraint_critics_enabled:
             require_transition_keys(batch)
+            if constraint_batch is not None:
+                require_transition_keys(constraint_batch)
         obs = torch.tensor(batch["obs"], dtype=torch.float32, device=self.device)
         batch_size = int(obs.shape[0])
         z = torch.tensor(batch["z"], dtype=torch.float32, device=self.device)
@@ -329,7 +331,7 @@ class LowerSAC:
                 self.q2_tgt(next_obs_aug_q2_tgt, z_next, a_next),
             ) - alpha_t * logp_next
             td_target = rew + self.gamma_rl * (1.0 - done) * q_next
-            if self.constraint_q_tgt is not None:
+            if self.constraint_q_tgt is not None and constraint_batch is None:
                 constraint_next = self.constraint_q_tgt(next_obs_aug_q1_tgt, z_next, a_next)
                 if self.constraint_target_nonnegative:
                     constraint_next = torch.relu(constraint_next)
@@ -341,9 +343,75 @@ class LowerSAC:
         q2 = self.q2(obs_aug_q2, z, act_exec)
         loss_q = F.mse_loss(q1, td_target) + F.mse_loss(q2, td_target)
         constraint_loss = torch.tensor(0.0, dtype=obs.dtype, device=self.device)
-        if self.constraint_q is not None and constraint_target is not None:
+        constraint_batch_stats: Dict[str, float] = {}
+        if self.constraint_q is not None and constraint_batch is not None:
+            cb = constraint_batch
+            c_obs = torch.tensor(cb["obs"], dtype=torch.float32, device=self.device)
+            c_batch_size = int(c_obs.shape[0])
+            c_z = torch.tensor(cb["z"], dtype=torch.float32, device=self.device)
+            validate_executed_action_shape(cb, batch_size=c_batch_size)
+            c_act_exec = torch.tensor(cb["act_exec"], dtype=torch.float32, device=self.device)
+            c_next_obs = torch.tensor(cb["next_obs"], dtype=torch.float32, device=self.device)
+            c_z_next = torch.tensor(cb["z_next"], dtype=torch.float32, device=self.device)
+            c_done = torch.tensor(cb["done"], dtype=torch.float32, device=self.device).view(-1, 1)
+            c_cost_vec = torch.tensor(cb["cost_vec"], dtype=torch.float32, device=self.device)
+            if c_cost_vec.dim() == 1:
+                c_cost_vec = c_cost_vec.view(-1, 1)
+            if c_cost_vec.shape[1] != self.constraint_dim:
+                padded = torch.zeros((c_batch_size, self.constraint_dim), dtype=torch.float32, device=self.device)
+                n = min(int(c_cost_vec.shape[1]), self.constraint_dim)
+                padded[:, :n] = c_cost_vec[:, :n]
+                c_cost_vec = padded
+            c_boost = torch.tensor(cb["boost_combo_exec"], dtype=torch.long, device=self.device)
+            c_mode = torch.tensor(
+                cb.get(
+                    "mode_exec",
+                    np.mod(cb.get("upper_idx_exec", cb.get("upper_idx", np.zeros(c_batch_size))), 3),
+                ),
+                dtype=torch.long,
+                device=self.device,
+            )
+            c_boost_next = torch.tensor(cb.get("boost_combo_exec_next", cb["boost_combo_exec"]), dtype=torch.long, device=self.device)
+            c_mode_next = torch.tensor(
+                cb.get("mode_exec_next", cb.get("mode_exec", np.mod(cb.get("upper_idx_exec", np.zeros(c_batch_size)), 3))),
+                dtype=torch.long,
+                device=self.device,
+            )
+            c_physical = self._physical_torch(cb, "physical_features", c_batch_size)
+            c_physical_next = self._physical_torch(cb, "physical_features_next", c_batch_size)
+            c_obs_aug_q1 = self._augment_torch(c_obs, c_boost, c_mode, c_physical, self.q1_phys)
+            c_next_obs_aug_actor = self._augment_torch(c_next_obs, c_boost_next, c_mode_next, c_physical_next, self.actor_phys)
+            c_next_obs_aug_q1_tgt = self._augment_torch(c_next_obs, c_boost_next, c_mode_next, c_physical_next, self.q1_tgt_phys)
+            c_next_temps = torch.tensor(cb["next_temps"], dtype=torch.float32, device=self.device)
+            c_amb = torch.tensor(cb["amb_temp"], dtype=torch.float32, device=self.device)
+            with torch.no_grad():
+                c_raw_next, _ = self.actor.sample(c_next_obs_aug_actor, c_z_next)
+                c_safe_next = self.safety.project_torch(c_raw_next, c_boost_next, c_mode_next, c_next_temps, c_amb)
+                c_a_next = torch.cat(
+                    [c_safe_next["currents_exec"], c_safe_next["rho_exec"], c_safe_next["tau_exec"]],
+                    dim=1,
+                )
+                c_constraint_next = self.constraint_q_tgt(c_next_obs_aug_q1_tgt, c_z_next, c_a_next)
+                if self.constraint_target_nonnegative:
+                    c_constraint_next = torch.relu(c_constraint_next)
+                constraint_target = c_cost_vec + self.gamma_rl * (1.0 - c_done) * c_constraint_next
+            constraint_pred = self.constraint_q(c_obs_aug_q1, c_z, c_act_exec)
+            per_item = F.mse_loss(constraint_pred, constraint_target, reduction="none").mean(dim=1)
+            weights = torch.tensor(
+                cb.get("constraint_replay_importance_weight", np.ones(c_batch_size, dtype=np.float32)),
+                dtype=torch.float32,
+                device=self.device,
+            ).view(-1)
+            constraint_loss = (per_item * weights).sum() / torch.clamp(weights.sum(), min=1.0)
+            constraint_batch_stats = {
+                "constraint_replay_weight_mean": float(weights.detach().mean().item()),
+                "constraint_replay_batch_size": float(c_batch_size),
+            }
+        elif self.constraint_q is not None and constraint_target is not None:
             constraint_pred = self.constraint_q(obs_aug_q1, z, act_exec)
             constraint_loss = F.mse_loss(constraint_pred, constraint_target)
+            loss_q = loss_q + constraint_loss
+        if self.constraint_q is not None and constraint_batch is not None:
             loss_q = loss_q + constraint_loss
 
         self.critic_optim.zero_grad()
@@ -408,6 +476,7 @@ class LowerSAC:
             "entropy": float((-logp).mean().item()),
             "alpha": float(alpha_t.detach().item()),
             "alpha_loss": float(alpha_loss_val),
+            **constraint_batch_stats,
         }
 
     def state_dict(self):

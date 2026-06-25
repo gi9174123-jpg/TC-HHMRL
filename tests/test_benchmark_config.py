@@ -51,6 +51,10 @@ def test_default_safety_uses_corrected_action_mapping_and_main_projection():
     assert int(cfg["constraint_critics"]["out_dim"]) == 4
     assert cfg["constraint_critics"]["actor_weights"] == [0.05, 0.10, 0.10, 0.10]
     assert cfg["constraint_critics"]["actor_penalty_nonnegative"] is True
+    assert cfg["constraint_replay"]["enabled"] is True
+    assert cfg["constraint_replay"]["uniform_fraction"] == 0.50
+    assert cfg["constraint_replay"]["boundary_fraction"] == 0.30
+    assert cfg["constraint_replay"]["violation_fraction"] == 0.20
     assert cfg["upper_dqn"]["double_dqn"] is True
     assert cfg["upper_dqn"]["dueling"] is True
 
@@ -95,8 +99,18 @@ def test_formal_metadata_reports_model_aware_lower_components():
     assert meta["constraint_reward_target"] == "raw_reward"
     assert meta["constraint_actor_weights"] == [0.05, 0.10, 0.10, 0.10]
     assert meta["constraint_actor_penalty_nonnegative"] is True
+    assert meta["constraint_replay_enabled"] is True
+    assert meta["constraint_replay_uniform_fraction"] == 0.50
+    assert meta["constraint_replay_boundary_fraction"] == 0.30
+    assert meta["constraint_replay_violation_fraction"] == 0.20
+    assert meta["constraint_replay_reward_batch"] == "unchanged_reward_critic_batch"
+    assert meta["constraint_replay_constraint_batch"] == "stratified_uniform_boundary_violation"
     assert meta["residual_planner_enabled"] is True
     assert meta["residual_planner_candidate_count"] == 24
+    assert meta["residual_planner_adaptive_budget_enabled"] is True
+    assert meta["residual_planner_budget_candidates"] == [0, 8, 16, 24]
+    assert meta["residual_planner_budget_rule"] == "rule_based_current_risk"
+    assert "target_critic_disagreement" in meta["residual_planner_budget_inputs"]
     assert meta["residual_planner_thermal_horizon"] == 2
     assert meta["residual_planner_start_meta_iter"] == 60
     assert meta["residual_planner_thermal_horizon_start_meta_iter"] == 86
@@ -125,8 +139,16 @@ def test_moderate_config_keeps_model_aware_lower_components_enabled():
     assert cfg["constraint_critics"]["enabled"] is True
     assert int(cfg["constraint_critics"]["out_dim"]) == 4
     assert cfg["constraint_critics"]["reward_target"] == "raw_reward"
+    assert cfg["constraint_replay"]["enabled"] is True
+    assert cfg["constraint_replay"]["uniform_fraction"] == 0.50
+    assert cfg["constraint_replay"]["boundary_fraction"] == 0.30
+    assert cfg["constraint_replay"]["violation_fraction"] == 0.20
     assert cfg["residual_planner"]["enabled"] is True
     assert int(cfg["residual_planner"]["candidate_count"]) == 24
+    assert cfg["residual_planner"]["adaptive_budget_enabled"] is True
+    assert cfg["residual_planner"]["budget_candidates"] == [0, 8, 16, 24]
+    assert cfg["residual_planner"]["replacement_margin_mode"] == "normalized"
+    assert cfg["residual_planner"]["replacement_margin"] is None
     assert int(cfg["residual_planner"]["thermal_horizon_start_meta_iter"]) == 86
     assert int(cfg["meta"]["checkpoint_selection"]["min_iter"]) == 86
     assert cfg["upper_dqn"]["double_dqn"] is True

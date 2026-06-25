@@ -33,6 +33,25 @@ class ResidualPlanner:
         self.thermal_horizon = int(planner_cfg.get("thermal_horizon", 2))
         self.start_meta_iter = int(planner_cfg.get("start_meta_iter", 60))
         self.thermal_horizon_start_meta_iter = int(planner_cfg.get("thermal_horizon_start_meta_iter", 86))
+        self.adaptive_budget_enabled = bool(planner_cfg.get("adaptive_budget_enabled", False))
+        budget_candidates = planner_cfg.get("budget_candidates", [0, 8, 16, 24])
+        self.budget_candidates = tuple(sorted({int(x) for x in budget_candidates if int(x) >= 0}))
+        if not self.budget_candidates:
+            self.budget_candidates = (0, 8, 16, 24)
+        self.budget_low_periodic_interval = int(planner_cfg.get("budget_low_periodic_interval", 10))
+        self.budget_low_periodic_k = int(planner_cfg.get("budget_low_periodic_k", 8))
+        self.budget_medium_k = int(planner_cfg.get("budget_medium_k", 16))
+        self.budget_high_k = int(planner_cfg.get("budget_high_k", 24))
+        self.budget_high_headroom_c = float(planner_cfg.get("budget_high_headroom_c", 1.0))
+        self.budget_medium_headroom_c = float(planner_cfg.get("budget_medium_headroom_c", 3.0))
+        self.budget_high_gain_std = float(planner_cfg.get("budget_high_gain_std", 1.5))
+        self.budget_medium_gain_std = float(planner_cfg.get("budget_medium_gain_std", 0.5))
+        self.budget_high_disagreement = float(planner_cfg.get("budget_high_disagreement", 1.0))
+        self.budget_medium_disagreement = float(planner_cfg.get("budget_medium_disagreement", 0.25))
+        self.budget_high_constraint = float(planner_cfg.get("budget_high_constraint", 0.20))
+        self.budget_medium_constraint = float(planner_cfg.get("budget_medium_constraint", 0.05))
+        self.budget_high_projection_residual = float(planner_cfg.get("budget_high_projection_residual", 0.25))
+        self.budget_medium_projection_residual = float(planner_cfg.get("budget_medium_projection_residual", 0.10))
         self.trust_region_enabled = bool(planner_cfg.get("trust_region_enabled", False))
         self.trust_region_mode = str(planner_cfg.get("trust_region_mode", "raw_and_executed"))
         self.trust_region_raw_l2 = planner_cfg.get("trust_region_raw_l2", None)
@@ -59,16 +78,127 @@ class ResidualPlanner:
         policy_raw: np.ndarray,
         *,
         thermal_headroom: np.ndarray | None,
+        candidate_count: int | None = None,
     ) -> np.ndarray:
         raw = np.asarray(policy_raw, dtype=np.float32).reshape(-1)[:5]
         basis = residual_basis(
-            candidate_count=self.candidate_count,
+            candidate_count=self.candidate_count if candidate_count is None else int(candidate_count),
             current_step=self.current_step,
             ratio_step=self.ratio_step,
             thermal_headroom=thermal_headroom,
         )
         candidates = raw.reshape(1, -1) + basis
         return np.clip(candidates, -1.0, 1.0).astype(np.float32)
+
+    def _nearest_budget(self, requested: int) -> int:
+        requested = int(max(0, requested))
+        candidates = sorted(self.budget_candidates)
+        feasible = [k for k in candidates if k <= requested]
+        if feasible:
+            return int(max(feasible))
+        return int(min(candidates))
+
+    @staticmethod
+    def _min_headroom(thermal_headroom: np.ndarray | None) -> float:
+        if thermal_headroom is None:
+            return float("inf")
+        headroom = np.asarray(thermal_headroom, dtype=np.float32).reshape(-1)
+        finite = headroom[np.isfinite(headroom)]
+        return float(np.min(finite)) if finite.size else float("inf")
+
+    def _policy_risk_probe(
+        self,
+        *,
+        lower,
+        safety,
+        obs: np.ndarray,
+        z: np.ndarray,
+        upper_idx_exec: int,
+        boost_combo: int,
+        mode: int,
+        policy_raw: np.ndarray,
+        physical_features: np.ndarray,
+        thermal_headroom: np.ndarray | None,
+        temps: np.ndarray,
+        amb_temp: float,
+        previous_projection_residual: np.ndarray | None,
+    ) -> Dict[str, float]:
+        raw = torch.as_tensor(np.asarray(policy_raw, dtype=np.float32).reshape(1, -1), dtype=torch.float32, device=self.device)
+        boost_t = torch.full((1,), int(boost_combo), dtype=torch.long, device=self.device)
+        mode_t = torch.full((1,), int(mode), dtype=torch.long, device=self.device)
+        temps_t = torch.as_tensor(np.asarray(temps, dtype=np.float32), dtype=torch.float32, device=self.device).view(1, -1)
+        amb_t = torch.full((1,), float(amb_temp), dtype=torch.float32, device=self.device)
+        with torch.no_grad():
+            safe = safety.project_torch(raw, boost_t, mode_t, temps_t, amb_t)
+            executed = self._executed_action(safe)
+            obs_aug = lower._augment_np(
+                np.asarray(obs, dtype=np.float32),
+                upper_idx=int(upper_idx_exec),
+                physical_features=np.asarray(physical_features, dtype=np.float32),
+                encoder=lower.q1_tgt_phys,
+            )
+            obs_aug_q2 = lower._augment_np(
+                np.asarray(obs, dtype=np.float32),
+                upper_idx=int(upper_idx_exec),
+                physical_features=np.asarray(physical_features, dtype=np.float32),
+                encoder=lower.q2_tgt_phys,
+            )
+            z_t = torch.as_tensor(np.asarray(z, dtype=np.float32), dtype=torch.float32, device=self.device).view(1, -1)
+            q1 = lower.q1_tgt(obs_aug, z_t, executed)
+            q2 = lower.q2_tgt(obs_aug_q2, z_t, executed)
+            disagreement = float(torch.abs(q1 - q2).detach().cpu().item())
+            constraint_penalty = 0.0
+            if getattr(lower, "constraint_q_tgt", None) is not None:
+                constraint_val = lower.constraint_q_tgt(obs_aug, z_t, executed)
+                if getattr(lower, "constraint_actor_penalty_nonnegative", True):
+                    constraint_val = torch.relu(constraint_val)
+                constraint_penalty = float((constraint_val * lower.constraint_actor_weights).sum().detach().cpu().item())
+
+        diag = safety.thermal_diagnostics()
+        gain_std_arr = np.asarray(
+            diag.get("effective_gain_std", diag.get("thermal_gain_std", np.zeros(3, dtype=np.float32))),
+            dtype=np.float32,
+        ).reshape(-1)
+        gain_std = float(np.nanmax(gain_std_arr)) if gain_std_arr.size else 0.0
+        residual = np.asarray(
+            previous_projection_residual if previous_projection_residual is not None else np.zeros(5, dtype=np.float32),
+            dtype=np.float32,
+        ).reshape(-1)
+        return {
+            "min_thermal_headroom": self._min_headroom(thermal_headroom),
+            "effective_gain_uncertainty": gain_std,
+            "target_critic_disagreement": disagreement,
+            "target_constraint_value": constraint_penalty,
+            "previous_projection_residual_norm": float(np.linalg.norm(residual)),
+        }
+
+    def _adaptive_budget(self, risk: Dict[str, float], *, global_step: int) -> tuple[int, str]:
+        if not self.adaptive_budget_enabled:
+            return int(self.candidate_count), "fixed_candidate_count"
+
+        high = (
+            risk["min_thermal_headroom"] <= self.budget_high_headroom_c
+            or risk["effective_gain_uncertainty"] >= self.budget_high_gain_std
+            or risk["target_critic_disagreement"] >= self.budget_high_disagreement
+            or risk["target_constraint_value"] >= self.budget_high_constraint
+            or risk["previous_projection_residual_norm"] >= self.budget_high_projection_residual
+        )
+        if high:
+            return self._nearest_budget(self.budget_high_k), "high_risk"
+
+        medium = (
+            risk["min_thermal_headroom"] <= self.budget_medium_headroom_c
+            or risk["effective_gain_uncertainty"] >= self.budget_medium_gain_std
+            or risk["target_critic_disagreement"] >= self.budget_medium_disagreement
+            or risk["target_constraint_value"] >= self.budget_medium_constraint
+            or risk["previous_projection_residual_norm"] >= self.budget_medium_projection_residual
+        )
+        if medium:
+            return self._nearest_budget(self.budget_medium_k), "medium_risk"
+
+        if self.budget_low_periodic_interval > 0 and int(global_step) % self.budget_low_periodic_interval == 0:
+            return self._nearest_budget(self.budget_low_periodic_k), "low_risk_periodic_verification"
+        return self._nearest_budget(0), "very_low_risk_policy_only"
 
     @staticmethod
     def _executed_action(safe: Dict[str, torch.Tensor]) -> torch.Tensor:
@@ -149,12 +279,79 @@ class ResidualPlanner:
         temps: np.ndarray,
         amb_temp: float,
         meta_iter: int,
+        global_step: int = 0,
+        previous_projection_residual: np.ndarray | None = None,
     ) -> tuple[np.ndarray, Dict[str, Any]]:
         if not self.enabled:
             return np.asarray(policy_raw, dtype=np.float32), {"residual_planner_enabled": False}
 
         start = time.perf_counter()
-        candidates_np = self._candidate_raw(policy_raw, thermal_headroom=thermal_headroom)
+        risk = self._policy_risk_probe(
+            lower=lower,
+            safety=safety,
+            obs=obs,
+            z=z,
+            upper_idx_exec=upper_idx_exec,
+            boost_combo=boost_combo,
+            mode=mode,
+            policy_raw=policy_raw,
+            physical_features=physical_features,
+            thermal_headroom=thermal_headroom,
+            temps=temps,
+            amb_temp=amb_temp,
+            previous_projection_residual=previous_projection_residual,
+        )
+        budget_k, budget_reason = self._adaptive_budget(risk, global_step=global_step)
+        if budget_k <= 0:
+            latency_ms = float((time.perf_counter() - start) * 1000.0)
+            return np.asarray(policy_raw, dtype=np.float32), {
+                "residual_planner_enabled": True,
+                "residual_planner_candidate_count": 0,
+                "residual_planner_budget": 0,
+                "residual_planner_budget_reason": budget_reason,
+                "residual_planner_adaptive_budget_enabled": bool(self.adaptive_budget_enabled),
+                "residual_planner_latency_ms": latency_ms,
+                "residual_planner_selected_idx": 0,
+                "residual_planner_effective_thermal_horizon": 0,
+                "residual_planner_score": 0.0,
+                "residual_planner_score_improvement": 0.0,
+                "residual_planner_best_idx": 0,
+                "residual_planner_best_score_improvement": 0.0,
+                "residual_planner_replacement_margin": 0.0,
+                "residual_planner_replacement_margin_mode": self.replacement_margin_mode,
+                "residual_planner_replaced_policy": False,
+                "residual_planner_fallback_to_policy": True,
+                "residual_planner_candidate_distance": 0.0,
+                "residual_planner_candidate_raw_distance": 0.0,
+                "residual_planner_candidate_exec_distance": 0.0,
+                "residual_planner_trust_region_rejected_count": 0,
+                "residual_planner_valid_candidate_count": 1,
+                "residual_planner_max_valid_distance": 0.0,
+                "residual_planner_margin_rejection_rate": 0.0,
+                "residual_planner_constraint_rejection_rate": 0.0,
+                "residual_planner_projection_rejection_rate": 0.0,
+                "residual_planner_h2_veto_rate": 0.0,
+                "residual_planner_fallback_rate": 1.0,
+                "residual_planner_replacement_rate": 0.0,
+                "residual_planner_reward_value": 0.0,
+                "residual_planner_constraint_penalty": risk["target_constraint_value"],
+                "residual_planner_disagreement": risk["target_critic_disagreement"],
+                "residual_planner_projection_residual": risk["previous_projection_residual_norm"],
+                "residual_planner_thermal_risk": 0.0,
+                "residual_planner_h1_thermal_risk": 0.0,
+                "residual_planner_h2_thermal_risk": 0.0,
+                "residual_planner_incremental_h2_risk": 0.0,
+                "residual_planner_h2_max_temperature": 0.0,
+                "residual_planner_h2_veto": False,
+                "residual_planner_trust_region_rejected": False,
+                "residual_planner_min_thermal_headroom": risk["min_thermal_headroom"],
+                "residual_planner_effective_gain_uncertainty": risk["effective_gain_uncertainty"],
+                "residual_planner_target_critic_disagreement": risk["target_critic_disagreement"],
+                "residual_planner_target_constraint_value": risk["target_constraint_value"],
+                "residual_planner_previous_projection_residual_norm": risk["previous_projection_residual_norm"],
+            }
+
+        candidates_np = self._candidate_raw(policy_raw, thermal_headroom=thermal_headroom, candidate_count=budget_k)
         k = int(candidates_np.shape[0])
         candidates = torch.as_tensor(candidates_np, dtype=torch.float32, device=self.device)
         boost_t = torch.full((k,), int(boost_combo), dtype=torch.long, device=self.device)
@@ -252,6 +449,9 @@ class ResidualPlanner:
         diagnostics = {
             "residual_planner_enabled": True,
             "residual_planner_candidate_count": k,
+            "residual_planner_budget": int(budget_k),
+            "residual_planner_budget_reason": budget_reason,
+            "residual_planner_adaptive_budget_enabled": bool(self.adaptive_budget_enabled),
             "residual_planner_effective_thermal_horizon": int(effective_thermal_horizon),
             "residual_planner_selected_idx": selected_idx,
             "residual_planner_latency_ms": latency_ms,
@@ -296,5 +496,10 @@ class ResidualPlanner:
             "residual_planner_h2_max_temperature": float(h2_max_temperature[selected_idx].detach().cpu().item()),
             "residual_planner_h2_veto": bool(h2_veto[selected_idx].detach().cpu().item()),
             "residual_planner_trust_region_rejected": bool(trust_rejected),
+            "residual_planner_min_thermal_headroom": risk["min_thermal_headroom"],
+            "residual_planner_effective_gain_uncertainty": risk["effective_gain_uncertainty"],
+            "residual_planner_target_critic_disagreement": risk["target_critic_disagreement"],
+            "residual_planner_target_constraint_value": risk["target_constraint_value"],
+            "residual_planner_previous_projection_residual_norm": risk["previous_projection_residual_norm"],
         }
         return candidates_np[selected_idx].astype(np.float32), diagnostics

@@ -39,6 +39,7 @@ def _cfg() -> dict:
     cfg["residual_planner"]["start_meta_iter"] = 0
     cfg["residual_planner"]["thermal_horizon_start_meta_iter"] = 0
     cfg["residual_planner"]["candidate_count"] = 24
+    cfg["residual_planner"]["adaptive_budget_enabled"] = False
     return cfg
 
 
@@ -199,6 +200,44 @@ def test_residual_planner_h2_veto_is_reported_near_thermal_boundary():
     assert "residual_planner_h2_veto_rate" in aux
     assert float(aux["residual_planner_h2_max_temperature"]) >= 0.0
     assert int(aux["residual_planner_selected_idx"]) >= 0
+
+
+def test_adaptive_planner_budget_selects_zero_for_very_low_risk_and_full_for_high_risk():
+    cfg = _cfg()
+    cfg["residual_planner"]["adaptive_budget_enabled"] = True
+    cfg["residual_planner"]["budget_low_periodic_interval"] = 0
+    agent = HierarchicalAgent(cfg, torch.device("cpu"))
+    agent.set_meta_iter(1)
+
+    obs = np.zeros(int(cfg["agent"]["obs_dim"]), dtype=np.float32)
+    z = np.zeros(int(cfg["agent"]["z_dim"]), dtype=np.float32)
+
+    _, low_aux = agent.act(
+        obs=obs,
+        temps=np.asarray([28.0, 28.0, 28.0], dtype=np.float32),
+        amb_temp=float(cfg["env"]["amb_temp"]),
+        gamma=float(cfg["env"]["gamma"]),
+        delta=float(cfg["env"]["delta"]),
+        z=z,
+        eval_mode=True,
+    )
+    assert low_aux["residual_planner_enabled"] is True
+    assert int(low_aux["residual_planner_budget"]) == 0
+    assert int(low_aux["residual_planner_candidate_count"]) == 0
+    assert low_aux["residual_planner_budget_reason"] == "very_low_risk_policy_only"
+
+    _, high_aux = agent.act(
+        obs=obs,
+        temps=np.asarray([48.5, 48.5, 48.5], dtype=np.float32),
+        amb_temp=float(cfg["env"]["amb_temp"]),
+        gamma=float(cfg["env"]["gamma"]),
+        delta=float(cfg["env"]["delta"]),
+        z=z,
+        eval_mode=True,
+    )
+    assert int(high_aux["residual_planner_budget"]) == 24
+    assert int(high_aux["residual_planner_candidate_count"]) == 24
+    assert high_aux["residual_planner_budget_reason"] == "high_risk"
 
 
 def test_residual_planner_preview_has_no_mutable_side_effects():

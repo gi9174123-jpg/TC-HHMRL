@@ -46,6 +46,11 @@ class EpisodeStats:
     residual_planner_best_score_improvement: float = 0.0
     residual_planner_candidate_distance: float = 0.0
     residual_planner_disagreement: float = 0.0
+    residual_planner_budget_mean: float = 0.0
+    residual_planner_budget_k0_rate: float = 0.0
+    residual_planner_budget_k8_rate: float = 0.0
+    residual_planner_budget_k16_rate: float = 0.0
+    residual_planner_budget_k24_rate: float = 0.0
 
 
 class MetaTrainer:
@@ -378,6 +383,11 @@ class MetaTrainer:
         ep_planner_best_score_improvement = 0.0
         ep_planner_candidate_distance = 0.0
         ep_planner_disagreement = 0.0
+        ep_planner_budget = 0.0
+        ep_planner_budget_k0 = 0.0
+        ep_planner_budget_k8 = 0.0
+        ep_planner_budget_k16 = 0.0
+        ep_planner_budget_k24 = 0.0
 
         macro_start_obs = None
         macro_start_z = None
@@ -591,6 +601,12 @@ class MetaTrainer:
             ep_planner_best_score_improvement += float(aux.get("residual_planner_best_score_improvement", 0.0))
             ep_planner_candidate_distance += float(aux.get("residual_planner_candidate_distance", 0.0))
             ep_planner_disagreement += float(aux.get("residual_planner_disagreement", 0.0))
+            planner_budget = int(aux.get("residual_planner_budget", aux.get("residual_planner_candidate_count", 0)))
+            ep_planner_budget += float(planner_budget)
+            ep_planner_budget_k0 += float(planner_budget == 0)
+            ep_planner_budget_k8 += float(planner_budget == 8)
+            ep_planner_budget_k16 += float(planner_budget == 16)
+            ep_planner_budget_k24 += float(planner_budget == 24)
 
             obs = next_obs
 
@@ -618,6 +634,11 @@ class MetaTrainer:
             residual_planner_best_score_improvement=ep_planner_best_score_improvement / max(ep_len, 1),
             residual_planner_candidate_distance=ep_planner_candidate_distance / max(ep_len, 1),
             residual_planner_disagreement=ep_planner_disagreement / max(ep_len, 1),
+            residual_planner_budget_mean=ep_planner_budget / max(ep_len, 1),
+            residual_planner_budget_k0_rate=ep_planner_budget_k0 / max(ep_len, 1),
+            residual_planner_budget_k8_rate=ep_planner_budget_k8 / max(ep_len, 1),
+            residual_planner_budget_k16_rate=ep_planner_budget_k16 / max(ep_len, 1),
+            residual_planner_budget_k24_rate=ep_planner_budget_k24 / max(ep_len, 1),
         )
 
     def train(self, meta_iters: int | None = None) -> Path:
@@ -964,6 +985,21 @@ class MetaTrainer:
                 "support_residual_planner_disagreement": float(
                     np.mean([s.residual_planner_disagreement for s in support_stats])
                 ),
+                "support_residual_planner_budget_mean": float(
+                    np.mean([s.residual_planner_budget_mean for s in support_stats])
+                ),
+                "support_residual_planner_budget_k0_rate": float(
+                    np.mean([s.residual_planner_budget_k0_rate for s in support_stats])
+                ),
+                "support_residual_planner_budget_k8_rate": float(
+                    np.mean([s.residual_planner_budget_k8_rate for s in support_stats])
+                ),
+                "support_residual_planner_budget_k16_rate": float(
+                    np.mean([s.residual_planner_budget_k16_rate for s in support_stats])
+                ),
+                "support_residual_planner_budget_k24_rate": float(
+                    np.mean([s.residual_planner_budget_k24_rate for s in support_stats])
+                ),
                 "query_reward": float(np.mean([s.reward for s in query_stats])) if query_stats else 0.0,
                 "query_se": float(np.mean([s.se for s in query_stats])) if query_stats else 0.0,
                 "query_eh": float(np.mean([s.eh for s in query_stats])) if query_stats else 0.0,
@@ -1020,6 +1056,31 @@ class MetaTrainer:
                 else 0.0,
                 "query_residual_planner_disagreement": float(
                     np.mean([s.residual_planner_disagreement for s in query_stats])
+                )
+                if query_stats
+                else 0.0,
+                "query_residual_planner_budget_mean": float(
+                    np.mean([s.residual_planner_budget_mean for s in query_stats])
+                )
+                if query_stats
+                else 0.0,
+                "query_residual_planner_budget_k0_rate": float(
+                    np.mean([s.residual_planner_budget_k0_rate for s in query_stats])
+                )
+                if query_stats
+                else 0.0,
+                "query_residual_planner_budget_k8_rate": float(
+                    np.mean([s.residual_planner_budget_k8_rate for s in query_stats])
+                )
+                if query_stats
+                else 0.0,
+                "query_residual_planner_budget_k16_rate": float(
+                    np.mean([s.residual_planner_budget_k16_rate for s in query_stats])
+                )
+                if query_stats
+                else 0.0,
+                "query_residual_planner_budget_k24_rate": float(
+                    np.mean([s.residual_planner_budget_k24_rate for s in query_stats])
                 )
                 if query_stats
                 else 0.0,

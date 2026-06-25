@@ -201,6 +201,7 @@ def formal_metadata_snapshot(cfg: Dict, *, pre_alignment: bool | None = None, ta
     adaptive_cfg = cfg.get("adaptive_thermal", {}) or {}
     physical_cfg = cfg.get("physical_context", {}) or {}
     constraint_cfg = cfg.get("constraint_critics", {}) or {}
+    constraint_replay_cfg = cfg.get("constraint_replay", {}) or {}
     planner_cfg = cfg.get("residual_planner", {}) or {}
     upper_cfg = cfg.get("upper_dqn", {}) or {}
     safety_cfg = cfg.get("safety", {}) or {}
@@ -238,8 +239,25 @@ def formal_metadata_snapshot(cfg: Dict, *, pre_alignment: bool | None = None, ta
         "constraint_reward_target": str(constraint_cfg.get("reward_target", "raw_reward")),
         "constraint_actor_weights": list(constraint_cfg.get("actor_weights", [])),
         "constraint_actor_penalty_nonnegative": bool(constraint_cfg.get("actor_penalty_nonnegative", True)),
+        "constraint_replay_enabled": bool(constraint_replay_cfg.get("enabled", False)),
+        "constraint_replay_uniform_fraction": float(constraint_replay_cfg.get("uniform_fraction", 0.0) or 0.0),
+        "constraint_replay_boundary_fraction": float(constraint_replay_cfg.get("boundary_fraction", 0.0) or 0.0),
+        "constraint_replay_violation_fraction": float(constraint_replay_cfg.get("violation_fraction", 0.0) or 0.0),
+        "constraint_replay_importance_weighting": bool(constraint_replay_cfg.get("importance_weighting", True)),
+        "constraint_replay_reward_batch": "unchanged_reward_critic_batch",
+        "constraint_replay_constraint_batch": "stratified_uniform_boundary_violation",
         "residual_planner_enabled": bool(planner_cfg.get("enabled", False)),
         "residual_planner_candidate_count": int(planner_cfg.get("candidate_count", 0) or 0),
+        "residual_planner_adaptive_budget_enabled": bool(planner_cfg.get("adaptive_budget_enabled", False)),
+        "residual_planner_budget_candidates": list(planner_cfg.get("budget_candidates", [])),
+        "residual_planner_budget_rule": "rule_based_current_risk" if bool(planner_cfg.get("adaptive_budget_enabled", False)) else "fixed_candidate_count",
+        "residual_planner_budget_inputs": [
+            "minimum_thermal_headroom",
+            "effective_gain_uncertainty",
+            "target_critic_disagreement",
+            "target_constraint_value",
+            "previous_projection_residual",
+        ],
         "residual_planner_thermal_horizon": int(planner_cfg.get("thermal_horizon", 0) or 0),
         "residual_planner_start_meta_iter": int(planner_cfg.get("start_meta_iter", 0) or 0),
         "residual_planner_thermal_horizon_start_meta_iter": int(
@@ -1788,6 +1806,8 @@ def _add_baseline_aux_diagnostics(row: Dict, aux: Dict) -> None:
         "pdqn_selected_k",
         "pdqn_argmax_q",
         "residual_planner_candidate_count",
+        "residual_planner_budget",
+        "residual_planner_adaptive_budget_enabled",
         "residual_planner_effective_thermal_horizon",
         "residual_planner_selected_idx",
         "residual_planner_latency_ms",
@@ -1815,6 +1835,11 @@ def _add_baseline_aux_diagnostics(row: Dict, aux: Dict) -> None:
         "residual_planner_h2_max_temperature",
         "residual_planner_h2_veto",
         "residual_planner_trust_region_rejected",
+        "residual_planner_min_thermal_headroom",
+        "residual_planner_effective_gain_uncertainty",
+        "residual_planner_target_critic_disagreement",
+        "residual_planner_target_constraint_value",
+        "residual_planner_previous_projection_residual_norm",
         "actor_total_current_requested",
         "actor_allocation_anchor",
         "actor_allocation_ld1",
@@ -1840,6 +1865,7 @@ def _add_baseline_aux_diagnostics(row: Dict, aux: Dict) -> None:
         "receiver_ratio_rule",
         "dimming_type",
         "residual_planner_replacement_margin_mode",
+        "residual_planner_budget_reason",
         "current_decoder",
     ]
     for key in numeric_keys:

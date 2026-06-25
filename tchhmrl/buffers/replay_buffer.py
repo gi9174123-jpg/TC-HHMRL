@@ -33,7 +33,49 @@ class ReplayBuffer:
     def __len__(self) -> int:
         return len(self._buf)
 
-    def sample( 
+    @staticmethod
+    def _as_batch(batch: List[Dict]) -> Dict[str, np.ndarray]:
+        keys = batch[0].keys()
+        out: Dict[str, np.ndarray] = {}
+        for k in keys:
+            vals = [b[k] for b in batch]
+            first = vals[0]
+            if np.isscalar(first):
+                out[k] = np.asarray(vals, dtype=np.float32)
+            else:
+                out[k] = np.asarray(vals, dtype=np.float32)
+        return out
+
+    @staticmethod
+    def _constraint_flags(tr: Dict, thresholds: Dict[str, float | None]) -> tuple[bool, bool]:
+        cost_vec = np.asarray(tr.get("cost_vec", [tr.get("cost", 0.0)]), dtype=np.float32).reshape(-1)
+        cost = float(tr.get("cost", float(np.sum(np.maximum(cost_vec, 0.0)))))
+        violation = bool(np.any(cost_vec > 0.0) or cost > float(thresholds.get("constraint_cost_threshold") or 1.0e-8))
+        violation = violation or bool(float(tr.get("burst_event", tr.get("burst_active", 0.0))) > 0.0)
+
+        boundary = False
+        thermal_thr = thresholds.get("thermal_headroom_threshold")
+        if thermal_thr is not None and "thermal_headroom" in tr:
+            headroom = np.asarray(tr["thermal_headroom"], dtype=np.float32).reshape(-1)
+            if headroom.size:
+                boundary = boundary or bool(np.nanmin(headroom) < float(thermal_thr))
+        residual_thr = thresholds.get("projection_residual_threshold")
+        if residual_thr is not None and "projection_residual" in tr:
+            residual = np.asarray(tr["projection_residual"], dtype=np.float32).reshape(-1)
+            boundary = boundary or bool(np.linalg.norm(residual) > float(residual_thr))
+        bus_thr = thresholds.get("bus_utilization_threshold")
+        if bus_thr is not None:
+            bus_util = tr.get("bus_utilization", tr.get("projected_current_total", None))
+            if bus_util is not None:
+                boundary = boundary or bool(float(bus_util) > float(bus_thr))
+        slope_thr = thresholds.get("temperature_slope_threshold")
+        if slope_thr is not None and "temperature_slope" in tr:
+            slope = np.asarray(tr["temperature_slope"], dtype=np.float32).reshape(-1)
+            if slope.size:
+                boundary = boundary or bool(np.nanmax(np.abs(slope)) > float(slope_thr))
+        return violation, boundary
+
+    def sample(
         self,
         batch_size: int,
         hard_fraction: float = 0.0,
@@ -63,16 +105,106 @@ class ReplayBuffer:
             batch = hard_batch + rest_batch
             random.shuffle(batch)
 
-        keys = batch[0].keys()
-        out: Dict[str, np.ndarray] = {}
-        for k in keys:
-            vals = [b[k] for b in batch]
-            first = vals[0]
-            if np.isscalar(first):
-                out[k] = np.asarray(vals, dtype=np.float32)
+        return self._as_batch(batch)
+
+    def sample_stratified_constraint(
+        self,
+        batch_size: int,
+        *,
+        uniform_fraction: float,
+        boundary_fraction: float,
+        violation_fraction: float,
+        thresholds: Dict[str, float | None],
+        importance_weighting: bool = True,
+    ) -> tuple[Dict[str, np.ndarray], Dict[str, float]]:
+        if len(self._buf) < batch_size:
+            if len(self._buf) == 0:
+                raise ValueError("cannot sample stratified constraint batch from an empty replay buffer")
+            batch = random.choices(list(self._buf), k=batch_size)
+            out = self._as_batch(batch)
+            out["constraint_replay_importance_weight"] = np.ones((batch_size,), dtype=np.float32)
+            return out, {
+                "constraint_batch_uniform_count": float(batch_size),
+                "constraint_batch_boundary_count": 0.0,
+                "constraint_batch_violation_count": 0.0,
+                "constraint_bucket_total_count": float(len(self._buf)),
+                "constraint_bucket_shortage_count": 0.0,
+            }
+
+        uniform_fraction = float(np.clip(uniform_fraction, 0.0, 1.0))
+        boundary_fraction = float(np.clip(boundary_fraction, 0.0, 1.0))
+        violation_fraction = float(np.clip(violation_fraction, 0.0, 1.0))
+        frac_sum = max(uniform_fraction + boundary_fraction + violation_fraction, 1.0e-6)
+        uniform_fraction /= frac_sum
+        boundary_fraction /= frac_sum
+        violation_fraction /= frac_sum
+
+        n_violation = int(round(batch_size * violation_fraction))
+        n_boundary = int(round(batch_size * boundary_fraction))
+        n_uniform = max(0, batch_size - n_violation - n_boundary)
+
+        buf_list = list(self._buf)
+        violation_pool: list[Dict] = []
+        boundary_pool: list[Dict] = []
+        uniform_pool: list[Dict] = []
+        for tr in buf_list:
+            is_violation, is_boundary = self._constraint_flags(tr, thresholds)
+            if is_violation:
+                violation_pool.append(tr)
+            elif is_boundary:
+                boundary_pool.append(tr)
             else:
-                out[k] = np.asarray(vals, dtype=np.float32)
-        return out
+                uniform_pool.append(tr)
+
+        selected: list[Dict] = []
+        selected_labels: list[str] = []
+        shortage = 0
+
+        def draw(pool: list[Dict], n: int, label: str) -> None:
+            nonlocal shortage
+            take = min(max(0, n), len(pool))
+            if take > 0:
+                items = random.sample(pool, take)
+                selected.extend(items)
+                selected_labels.extend([label] * len(items))
+            shortage += max(0, n - take)
+
+        draw(violation_pool, n_violation, "violation")
+        used_ids = {id(x) for x in selected}
+        boundary_pool = [x for x in boundary_pool if id(x) not in used_ids]
+        uniform_pool = [x for x in uniform_pool if id(x) not in used_ids]
+        draw(boundary_pool, n_boundary, "boundary")
+        used_ids = {id(x) for x in selected}
+        fallback_pool = [x for x in buf_list if id(x) not in used_ids]
+        uniform_draw_pool = [x for x in uniform_pool if id(x) not in used_ids] or fallback_pool
+        draw(uniform_draw_pool, n_uniform, "uniform")
+
+        used_ids = {id(x) for x in selected}
+        while len(selected) < batch_size:
+            fallback_pool = [x for x in buf_list if id(x) not in used_ids]
+            if not fallback_pool:
+                break
+            item = random.choice(fallback_pool)
+            selected.append(item)
+            selected_labels.append("uniform")
+            used_ids.add(id(item))
+            shortage += 1
+
+        selected = selected[:batch_size]
+        selected_labels = selected_labels[:batch_size]
+        random.shuffle(selected)
+        out = self._as_batch(selected)
+        if importance_weighting:
+            out["constraint_replay_importance_weight"] = np.ones((len(selected),), dtype=np.float32)
+        else:
+            out["constraint_replay_importance_weight"] = np.ones((len(selected),), dtype=np.float32)
+        return out, {
+            "constraint_batch_uniform_count": float(sum(1 for x in selected_labels if x == "uniform")),
+            "constraint_batch_boundary_count": float(sum(1 for x in selected_labels if x == "boundary")),
+            "constraint_batch_violation_count": float(sum(1 for x in selected_labels if x == "violation")),
+            "constraint_bucket_total_count": float(len(buf_list)),
+            "constraint_bucket_shortage_count": float(shortage),
+        }
 
 
 class EpisodeBuffer:

@@ -96,6 +96,20 @@ class HierarchicalAgent:
         self.hard_cost_w = float(hard_cfg.get("cost_w", 1.0))
         self.hard_mode_switch_bonus = float(hard_cfg.get("mode_switch_bonus", 0.5))
         self.hard_boost_switch_bonus = float(hard_cfg.get("boost_switch_bonus", 0.5))
+        constraint_replay_cfg = cfg.get("constraint_replay", {}) or {}
+        self.constraint_replay_enabled = bool(constraint_replay_cfg.get("enabled", False))
+        self.constraint_replay_uniform_fraction = float(constraint_replay_cfg.get("uniform_fraction", 0.50))
+        self.constraint_replay_boundary_fraction = float(constraint_replay_cfg.get("boundary_fraction", 0.30))
+        self.constraint_replay_violation_fraction = float(constraint_replay_cfg.get("violation_fraction", 0.20))
+        self.constraint_replay_importance_weighting = bool(constraint_replay_cfg.get("importance_weighting", True))
+        self.constraint_replay_thresholds = {
+            "thermal_headroom_threshold": constraint_replay_cfg.get("thermal_headroom_threshold", None),
+            "qos_margin_threshold": constraint_replay_cfg.get("qos_margin_threshold", None),
+            "bus_utilization_threshold": constraint_replay_cfg.get("bus_utilization_threshold", None),
+            "projection_residual_threshold": constraint_replay_cfg.get("projection_residual_threshold", None),
+            "constraint_cost_threshold": constraint_replay_cfg.get("constraint_cost_threshold", 1.0e-8),
+            "temperature_slope_threshold": constraint_replay_cfg.get("temperature_slope_threshold", None),
+        }
 
         self.global_step = 0
         self.current_meta_iter = 0
@@ -489,6 +503,8 @@ class HierarchicalAgent:
                 temps=temps,
                 amb_temp=amb_temp,
                 meta_iter=int(self.current_meta_iter),
+                global_step=int(self.global_step),
+                previous_projection_residual=self.prev_projection_residual,
             )
 
         safe, self.safety_mem = self.safety.project_np(
@@ -752,7 +768,23 @@ class HierarchicalAgent:
                     hard_fraction=self.hard_fraction if self.hard_mining_enabled else 0.0,
                     scorer=self._hard_score if self.hard_mining_enabled else None,
                 )
-                sac_list.append(self.lower.update(lower_batch))
+                constraint_batch = None
+                constraint_stats = {}
+                if self.constraint_replay_enabled and getattr(self.lower, "constraint_critics_enabled", False):
+                    constraint_batch, constraint_stats = self.replay.sample_stratified_constraint(
+                        self.batch_size,
+                        uniform_fraction=self.constraint_replay_uniform_fraction,
+                        boundary_fraction=self.constraint_replay_boundary_fraction,
+                        violation_fraction=self.constraint_replay_violation_fraction,
+                        thresholds=self.constraint_replay_thresholds,
+                        importance_weighting=self.constraint_replay_importance_weighting,
+                    )
+                sac_stats = self.lower.update(lower_batch, constraint_batch=constraint_batch)
+                sac_stats.update(constraint_stats)
+                sac_stats["constraint_replay_enabled"] = float(
+                    self.constraint_replay_enabled and constraint_batch is not None
+                )
+                sac_list.append(sac_stats)
                 ctx_list.append(self.update_context_encoder())
             merged.update(self._mean_metrics(sac_list))
             merged.update(self._mean_metrics(ctx_list))
