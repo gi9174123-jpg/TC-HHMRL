@@ -435,6 +435,14 @@ class HierarchicalAgent:
         if self.lower.constraint_q_tgt is not None and all(s["lower"].get("constraint_q_tgt") is not None for s in adapted_states):
             constraint_q_tgt = self._average_state_dict([s["lower"]["constraint_q_tgt"] for s in adapted_states])
             self._blend_module_state(self.lower.constraint_q_tgt, constraint_q_tgt, step_size)
+        if self.lower.constraint_phys is not None and all(s["lower"].get("constraint_phys") is not None for s in adapted_states):
+            constraint_phys = self._average_state_dict([s["lower"]["constraint_phys"] for s in adapted_states])
+            self._blend_module_state(self.lower.constraint_phys, constraint_phys, step_size)
+        if self.lower.constraint_tgt_phys is not None and all(
+            s["lower"].get("constraint_tgt_phys") is not None for s in adapted_states
+        ):
+            constraint_tgt_phys = self._average_state_dict([s["lower"]["constraint_tgt_phys"] for s in adapted_states])
+            self._blend_module_state(self.lower.constraint_tgt_phys, constraint_tgt_phys, step_size)
         self._blend_module_state(self.context_encoder, ctx_enc, step_size)
         self._blend_module_state(self.context_predictor, ctx_pred, step_size)
         if self.lower.auto_alpha and self.lower.log_alpha is not None:

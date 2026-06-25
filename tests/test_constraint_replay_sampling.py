@@ -92,6 +92,46 @@ def test_replay_buffer_stratified_constraint_sampling_tracks_buckets():
         == 12
     )
     assert stats["constraint_bucket_total_count"] == 40
+    assert np.isclose(stats["constraint_replay_uniform_pool_fraction"], 20.0 / 40.0)
+    assert np.isclose(stats["constraint_replay_boundary_pool_fraction"], 10.0 / 40.0)
+    assert np.isclose(stats["constraint_replay_violation_pool_fraction"], 10.0 / 40.0)
+    assert np.isclose(stats["constraint_replay_qos_only_violation_fraction"], 10.0 / 40.0)
+    assert np.isclose(stats["constraint_replay_thermal_violation_fraction"], 0.0)
+    assert np.isclose(stats["constraint_replay_burst_only_fraction"], 0.0)
+
+
+def test_constraint_replay_reports_violation_source_fractions():
+    cfg = _small_cfg()
+    replay = ReplayBuffer(capacity=16)
+    replay.add(_transition(cfg, cost=0.0, residual=0.0, headroom=8.0))
+
+    qos = _transition(cfg, cost=0.02, residual=0.0, headroom=8.0)
+    replay.add(qos)
+
+    thermal = _transition(cfg, cost=0.02, residual=0.0, headroom=8.0)
+    thermal["cost_vec"] = np.asarray([0.0, 0.02, 0.0, 0.0], dtype=np.float32)
+    replay.add(thermal)
+
+    burst = _transition(cfg, cost=0.0, residual=0.0, headroom=8.0)
+    burst["burst_event"] = np.float32(1.0)
+    replay.add(burst)
+
+    _batch, stats = replay.sample_stratified_constraint(
+        4,
+        uniform_fraction=0.25,
+        boundary_fraction=0.25,
+        violation_fraction=0.50,
+        thresholds={
+            "thermal_headroom_threshold": 1.0,
+            "projection_residual_threshold": 0.5,
+            "constraint_cost_threshold": 1.0e-8,
+        },
+        importance_weighting=False,
+    )
+
+    assert np.isclose(stats["constraint_replay_qos_only_violation_fraction"], 1.0 / 4.0)
+    assert np.isclose(stats["constraint_replay_thermal_violation_fraction"], 1.0 / 4.0)
+    assert np.isclose(stats["constraint_replay_burst_only_fraction"], 1.0 / 4.0)
 
 
 def test_replay_buffer_stratified_constraint_shortage_falls_back_to_uniform():

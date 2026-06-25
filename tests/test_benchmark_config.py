@@ -104,6 +104,8 @@ def test_formal_metadata_reports_model_aware_lower_components():
     assert meta["entropy_space"] == "mode_boost_masked_latent_action"
     assert meta["physical_context_enabled"] is True
     assert meta["constraint_critics_enabled"] is True
+    assert meta["constraint_physical_encoder_independent"] is True
+    assert meta["constraint_optimizer_separate"] is True
     assert meta["constraint_critic_dim"] == 4
     assert meta["constraint_reward_target"] == "reward_task"
     assert meta["reward_training_target"] == "reward_task"

@@ -47,11 +47,29 @@ class ReplayBuffer:
         return out
 
     @staticmethod
-    def _constraint_flags(tr: Dict, thresholds: Dict[str, float | None]) -> tuple[bool, bool]:
+    def _constraint_components(tr: Dict, thresholds: Dict[str, float | None]) -> Dict[str, bool]:
         cost_vec = np.asarray(tr.get("cost_vec", [tr.get("cost", 0.0)]), dtype=np.float32).reshape(-1)
         cost = float(tr.get("cost", float(np.sum(np.maximum(cost_vec, 0.0)))))
-        violation = bool(np.any(cost_vec > 0.0) or cost > float(thresholds.get("constraint_cost_threshold") or 1.0e-8))
-        violation = violation or bool(float(tr.get("burst_event", tr.get("burst_active", 0.0))) > 0.0)
+        cost_thr = float(thresholds.get("constraint_cost_threshold") or 1.0e-8)
+        qos_violation = bool(cost_vec.size > 0 and float(cost_vec[0]) > cost_thr)
+        if cost_vec.size <= 1 and cost > cost_thr:
+            qos_violation = True
+        thermal_violation = bool(cost_vec.size > 1 and np.any(cost_vec[1:] > cost_thr))
+        burst_event = bool(float(tr.get("burst_event", tr.get("burst_active", 0.0))) > 0.0)
+        violation = bool(qos_violation or thermal_violation or burst_event or cost > cost_thr)
+        return {
+            "violation": violation,
+            "qos_violation": qos_violation,
+            "thermal_violation": thermal_violation,
+            "burst_event": burst_event,
+            "qos_only_violation": bool(qos_violation and not thermal_violation and not burst_event),
+            "burst_only": bool(burst_event and not qos_violation and not thermal_violation),
+        }
+
+    @staticmethod
+    def _constraint_flags(tr: Dict, thresholds: Dict[str, float | None]) -> tuple[bool, bool]:
+        components = ReplayBuffer._constraint_components(tr, thresholds)
+        violation = bool(components["violation"])
 
         boundary = False
         thermal_thr = thresholds.get("thermal_headroom_threshold")
@@ -80,6 +98,43 @@ class ReplayBuffer:
             if slope.size:
                 boundary = boundary or bool(np.nanmax(np.abs(slope)) > float(slope_thr))
         return violation, boundary
+
+    @classmethod
+    def _constraint_pool_diagnostics(
+        cls,
+        buf_list: List[Dict],
+        thresholds: Dict[str, float | None],
+    ) -> Dict[str, float]:
+        total = float(max(len(buf_list), 1))
+        uniform_count = 0
+        boundary_count = 0
+        violation_count = 0
+        qos_only_count = 0
+        thermal_violation_count = 0
+        burst_only_count = 0
+        for tr in buf_list:
+            components = cls._constraint_components(tr, thresholds)
+            is_violation, is_boundary = cls._constraint_flags(tr, thresholds)
+            if is_violation:
+                violation_count += 1
+            elif is_boundary:
+                boundary_count += 1
+            else:
+                uniform_count += 1
+            qos_only_count += int(bool(components["qos_only_violation"]))
+            thermal_violation_count += int(bool(components["thermal_violation"]))
+            burst_only_count += int(bool(components["burst_only"]))
+        return {
+            "constraint_replay_uniform_pool_fraction": float(uniform_count) / total,
+            "constraint_replay_boundary_pool_fraction": float(boundary_count) / total,
+            "constraint_replay_violation_pool_fraction": float(violation_count) / total,
+            "constraint_bucket_uniform_pool_fraction": float(uniform_count) / total,
+            "constraint_bucket_boundary_pool_fraction": float(boundary_count) / total,
+            "constraint_bucket_violation_pool_fraction": float(violation_count) / total,
+            "constraint_replay_qos_only_violation_fraction": float(qos_only_count) / total,
+            "constraint_replay_thermal_violation_fraction": float(thermal_violation_count) / total,
+            "constraint_replay_burst_only_fraction": float(burst_only_count) / total,
+        }
 
     def sample(
         self,
@@ -131,7 +186,7 @@ class ReplayBuffer:
             out = self._as_batch(batch)
             out["constraint_replay_importance_weight"] = np.ones((batch_size,), dtype=np.float32)
             out["constraint_replay_bucket_id"] = np.zeros((batch_size,), dtype=np.float32)
-            return out, {
+            stats = {
                 "constraint_batch_uniform_count": float(batch_size),
                 "constraint_batch_boundary_count": 0.0,
                 "constraint_batch_violation_count": 0.0,
@@ -143,6 +198,8 @@ class ReplayBuffer:
                 "constraint_replay_importance_weight_min": 1.0,
                 "constraint_replay_importance_weight_max": 1.0,
             }
+            stats.update(self._constraint_pool_diagnostics(list(self._buf), thresholds))
+            return out, stats
 
         uniform_fraction = float(np.clip(uniform_fraction, 0.0, 1.0))
         boundary_fraction = float(np.clip(boundary_fraction, 0.0, 1.0))
@@ -236,7 +293,7 @@ class ReplayBuffer:
         else:
             out["constraint_replay_importance_weight"] = np.ones((len(selected),), dtype=np.float32)
         weights_out = np.asarray(out["constraint_replay_importance_weight"], dtype=np.float32)
-        return out, {
+        stats = {
             "constraint_batch_uniform_count": float(sum(1 for x in selected_labels if x == "uniform")),
             "constraint_batch_boundary_count": float(sum(1 for x in selected_labels if x == "boundary")),
             "constraint_batch_violation_count": float(sum(1 for x in selected_labels if x == "violation")),
@@ -248,6 +305,8 @@ class ReplayBuffer:
             "constraint_replay_importance_weight_min": float(weights_out.min()) if weights_out.size else 1.0,
             "constraint_replay_importance_weight_max": float(weights_out.max()) if weights_out.size else 1.0,
         }
+        stats.update(self._constraint_pool_diagnostics(buf_list, thresholds))
+        return out, stats
 
 
 class EpisodeBuffer:

@@ -106,8 +106,18 @@ def test_lower_sac_trains_independent_constraint_critics():
     assert sac.constraint_critics_enabled is True
     assert sac.constraint_q is not None
     assert sac.constraint_q_tgt is not None
+    assert sac.constraint_phys is not None
+    assert sac.constraint_tgt_phys is not None
+    assert sac.constraint_phys is not sac.q1_phys
+    assert sac.constraint_tgt_phys is not sac.q1_tgt_phys
+    assert sac.constraint_optim is not None
     assert sac.constraint_dim == 4
     assert sac.constraint_actor_weights.shape == (1, 4)
+    critic_param_ids = {id(p) for group in sac.critic_optim.param_groups for p in group["params"]}
+    constraint_param_ids = {id(p) for group in sac.constraint_optim.param_groups for p in group["params"]}
+    assert critic_param_ids.isdisjoint(constraint_param_ids)
+    assert {id(p) for p in sac.constraint_q.parameters()}.issubset(constraint_param_ids)
+    assert {id(p) for p in sac.constraint_phys.parameters()}.issubset(constraint_param_ids)
 
     stats = sac.update(_dummy_lower_batch(cfg))
 
@@ -116,6 +126,27 @@ def test_lower_sac_trains_independent_constraint_critics():
     assert np.isfinite(stats["constraint_critic_loss"])
     assert np.isfinite(stats["constraint_actor_penalty"])
     assert stats["constraint_actor_penalty"] >= 0.0
+
+
+def test_lower_sac_state_dict_restores_constraint_physical_encoder_and_optimizer():
+    cfg = _small_cfg()
+    safety = SafetyLayer(cfg)
+    sac = LowerSAC(cfg, safety, torch.device("cpu"))
+    batch = _dummy_lower_batch(cfg)
+    sac.update(batch, constraint_batch=batch)
+    state = copy.deepcopy(sac.state_dict())
+
+    assert state["constraint_phys"] is not None
+    assert state["constraint_tgt_phys"] is not None
+    assert state["constraint_optim"] is not None
+
+    with torch.no_grad():
+        for p in sac.constraint_phys.parameters():
+            p.add_(1.0)
+    sac.load_state_dict(state)
+    restored = sac.state_dict()
+    for key, value in state["constraint_phys"].items():
+        assert torch.allclose(restored["constraint_phys"][key], value)
 
 
 def test_lower_reward_critic_uses_task_reward_when_constraint_critics_are_enabled():

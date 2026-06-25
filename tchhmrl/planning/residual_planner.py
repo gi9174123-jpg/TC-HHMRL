@@ -158,7 +158,13 @@ class ResidualPlanner:
             disagreement = float(torch.abs(q1 - q2).detach().cpu().item())
             constraint_penalty = 0.0
             if getattr(lower, "constraint_q_tgt", None) is not None:
-                constraint_val = lower.constraint_q_tgt(obs_aug, z_t, executed)
+                obs_aug_constraint = lower._augment_np(
+                    np.asarray(obs, dtype=np.float32),
+                    upper_idx=int(upper_idx_exec),
+                    physical_features=np.asarray(physical_features, dtype=np.float32),
+                    encoder=getattr(lower, "constraint_tgt_phys", None),
+                )
+                constraint_val = lower.constraint_q_tgt(obs_aug_constraint, z_t, executed)
                 if getattr(lower, "constraint_actor_penalty_nonnegative", True):
                     constraint_val = torch.relu(constraint_val)
                 constraint_penalty = float((constraint_val * lower.constraint_actor_weights).sum().detach().cpu().item())
@@ -426,7 +432,13 @@ class ResidualPlanner:
 
             constraint_penalty = torch.zeros_like(reward_value)
             if getattr(lower, "constraint_q_tgt", None) is not None:
-                constraint_val = lower.constraint_q_tgt(obs_aug, z_t, executed)
+                obs_aug_constraint = lower._augment_np(
+                    np.asarray(obs, dtype=np.float32),
+                    upper_idx=int(upper_idx_exec),
+                    physical_features=np.asarray(physical_features, dtype=np.float32),
+                    encoder=getattr(lower, "constraint_tgt_phys", None),
+                ).expand(k, -1)
+                constraint_val = lower.constraint_q_tgt(obs_aug_constraint, z_t, executed)
                 if getattr(lower, "constraint_actor_penalty_nonnegative", True):
                     constraint_val = torch.relu(constraint_val)
                 constraint_penalty = (constraint_val * lower.constraint_actor_weights).sum(dim=1, keepdim=True)

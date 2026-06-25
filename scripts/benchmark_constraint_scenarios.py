@@ -232,6 +232,10 @@ def formal_metadata_snapshot(cfg: Dict, *, pre_alignment: bool | None = None, ta
         "physical_context_input_dim": int(physical_cfg.get("input_dim", 0) or 0),
         "physical_context_embedding_dim": int(physical_cfg.get("embedding_dim", 0) or 0),
         "constraint_critics_enabled": bool(constraint_cfg.get("enabled", False)),
+        "constraint_physical_encoder_independent": bool(
+            constraint_cfg.get("enabled", False) and physical_cfg.get("enabled", False)
+        ),
+        "constraint_optimizer_separate": bool(constraint_cfg.get("enabled", False)),
         "transition_schema_version": TRANSITION_SCHEMA_VERSION,
         "reward_schema_version": REWARD_SCHEMA_VERSION,
         "action_contract_version": ACTION_CONTRACT_VERSION,

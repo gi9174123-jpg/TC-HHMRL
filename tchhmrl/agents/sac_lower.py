@@ -94,6 +94,16 @@ class LowerSAC:
             if self.physical_enabled
             else None
         )
+        self.constraint_phys = (
+            PhysicalEncoder(self.physical_dim, physical_hidden, self.physical_embedding_dim).to(device)
+            if self.physical_enabled and self.constraint_critics_enabled
+            else None
+        )
+        self.constraint_tgt_phys = (
+            PhysicalEncoder(self.physical_dim, physical_hidden, self.physical_embedding_dim).to(device)
+            if self.physical_enabled and self.constraint_critics_enabled
+            else None
+        )
 
         self.actor = GaussianTanhPolicy(self.obs_aug_dim, self.z_dim, self.act_dim, hidden).to(device)
         self.q1 = ContinuousQNetwork(self.obs_aug_dim, self.z_dim, self.act_dim, hidden).to(device)
@@ -120,6 +130,8 @@ class LowerSAC:
             assert self.q1_tgt_phys is not None and self.q2_tgt_phys is not None
             self.q1_tgt_phys.load_state_dict(self.q1_phys.state_dict())
             self.q2_tgt_phys.load_state_dict(self.q2_phys.state_dict())
+            if self.constraint_phys is not None and self.constraint_tgt_phys is not None:
+                self.constraint_tgt_phys.load_state_dict(self.constraint_phys.state_dict())
 
         actor_params = list(self.actor.parameters())
         if self.actor_phys is not None:
@@ -127,13 +139,21 @@ class LowerSAC:
         critic_params = list(self.q1.parameters()) + list(self.q2.parameters())
         if self.q1_phys is not None and self.q2_phys is not None:
             critic_params += list(self.q1_phys.parameters()) + list(self.q2_phys.parameters())
+        constraint_params = []
         if self.constraint_q is not None:
-            critic_params += list(self.constraint_q.parameters())
+            constraint_params += list(self.constraint_q.parameters())
+        if self.constraint_phys is not None:
+            constraint_params += list(self.constraint_phys.parameters())
 
         self.actor_optim = torch.optim.Adam(actor_params, lr=float(sac_cfg["actor_lr"]))
         self.critic_optim = torch.optim.Adam(
             critic_params,
             lr=float(sac_cfg["critic_lr"]),
+        )
+        self.constraint_optim = (
+            torch.optim.Adam(constraint_params, lr=float(sac_cfg["critic_lr"]))
+            if constraint_params
+            else None
         )
         if self.auto_alpha:
             init_alpha = max(self.alpha_start, 1.0e-6)
@@ -333,6 +353,16 @@ class LowerSAC:
         obs_aug_q2 = self._augment_torch(obs, boost, mode, physical, self.q2_phys)
         next_obs_aug_q1_tgt = self._augment_torch(next_obs, boost_next, mode_next, physical_next, self.q1_tgt_phys)
         next_obs_aug_q2_tgt = self._augment_torch(next_obs, boost_next, mode_next, physical_next, self.q2_tgt_phys)
+        obs_aug_constraint = (
+            self._augment_torch(obs, boost, mode, physical, self.constraint_phys)
+            if self.constraint_q is not None
+            else obs_aug_q1
+        )
+        next_obs_aug_constraint_tgt = (
+            self._augment_torch(next_obs, boost_next, mode_next, physical_next, self.constraint_tgt_phys)
+            if self.constraint_q_tgt is not None
+            else next_obs_aug_q1_tgt
+        )
 
         temps = torch.tensor(batch["temps"], dtype=torch.float32, device=self.device)
         next_temps = torch.tensor(batch["next_temps"], dtype=torch.float32, device=self.device)
@@ -353,7 +383,7 @@ class LowerSAC:
             ) - alpha_t * logp_next_eff
             td_target = rew + self.gamma_rl * (1.0 - done) * q_next
             if self.constraint_q_tgt is not None and constraint_batch is None:
-                constraint_next = self.constraint_q_tgt(next_obs_aug_q1_tgt, z_next, a_next)
+                constraint_next = self.constraint_q_tgt(next_obs_aug_constraint_tgt, z_next, a_next)
                 if self.constraint_target_nonnegative:
                     constraint_next = torch.relu(constraint_next)
                 constraint_target = cost_vec + self.gamma_rl * (1.0 - done) * constraint_next
@@ -400,9 +430,15 @@ class LowerSAC:
             )
             c_physical = self._physical_torch(cb, "physical_features", c_batch_size)
             c_physical_next = self._physical_torch(cb, "physical_features_next", c_batch_size)
-            c_obs_aug_q1 = self._augment_torch(c_obs, c_boost, c_mode, c_physical, self.q1_phys)
+            c_obs_aug_constraint = self._augment_torch(c_obs, c_boost, c_mode, c_physical, self.constraint_phys)
             c_next_obs_aug_actor = self._augment_torch(c_next_obs, c_boost_next, c_mode_next, c_physical_next, self.actor_phys)
-            c_next_obs_aug_q1_tgt = self._augment_torch(c_next_obs, c_boost_next, c_mode_next, c_physical_next, self.q1_tgt_phys)
+            c_next_obs_aug_constraint_tgt = self._augment_torch(
+                c_next_obs,
+                c_boost_next,
+                c_mode_next,
+                c_physical_next,
+                self.constraint_tgt_phys,
+            )
             c_next_temps = torch.tensor(cb["next_temps"], dtype=torch.float32, device=self.device)
             c_amb = torch.tensor(cb["amb_temp"], dtype=torch.float32, device=self.device)
             with torch.no_grad():
@@ -412,11 +448,11 @@ class LowerSAC:
                     [c_safe_next["currents_exec"], c_safe_next["rho_exec"], c_safe_next["tau_exec"]],
                     dim=1,
                 )
-                c_constraint_next = self.constraint_q_tgt(c_next_obs_aug_q1_tgt, c_z_next, c_a_next)
+                c_constraint_next = self.constraint_q_tgt(c_next_obs_aug_constraint_tgt, c_z_next, c_a_next)
                 if self.constraint_target_nonnegative:
                     c_constraint_next = torch.relu(c_constraint_next)
                 constraint_target = c_cost_vec + self.gamma_rl * (1.0 - c_done) * c_constraint_next
-            constraint_pred = self.constraint_q(c_obs_aug_q1, c_z, c_act_exec)
+            constraint_pred = self.constraint_q(c_obs_aug_constraint, c_z, c_act_exec)
             per_item = F.mse_loss(constraint_pred, constraint_target, reduction="none").mean(dim=1)
             weights = torch.tensor(
                 cb.get("constraint_replay_importance_weight", np.ones(c_batch_size, dtype=np.float32)),
@@ -454,11 +490,8 @@ class LowerSAC:
                     constraint_batch_stats[f"constraint_max_{j}"] = float(target_j.max().item())
                     constraint_batch_stats[f"constraint_positive_fraction_{j}"] = float((target_j > 0.0).float().mean().item())
         elif self.constraint_q is not None and constraint_target is not None:
-            constraint_pred = self.constraint_q(obs_aug_q1, z, act_exec)
+            constraint_pred = self.constraint_q(obs_aug_constraint, z, act_exec)
             constraint_loss = F.mse_loss(constraint_pred, constraint_target)
-            loss_q = loss_q + constraint_loss
-        if self.constraint_q is not None and constraint_batch is not None:
-            loss_q = loss_q + constraint_loss
 
         self.critic_optim.zero_grad()
         loss_q.backward()
@@ -467,6 +500,14 @@ class LowerSAC:
             self.grad_clip,
         )
         self.critic_optim.step()
+        if self.constraint_optim is not None and bool(constraint_loss.requires_grad):
+            self.constraint_optim.zero_grad()
+            constraint_loss.backward()
+            torch.nn.utils.clip_grad_norm_(
+                [p for group in self.constraint_optim.param_groups for p in group["params"]],
+                self.grad_clip,
+            )
+            self.constraint_optim.step()
 
         raw_pi, logp, logp_dim = self.actor.sample(obs_aug_actor, z, return_log_prob_per_dim=True)
         logp_eff = self._masked_logp(logp_dim, boost, mode)
@@ -474,11 +515,16 @@ class LowerSAC:
         a_pi = torch.cat([safe_pi["currents_exec"], safe_pi["rho_exec"], safe_pi["tau_exec"]], dim=1)
         obs_aug_q1_pi = self._augment_torch(obs, boost, mode, physical, self.q1_phys)
         obs_aug_q2_pi = self._augment_torch(obs, boost, mode, physical, self.q2_phys)
+        obs_aug_constraint_pi = (
+            self._augment_torch(obs, boost, mode, physical, self.constraint_phys)
+            if self.constraint_q is not None
+            else obs_aug_q1_pi
+        )
         q_pi = torch.min(self.q1(obs_aug_q1_pi, z, a_pi), self.q2(obs_aug_q2_pi, z, a_pi))
         constraint_pi_weighted = torch.zeros_like(q_pi)
         constraint_pi_mean = 0.0
         if self.constraint_q is not None:
-            constraint_pi = self.constraint_q(obs_aug_q1_pi, z, a_pi)
+            constraint_pi = self.constraint_q(obs_aug_constraint_pi, z, a_pi)
             if self.constraint_actor_penalty_nonnegative:
                 constraint_pi = torch.relu(constraint_pi)
             constraint_pi_weighted = (constraint_pi * self.constraint_actor_weights).sum(dim=1, keepdim=True)
@@ -509,6 +555,8 @@ class LowerSAC:
             self._soft_update(self.q2_phys, self.q2_tgt_phys)
         if self.constraint_q is not None and self.constraint_q_tgt is not None:
             self._soft_update(self.constraint_q, self.constraint_q_tgt)
+        if self.constraint_phys is not None and self.constraint_tgt_phys is not None:
+            self._soft_update(self.constraint_phys, self.constraint_tgt_phys)
         self.update_steps += 1
 
         return {
@@ -543,8 +591,11 @@ class LowerSAC:
             "q2_phys": self.q2_phys.state_dict() if self.q2_phys is not None else None,
             "q1_tgt_phys": self.q1_tgt_phys.state_dict() if self.q1_tgt_phys is not None else None,
             "q2_tgt_phys": self.q2_tgt_phys.state_dict() if self.q2_tgt_phys is not None else None,
+            "constraint_phys": self.constraint_phys.state_dict() if self.constraint_phys is not None else None,
+            "constraint_tgt_phys": self.constraint_tgt_phys.state_dict() if self.constraint_tgt_phys is not None else None,
             "actor_optim": self.actor_optim.state_dict(),
             "critic_optim": self.critic_optim.state_dict(),
+            "constraint_optim": self.constraint_optim.state_dict() if self.constraint_optim is not None else None,
             "update_steps": self.update_steps,
             "auto_alpha": self.auto_alpha,
             "alpha_start": self.alpha_start,
@@ -575,8 +626,20 @@ class LowerSAC:
             self.q1_tgt_phys.load_state_dict(state["q1_tgt_phys"])
         if self.q2_tgt_phys is not None and state.get("q2_tgt_phys") is not None:
             self.q2_tgt_phys.load_state_dict(state["q2_tgt_phys"])
+        if self.constraint_phys is not None:
+            if state.get("constraint_phys") is not None:
+                self.constraint_phys.load_state_dict(state["constraint_phys"])
+            elif state.get("q1_phys") is not None:
+                self.constraint_phys.load_state_dict(state["q1_phys"])
+        if self.constraint_tgt_phys is not None:
+            if state.get("constraint_tgt_phys") is not None:
+                self.constraint_tgt_phys.load_state_dict(state["constraint_tgt_phys"])
+            elif state.get("q1_tgt_phys") is not None:
+                self.constraint_tgt_phys.load_state_dict(state["q1_tgt_phys"])
         self.actor_optim.load_state_dict(state["actor_optim"])
         self.critic_optim.load_state_dict(state["critic_optim"])
+        if self.constraint_optim is not None and state.get("constraint_optim") is not None:
+            self.constraint_optim.load_state_dict(state["constraint_optim"])
         self.update_steps = int(state.get("update_steps", 0))
         if self.auto_alpha and self.log_alpha is not None and state.get("log_alpha") is not None:
             with torch.no_grad():
