@@ -198,12 +198,21 @@ def formal_metadata_snapshot(cfg: Dict, *, pre_alignment: bool | None = None, ta
     constraint_cfg = cfg.get("constraint_critics", {}) or {}
     planner_cfg = cfg.get("residual_planner", {}) or {}
     upper_cfg = cfg.get("upper_dqn", {}) or {}
+    safety_cfg = cfg.get("safety", {}) or {}
     return {
         **alignment_snapshot(cfg, pre_alignment=pre_alignment, task_source=task_source),
         **physics_snapshot_from_cfg(cfg),
         "adaptive_thermal_enabled": bool(adaptive_cfg.get("enabled", False)),
-        "adaptive_thermal_estimator": "ema_gain_scale" if bool(adaptive_cfg.get("enabled", False)) else "disabled",
-        "adaptive_thermal_projection": "mean_plus_beta_std" if bool(adaptive_cfg.get("enabled", False)) else "nominal",
+        "adaptive_thermal_estimator": "ema_effective_gain" if bool(adaptive_cfg.get("enabled", False)) else "disabled",
+        "adaptive_thermal_projection": "gamma_nominal_plus_effective_gain_safe"
+        if bool(adaptive_cfg.get("enabled", False))
+        else "gamma_nominal_plus_initial_effective_gain",
+        "thermal_parameter_source": str(
+            safety_cfg.get("thermal_parameter_source", "nominal_plus_online_effective_gain")
+        ),
+        "controller_uses_task_gamma_delta": False,
+        "gamma_nominal": float(safety_cfg.get("gamma_nominal", cfg.get("env", {}).get("gamma", 0.0))),
+        "effective_gain_initial": list(safety_cfg.get("effective_gain_initial", [])),
         "adaptive_thermal_extra_rollouts": 0,
         "adaptive_thermal_extra_gradient_updates": 0,
         "physical_context_enabled": bool(physical_cfg.get("enabled", False)),

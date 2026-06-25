@@ -19,17 +19,28 @@ class ThermalEstimatorSnapshot:
 class ThermalGainEstimator:
     """Online EMA estimator for per-source effective thermal gain.
 
-    The estimator tracks a multiplicative gain scale relative to the nominal
-    model used by the environment:
+    The estimator tracks the full effective heating gain in
 
-        T_next = base + delta * thermal_coeff_i * scale_i * I_i^2.
+        T_next = base_nominal + g_i * I_i^2.
+
+    Here ``base_nominal`` uses the controller's calibrated cooling coefficient,
+    not the task-level environment truth.  The task-specific ``delta`` is
+    intentionally absent from this estimator interface so the controller cannot
+    receive thermal dynamics oracle information through the safety layer.
 
     It only updates when the current provides enough excitation to identify
     the thermal response. The state is intentionally small so it can be copied
     and restored by support-gated rollback without extra training budget.
     """
 
-    def __init__(self, cfg: Dict[str, Any], *, n_tx: int, thermal_safe: float):
+    def __init__(
+        self,
+        cfg: Dict[str, Any],
+        *,
+        n_tx: int,
+        thermal_safe: float,
+        initial_effective_gain: np.ndarray | None = None,
+    ):
         self.cfg = dict(cfg or {})
         self.n_tx = int(n_tx)
         self.thermal_safe = float(thermal_safe)
@@ -40,11 +51,18 @@ class ThermalGainEstimator:
         self.uncertainty_beta_min = float(self.cfg.get("uncertainty_beta_min", 0.5))
         self.uncertainty_beta_max = float(self.cfg.get("uncertainty_beta_max", 1.5))
         self.min_gain = float(self.cfg.get("min_gain", 0.5))
-        self.max_gain = float(self.cfg.get("max_gain", 2.0))
+        self.max_gain = float(self.cfg.get("max_gain", 16.0))
         initial_std = float(self.cfg.get("initial_std", 0.0))
-        initial_mean = float(self.cfg.get("initial_mean", 1.0))
+        if initial_effective_gain is None:
+            configured = self.cfg.get("initial_effective_gain", self.cfg.get("initial_mean", 1.0))
+            initial_effective_gain = np.asarray(configured, dtype=np.float32)
+        initial_effective_gain = np.asarray(initial_effective_gain, dtype=np.float32).reshape(-1)
+        if initial_effective_gain.size == 1:
+            initial_effective_gain = np.full((self.n_tx,), float(initial_effective_gain[0]), dtype=np.float32)
+        if initial_effective_gain.size != self.n_tx:
+            raise ValueError("adaptive_thermal.initial_effective_gain must be scalar or length n_tx")
 
-        self.gain_mean = np.full((self.n_tx,), initial_mean, dtype=np.float32)
+        self.gain_mean = np.clip(initial_effective_gain, self.min_gain, self.max_gain).astype(np.float32)
         self.gain_var = np.full((self.n_tx,), max(initial_std, 0.0) ** 2, dtype=np.float32)
         self.valid_count = np.zeros((self.n_tx,), dtype=np.int64)
         self.temperature_slope = np.zeros((self.n_tx,), dtype=np.float32)
@@ -83,22 +101,31 @@ class ThermalGainEstimator:
     def gain_std(self) -> np.ndarray:
         return np.sqrt(np.maximum(self.gain_var, 0.0)).astype(np.float32)
 
-    def safe_gain_scale(self) -> np.ndarray:
+    def effective_gain_safe(self) -> np.ndarray:
         if not self.enabled:
-            return np.ones((self.n_tx,), dtype=np.float32)
+            return self.gain_mean.astype(np.float32).copy()
         safe = self.gain_mean + self.beta() * self.gain_std()
         return np.clip(safe, self.min_gain, self.max_gain).astype(np.float32)
 
-    def diagnostics(self, *, temps: np.ndarray | None = None) -> Dict[str, np.ndarray | bool]:
-        if temps is not None:
-            temps_arr = np.asarray(temps, dtype=np.float32).reshape(-1)[: self.n_tx]
-            if temps_arr.size == self.n_tx:
-                self.last_headroom = (self.thermal_safe - temps_arr).astype(np.float32)
+    def safe_gain_scale(self) -> np.ndarray:
+        # Backward-compatible alias.  The returned value is now an absolute
+        # effective heating gain, not a multiplicative scale.
+        return self.effective_gain_safe()
+
+    def observe_temperature(self, temps: np.ndarray) -> None:
+        temps_arr = np.asarray(temps, dtype=np.float32).reshape(-1)[: self.n_tx]
+        if temps_arr.size == self.n_tx:
+            self.last_headroom = (self.thermal_safe - temps_arr).astype(np.float32)
+
+    def diagnostics(self) -> Dict[str, np.ndarray | bool]:
         return {
             "adaptive_thermal_enabled": bool(self.enabled),
             "thermal_gain_mean": self.gain_mean.astype(np.float32).copy(),
             "thermal_gain_std": self.gain_std(),
-            "thermal_gain_safe_scale": self.safe_gain_scale(),
+            "thermal_gain_safe_scale": self.effective_gain_safe(),
+            "effective_gain_mean": self.gain_mean.astype(np.float32).copy(),
+            "effective_gain_std": self.gain_std(),
+            "effective_gain_safe": self.effective_gain_safe(),
             "thermal_gain_beta": self.beta(),
             "thermal_gain_valid_count": self.valid_count.astype(np.float32).copy(),
             "temperature_slope": self.temperature_slope.astype(np.float32).copy(),
@@ -112,8 +139,6 @@ class ThermalGainEstimator:
         temps_before: np.ndarray,
         temps_after: np.ndarray,
         thermal_base: np.ndarray,
-        delta: float,
-        thermal_coeff: np.ndarray,
     ) -> Dict[str, np.ndarray | bool]:
         temps_before = np.asarray(temps_before, dtype=np.float32).reshape(-1)[: self.n_tx]
         temps_after = np.asarray(temps_after, dtype=np.float32).reshape(-1)[: self.n_tx]
@@ -124,23 +149,20 @@ class ThermalGainEstimator:
 
         currents = np.asarray(currents, dtype=np.float32).reshape(-1)[: self.n_tx]
         thermal_base = np.asarray(thermal_base, dtype=np.float32).reshape(-1)[: self.n_tx]
-        thermal_coeff = np.asarray(thermal_coeff, dtype=np.float32).reshape(-1)[: self.n_tx]
-        nominal_gain = max(float(delta), 0.0) * thermal_coeff
         current_sq = currents * currents
-        valid = (current_sq >= self.excitation_threshold) & (nominal_gain > 1.0e-8)
+        valid = current_sq >= self.excitation_threshold
 
         for idx in range(self.n_tx):
             if not bool(valid[idx]):
                 continue
             instant_eff_gain = float((temps_after[idx] - thermal_base[idx]) / max(float(current_sq[idx]), 1.0e-8))
-            instant_scale = instant_eff_gain / max(float(nominal_gain[idx]), 1.0e-8)
-            if not np.isfinite(instant_scale):
+            if not np.isfinite(instant_eff_gain):
                 continue
-            instant_scale = float(np.clip(instant_scale, self.min_gain, self.max_gain))
+            instant_eff_gain = float(np.clip(instant_eff_gain, self.min_gain, self.max_gain))
             prev_mean = float(self.gain_mean[idx])
             prev_std = float(np.sqrt(max(float(self.gain_var[idx]), 0.0)))
             clip_radius = max(self.innovation_clip * max(prev_std, 0.05), 0.05)
-            clipped = float(np.clip(instant_scale, prev_mean - clip_radius, prev_mean + clip_radius))
+            clipped = float(np.clip(instant_eff_gain, prev_mean - clip_radius, prev_mean + clip_radius))
 
             alpha = float(np.clip(self.ema_alpha, 0.0, 1.0))
             delta_mean = clipped - prev_mean

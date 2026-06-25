@@ -119,7 +119,7 @@ def test_lower_update_uses_next_macro_for_target_projection():
     calls: list[torch.Tensor] = []
     original = safety.project_torch
 
-    def wrapped(self, lower_raw, boost_combo, mode, temps, amb_temp, gamma, delta):
+    def wrapped(self, lower_raw, boost_combo, mode, temps, amb_temp, gamma=None, delta=None):
         calls.append(boost_combo.detach().cpu().clone())
         return original(lower_raw, boost_combo, mode, temps, amb_temp, gamma, delta)
 

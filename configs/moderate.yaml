@@ -54,6 +54,9 @@ env:
     burst_ld_factor: 1.25
 
 safety:
+  thermal_parameter_source: nominal_plus_online_effective_gain
+  gamma_nominal: 0.055
+  effective_gain_initial: [4.4, 6.0, 6.0]
   min_dwell_steps: 2
   soft_alpha: 0.28
   cutoff_alpha: 0.36
@@ -71,9 +74,9 @@ adaptive_thermal:
   innovation_clip: 3.0
   uncertainty_beta_min: 0.5
   uncertainty_beta_max: 1.5
-  min_gain: 0.5
-  max_gain: 2.0
-  initial_mean: 1.0
+  min_gain: 1.0
+  max_gain: 14.0
+  initial_effective_gain: [4.4, 6.0, 6.0]
   initial_std: 0.0
 
 physical_context:

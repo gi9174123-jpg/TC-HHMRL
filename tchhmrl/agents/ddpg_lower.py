@@ -287,15 +287,13 @@ class LowerDDPG:
         temps = torch.tensor(batch["temps"], dtype=torch.float32, device=self.device)
         next_temps = torch.tensor(batch["next_temps"], dtype=torch.float32, device=self.device)
         amb = torch.tensor(batch["amb_temp"], dtype=torch.float32, device=self.device)
-        gamma_env = torch.tensor(batch["gamma_env"], dtype=torch.float32, device=self.device)
-        delta_env = torch.tensor(batch["delta_env"], dtype=torch.float32, device=self.device)
 
         with torch.no_grad():
             raw_next = self._expand_learned_raw_torch(
                 self.actor_tgt(next_obs_aug, z_next),
                 current_template_level=current_template_level_next,
             )
-            safe_next = self.safety.project_torch(raw_next, boost_next, mode_next, next_temps, amb, gamma_env, delta_env)
+            safe_next = self.safety.project_torch(raw_next, boost_next, mode_next, next_temps, amb)
             a_next = torch.cat(
                 [safe_next["currents_exec"], safe_next["rho_exec"], safe_next["tau_exec"]],
                 dim=1,
@@ -311,7 +309,7 @@ class LowerDDPG:
         self.critic_optim.step()
 
         raw_pi = self._expand_learned_raw_torch(self.actor(obs_aug, z), current_template_level=current_template_level)
-        safe_pi = self.safety.project_torch(raw_pi, boost, mode, temps, amb, gamma_env, delta_env)
+        safe_pi = self.safety.project_torch(raw_pi, boost, mode, temps, amb)
         a_pi = torch.cat([safe_pi["currents_exec"], safe_pi["rho_exec"], safe_pi["tau_exec"]], dim=1)
         actor_loss = -self.critic(obs_aug, z, a_pi).mean()
 

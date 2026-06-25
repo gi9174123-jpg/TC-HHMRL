@@ -279,11 +279,14 @@ class HierarchicalAgent:
         self._restore_rng_state(state.get("rng", {}))
 
     def current_physical_features(self, temps: np.ndarray | None = None) -> np.ndarray:
-        diag = self.safety.thermal_diagnostics(temps=temps)
+        diag = self.safety.thermal_diagnostics()
         gain_mean = np.asarray(diag.get("thermal_gain_mean", np.ones(3)), dtype=np.float32).reshape(-1)[:3]
         gain_std = np.asarray(diag.get("thermal_gain_std", np.zeros(3)), dtype=np.float32).reshape(-1)[:3]
         temp_slope = np.asarray(diag.get("temperature_slope", np.zeros(3)), dtype=np.float32).reshape(-1)[:3] / 10.0
-        headroom = np.asarray(diag.get("thermal_headroom", np.zeros(3)), dtype=np.float32).reshape(-1)[:3]
+        if temps is None:
+            headroom = np.asarray(diag.get("thermal_headroom", np.zeros(3)), dtype=np.float32).reshape(-1)[:3]
+        else:
+            headroom = (float(self.safety.thermal_safe) - np.asarray(temps, dtype=np.float32).reshape(-1)[:3])
         headroom = np.nan_to_num(headroom / max(float(self.safety.thermal_safe), 1.0e-6), nan=0.0)
         bus_headroom = np.asarray([float(self.prev_bus_headroom)], dtype=np.float32)
         residual = np.asarray(self.prev_projection_residual, dtype=np.float32).reshape(-1)[:5]
@@ -300,20 +303,15 @@ class HierarchicalAgent:
         temps_before: np.ndarray,
         info: Dict,
     ) -> Dict[str, np.ndarray | bool]:
-        thermal_base = np.asarray(
-            [
-                float(info.get("thermal_base_tx0", 0.0)),
-                float(info.get("thermal_base_tx1", 0.0)),
-                float(info.get("thermal_base_tx2", 0.0)),
-            ],
-            dtype=np.float32,
+        thermal_base, _ = self.safety._thermal_base_np(
+            np.asarray(temps_before, dtype=np.float32),
+            float(info.get("amb_temp", self.cfg.get("env", {}).get("amb_temp", 0.0))),
         )
         return self.safety.update_thermal_estimator(
             currents=np.asarray(info.get("currents_exec", np.zeros(3, dtype=np.float32)), dtype=np.float32),
             temps_before=np.asarray(temps_before, dtype=np.float32),
             temps_after=np.asarray(info.get("temps", temps_before), dtype=np.float32),
             thermal_base=thermal_base,
-            delta=float(info.get("delta", 0.0)),
         )
 
     @staticmethod
@@ -477,7 +475,6 @@ class HierarchicalAgent:
             "residual_planner_score_improvement": 0.0,
         }
         if self.residual_planner.active(meta_iter=self.current_meta_iter):
-            thermal_diag = self.safety.thermal_diagnostics(temps=temps)
             lower_raw, planner_aux = self.residual_planner.plan(
                 lower=self.lower,
                 safety=self.safety,
@@ -488,11 +485,9 @@ class HierarchicalAgent:
                 mode=int(mode_preview),
                 policy_raw=lower_raw,
                 physical_features=physical_features,
-                thermal_headroom=np.asarray(thermal_diag.get("thermal_headroom", np.zeros(3)), dtype=np.float32),
+                thermal_headroom=(float(self.safety.thermal_safe) - np.asarray(temps, dtype=np.float32)),
                 temps=temps,
                 amb_temp=amb_temp,
-                gamma=gamma,
-                delta=delta,
                 meta_iter=int(self.current_meta_iter),
             )
 

@@ -86,6 +86,10 @@ class SafetyLayer:
         self.bus_current_max = float(safety_cfg["bus_current_max"])
         self.thermal_safe = float(safety_cfg["thermal_safe"])
         self.thermal_cutoff = float(safety_cfg["thermal_cutoff"])
+        self.thermal_parameter_source = str(
+            safety_cfg.get("thermal_parameter_source", "nominal_plus_online_effective_gain")
+        )
+        self.gamma_nominal = float(safety_cfg.get("gamma_nominal", env_cfg.get("gamma", 0.07)))
 
         tx_device = hybrid_cfg.get("tx_device", ["LED", "LD", "LD"])
         if len(tx_device) != int(self.current_max.shape[0]):
@@ -100,10 +104,14 @@ class SafetyLayer:
         thermal_led_coeff = float(hybrid_cfg.get("thermal_led_coeff", 1.00))
         thermal_ld_coeff = float(hybrid_cfg.get("thermal_ld_coeff", 1.25))
         self.tx_thermal_coeff = tx_is_led * thermal_led_coeff + tx_is_ld * thermal_ld_coeff
+        configured_gain = safety_cfg.get("effective_gain_initial", None)
+        if configured_gain is None:
+            configured_gain = float(env_cfg.get("delta", 1.0)) * self.tx_thermal_coeff
         self.thermal_estimator = ThermalGainEstimator(
             cfg.get("adaptive_thermal", {}),
             n_tx=int(self.current_max.shape[0]),
             thermal_safe=self.thermal_safe,
+            initial_effective_gain=np.asarray(configured_gain, dtype=np.float32),
         )
         self._dalal_eps = 1.0e-6
         self._dalal_iters = 4
@@ -124,27 +132,25 @@ class SafetyLayer:
         temps_before: np.ndarray,
         temps_after: np.ndarray,
         thermal_base: np.ndarray,
-        delta: float,
     ) -> Dict[str, np.ndarray | bool]:
         return self.thermal_estimator.update(
             currents=currents,
             temps_before=temps_before,
             temps_after=temps_after,
             thermal_base=thermal_base,
-            delta=float(delta),
-            thermal_coeff=self.tx_thermal_coeff,
         )
 
-    def thermal_diagnostics(self, *, temps: np.ndarray | None = None) -> Dict[str, np.ndarray | bool]:
-        return self.thermal_estimator.diagnostics(temps=temps)
+    def observe_temperature(self, temps: np.ndarray) -> None:
+        self.thermal_estimator.observe_temperature(temps)
+
+    def thermal_diagnostics(self) -> Dict[str, np.ndarray | bool]:
+        return self.thermal_estimator.diagnostics()
 
     def _safe_thermal_coeff_np(self) -> np.ndarray:
-        return (self.tx_thermal_coeff * self.thermal_estimator.safe_gain_scale()).astype(np.float32)
+        return self.thermal_estimator.effective_gain_safe().astype(np.float32)
 
     def _safe_thermal_coeff_torch(self, *, dtype: torch.dtype, device: torch.device) -> torch.Tensor:
-        scale = torch.as_tensor(self.thermal_estimator.safe_gain_scale(), dtype=dtype, device=device).view(1, -1)
-        coeff = torch.as_tensor(self.tx_thermal_coeff, dtype=dtype, device=device).view(1, -1)
-        return coeff * scale
+        return torch.as_tensor(self.thermal_estimator.effective_gain_safe(), dtype=dtype, device=device).view(1, -1)
 
     @staticmethod
     def decode_upper(upper_raw: int | np.ndarray) -> Tuple[int, int]:
@@ -259,10 +265,11 @@ class SafetyLayer:
         diff = temps.reshape(1, -1) - temps.reshape(-1, 1)
         return np.sum(self.thermal_coupling_matrix * diff, axis=1).astype(np.float32)
 
-    def _thermal_base_np(self, temps: np.ndarray, amb_temp: float, gamma: float) -> Tuple[np.ndarray, np.ndarray]:
+    def _thermal_base_np(self, temps: np.ndarray, amb_temp: float, gamma: float | None = None) -> Tuple[np.ndarray, np.ndarray]:
         temps = np.asarray(temps, dtype=np.float32)
         coupling = self._thermal_coupling_term_np(temps)
-        base = ((1.0 - gamma) * temps + gamma * float(amb_temp) + coupling).astype(np.float32)
+        gamma_nominal = float(self.gamma_nominal)
+        base = ((1.0 - gamma_nominal) * temps + gamma_nominal * float(amb_temp) + coupling).astype(np.float32)
         return base, coupling
 
     def _thermal_coupling_term_torch(self, temps: torch.Tensor) -> torch.Tensor:
@@ -272,9 +279,15 @@ class SafetyLayer:
         diff = temps.unsqueeze(1) - temps.unsqueeze(2)
         return (matrix.unsqueeze(0) * diff).sum(dim=2)
 
-    def _thermal_base_torch(self, temps: torch.Tensor, amb_temp: torch.Tensor, gamma: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+    def _thermal_base_torch(
+        self,
+        temps: torch.Tensor,
+        amb_temp: torch.Tensor,
+        gamma: torch.Tensor | None = None,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
         coupling = self._thermal_coupling_term_torch(temps)
-        base = (1.0 - gamma) * temps + gamma * amb_temp + coupling
+        gamma_nominal = torch.as_tensor(float(self.gamma_nominal), dtype=temps.dtype, device=temps.device)
+        base = (1.0 - gamma_nominal) * temps + gamma_nominal * amb_temp + coupling
         return base, coupling
 
     def _thermal_cap_np(
@@ -283,12 +296,12 @@ class SafetyLayer:
         currents: np.ndarray,
         temps: np.ndarray,
         amb_temp: float,
-        gamma: float,
-        delta: float,
+        gamma: float | None = None,
+        delta: float | None = None,
     ) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
         base, coupling = self._thermal_base_np(temps, amb_temp, gamma)
         allowed_rise = self.thermal_safe - self.thermal_cap_margin_c - base
-        denom = max(float(delta), 0.0) * self._safe_thermal_coeff_np() + 1.0e-6
+        denom = self._safe_thermal_coeff_np() + 1.0e-6
         cap = np.sqrt(np.maximum(allowed_rise / denom, 0.0)).astype(np.float32)
         cap = np.minimum(cap, self.current_max).astype(np.float32)
         safe_currents = np.minimum(currents, cap).astype(np.float32)
@@ -304,8 +317,8 @@ class SafetyLayer:
         active_mask: np.ndarray,
         temps: np.ndarray,
         amb_temp: float,
-        gamma: float,
-        delta: float,
+        gamma: float | None = None,
+        delta: float | None = None,
     ) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
         """Hard per-source clipping with non-oracle current recovery.
 
@@ -355,14 +368,14 @@ class SafetyLayer:
         currents: torch.Tensor,
         temps: torch.Tensor,
         amb_temp: torch.Tensor,
-        gamma: torch.Tensor,
-        delta: torch.Tensor,
+        gamma: torch.Tensor | None = None,
+        delta: torch.Tensor | None = None,
         current_max: torch.Tensor,
         thermal_coeff: torch.Tensor,
     ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
         base, coupling = self._thermal_base_torch(temps, amb_temp, gamma)
         allowed_rise = self.thermal_safe - self.thermal_cap_margin_c - base
-        denom = torch.clamp(delta, min=0.0) * thermal_coeff + 1.0e-6
+        denom = thermal_coeff + 1.0e-6
         cap = torch.sqrt(torch.clamp(allowed_rise / denom, min=0.0))
         cap = torch.minimum(cap, current_max)
         safe_currents = torch.minimum(currents, cap)
@@ -381,8 +394,8 @@ class SafetyLayer:
         active_mask: torch.Tensor,
         temps: torch.Tensor,
         amb_temp: torch.Tensor,
-        gamma: torch.Tensor,
-        delta: torch.Tensor,
+        gamma: torch.Tensor | None = None,
+        delta: torch.Tensor | None = None,
         current_max: torch.Tensor,
         thermal_coeff: torch.Tensor,
     ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
@@ -444,8 +457,8 @@ class SafetyLayer:
         lower_raw: np.ndarray,
         temps: np.ndarray,
         amb_temp: float,
-        gamma: float,
-        delta: float,
+        gamma: float | None = None,
+        delta: float | None = None,
         mem: Optional[Dict[str, int]] = None,
     ) -> Tuple[Dict[str, np.ndarray | int | float], Dict[str, int]]:
         mem = dict(mem or {"current_boost": 0, "dwell_count": self.min_dwell_steps})
@@ -474,8 +487,6 @@ class SafetyLayer:
                 currents=currents,
                 temps=np.asarray(temps, dtype=np.float32),
                 amb_temp=float(amb_temp),
-                gamma=float(gamma),
-                delta=float(delta),
             )
         else:
             currents *= self._hard_bus_scale_np(total)
@@ -486,9 +497,9 @@ class SafetyLayer:
         rho, tau = self._project_mode_params_np(mode, rho_raw, tau_raw)
 
         temps = np.asarray(temps, dtype=np.float32)
-        thermal_base, thermal_source_term = self._thermal_base_np(temps, float(amb_temp), float(gamma))
+        thermal_base, thermal_source_term = self._thermal_base_np(temps, float(amb_temp))
         thermal_coeff_safe_np = self._safe_thermal_coeff_np()
-        T_pred = thermal_base + delta * thermal_coeff_safe_np * (currents**2)
+        T_pred = thermal_base + thermal_coeff_safe_np * (currents**2)
         thermal_cap_current = self.current_max.astype(np.float32)
         thermal_cap_scale = np.ones_like(currents, dtype=np.float32)
 
@@ -504,11 +515,9 @@ class SafetyLayer:
                 currents=currents,
                 temps=temps,
                 amb_temp=float(amb_temp),
-                gamma=float(gamma),
-                delta=float(delta),
             )
             thermal_coeff_safe_np = self._safe_thermal_coeff_np()
-            T_pred = thermal_base + delta * thermal_coeff_safe_np * (currents**2)
+            T_pred = thermal_base + thermal_coeff_safe_np * (currents**2)
             thermal_cap_scale = thermal_scale.astype(np.float32)
             soft_scale = thermal_scale.astype(np.float32)
             cutoff_scale = np.ones_like(currents, dtype=np.float32)
@@ -519,11 +528,9 @@ class SafetyLayer:
                 active_mask=active_mask,
                 temps=temps,
                 amb_temp=float(amb_temp),
-                gamma=float(gamma),
-                delta=float(delta),
             )
             thermal_coeff_safe_np = self._safe_thermal_coeff_np()
-            T_pred = thermal_base + delta * thermal_coeff_safe_np * (currents**2)
+            T_pred = thermal_base + thermal_coeff_safe_np * (currents**2)
             thermal_cap_scale = thermal_scale.astype(np.float32)
             soft_scale = thermal_scale.astype(np.float32)
             cutoff_scale = np.ones_like(currents, dtype=np.float32)
@@ -561,6 +568,8 @@ class SafetyLayer:
             "thermal_pred_temp": T_pred.astype(np.float32),
             "thermal_pred_margin": thermal_margin.astype(np.float32),
             "thermal_model": self.thermal_model,
+            "thermal_parameter_source": self.thermal_parameter_source,
+            "gamma_nominal": float(self.gamma_nominal),
             "thermal_coupling_matrix_hash": self.thermal_coupling_matrix_hash,
             "safety_projection_version": self.safety_projection_version,
             "thermal_margin": thermal_margin,
@@ -575,7 +584,11 @@ class SafetyLayer:
             "projected_current_total": projected_current_total,
             "projection_compression_ratio": projection_compression_ratio,
         }
-        out.update(self.thermal_diagnostics(temps=temps))
+        diag = self.thermal_diagnostics()
+        local_headroom = (self.thermal_safe - temps).astype(np.float32)
+        out.update(diag)
+        out["thermal_headroom_observed"] = local_headroom
+        out["thermal_headroom"] = local_headroom
         if self.thermal_model == "coupled":
             out["thermal_coupling_term"] = thermal_source_term.astype(np.float32)
             out["thermal_base_coupled"] = thermal_base.astype(np.float32)
@@ -588,8 +601,8 @@ class SafetyLayer:
         mode: torch.Tensor,
         temps: torch.Tensor,
         amb_temp: torch.Tensor,
-        gamma: torch.Tensor,
-        delta: torch.Tensor,
+        gamma: torch.Tensor | None = None,
+        delta: torch.Tensor | None = None,
     ) -> Dict[str, torch.Tensor]:
         if lower_raw.dim() == 1:
             lower_raw = lower_raw.unsqueeze(0)
@@ -626,8 +639,6 @@ class SafetyLayer:
                 currents=currents,
                 temps=temps if temps.dim() > 1 else temps.unsqueeze(0),
                 amb_temp=amb_temp if amb_temp.dim() > 1 else amb_temp.unsqueeze(1),
-                gamma=gamma if gamma.dim() > 1 else gamma.unsqueeze(1),
-                delta=delta if delta.dim() > 1 else delta.unsqueeze(1),
             )
         else:
             currents = currents * self._hard_bus_scale_torch(total)
@@ -641,14 +652,9 @@ class SafetyLayer:
             temps = temps.unsqueeze(0)
         if amb_temp.dim() == 1:
             amb_temp = amb_temp.unsqueeze(1)
-        if gamma.dim() == 1:
-            gamma = gamma.unsqueeze(1)
-        if delta.dim() == 1:
-            delta = delta.unsqueeze(1)
-
         thermal_coeff = self._safe_thermal_coeff_torch(dtype=lower_raw.dtype, device=device)
-        thermal_base, thermal_source_term = self._thermal_base_torch(temps, amb_temp, gamma)
-        T_pred = thermal_base + delta * thermal_coeff * (currents**2)
+        thermal_base, thermal_source_term = self._thermal_base_torch(temps, amb_temp)
+        T_pred = thermal_base + thermal_coeff * (currents**2)
         thermal_cap_current = current_max.expand_as(currents)
         thermal_cap_scale = torch.ones_like(currents)
         if self.projection_mode in {"smooth", "smooth_relaxed"}:
@@ -663,12 +669,10 @@ class SafetyLayer:
                 currents=currents,
                 temps=temps,
                 amb_temp=amb_temp,
-                gamma=gamma,
-                delta=delta,
                 current_max=current_max,
                 thermal_coeff=thermal_coeff,
             )
-            T_pred = thermal_base + delta * thermal_coeff * (currents**2)
+            T_pred = thermal_base + thermal_coeff * (currents**2)
             thermal_cap_scale = thermal_scale
             soft_scale = thermal_scale
             cutoff_scale = torch.ones_like(currents)
@@ -679,12 +683,10 @@ class SafetyLayer:
                 active_mask=active_mask,
                 temps=temps,
                 amb_temp=amb_temp,
-                gamma=gamma,
-                delta=delta,
                 current_max=current_max,
                 thermal_coeff=thermal_coeff,
             )
-            T_pred = thermal_base + delta * thermal_coeff * (currents**2)
+            T_pred = thermal_base + thermal_coeff * (currents**2)
             thermal_cap_scale = thermal_scale
             soft_scale = thermal_scale
             cutoff_scale = torch.ones_like(currents)
@@ -731,6 +733,8 @@ class SafetyLayer:
             "thermal_pred_temp": T_pred,
             "thermal_pred_margin": thermal_margin,
             "thermal_model": self.thermal_model,
+            "thermal_parameter_source": self.thermal_parameter_source,
+            "gamma_nominal": torch.full((lower_raw.shape[0],), float(self.gamma_nominal), dtype=lower_raw.dtype, device=device),
             "thermal_coupling_matrix_hash": self.thermal_coupling_matrix_hash,
             "safety_projection_version": self.safety_projection_version,
             "thermal_margin": thermal_margin,
@@ -744,7 +748,7 @@ class SafetyLayer:
             "projected_current_total": projected_current_total,
             "projection_compression_ratio": projection_compression_ratio,
         }
-        diag = self.thermal_diagnostics(temps=temps.detach().cpu().numpy().reshape(-1)[: self.current_max.shape[0]])
+        diag = self.thermal_diagnostics()
         for key, val in diag.items():
             if isinstance(val, np.ndarray):
                 tensor = torch.as_tensor(val, dtype=lower_raw.dtype, device=device)
@@ -753,6 +757,8 @@ class SafetyLayer:
                 out[key] = tensor
             else:
                 out[key] = torch.full((lower_raw.shape[0],), float(bool(val)), dtype=lower_raw.dtype, device=device)
+        out["thermal_headroom_observed"] = self.thermal_safe - temps
+        out["thermal_headroom"] = self.thermal_safe - temps
         if self.thermal_model == "coupled":
             out["thermal_coupling_term"] = thermal_source_term
             out["thermal_base_coupled"] = thermal_base
@@ -764,8 +770,6 @@ class SafetyLayer:
         currents: np.ndarray,
         temps: np.ndarray,
         amb_temp: float,
-        gamma: float,
-        delta: float,
     ) -> np.ndarray:
         currents = np.clip(np.asarray(currents, dtype=np.float32), 0.0, self.current_max)
         for _ in range(self._dalal_iters):
@@ -776,13 +780,14 @@ class SafetyLayer:
                 step = float(g_bus / (np.dot(grad_bus, grad_bus) + self._dalal_eps))
                 currents = np.clip(currents - step * grad_bus, 0.0, self.current_max)
 
-            base, _ = self._thermal_base_np(temps, amb_temp, gamma)
-            t_pred = base + delta * self.tx_thermal_coeff * (currents**2)
+            base, _ = self._thermal_base_np(temps, amb_temp)
+            effective_gain = self._safe_thermal_coeff_np()
+            t_pred = base + effective_gain * (currents**2)
             for idx in range(currents.shape[0]):
                 g_temp = float(t_pred[idx] - self.thermal_safe)
                 if g_temp <= 0.0:
                     continue
-                grad_i = float(2.0 * delta * self.tx_thermal_coeff[idx] * currents[idx])
+                grad_i = float(2.0 * effective_gain[idx] * currents[idx])
                 step = float(g_temp / (grad_i * grad_i + self._dalal_eps))
                 currents[idx] = float(np.clip(currents[idx] - step * grad_i, 0.0, self.current_max[idx]))
         return currents.astype(np.float32)
@@ -793,11 +798,9 @@ class SafetyLayer:
         currents: torch.Tensor,
         temps: torch.Tensor,
         amb_temp: torch.Tensor,
-        gamma: torch.Tensor,
-        delta: torch.Tensor,
     ) -> torch.Tensor:
         current_max = torch.as_tensor(self.current_max, dtype=currents.dtype, device=currents.device).view(1, -1)
-        thermal_coeff = torch.as_tensor(self.tx_thermal_coeff, dtype=currents.dtype, device=currents.device).view(1, -1)
+        effective_gain = self._safe_thermal_coeff_torch(dtype=currents.dtype, device=currents.device)
         currents = torch.minimum(torch.clamp(currents, min=0.0), current_max)
         eps = torch.as_tensor(self._dalal_eps, dtype=currents.dtype, device=currents.device)
         for _ in range(self._dalal_iters):
@@ -807,10 +810,10 @@ class SafetyLayer:
             step_bus = g_bus / (grad_bus.square().sum(dim=1, keepdim=True) + eps)
             currents = torch.minimum(torch.clamp(currents - step_bus * grad_bus, min=0.0), current_max)
 
-            base, _ = self._thermal_base_torch(temps, amb_temp, gamma)
-            t_pred = base + delta * thermal_coeff * (currents**2)
+            base, _ = self._thermal_base_torch(temps, amb_temp)
+            t_pred = base + effective_gain * (currents**2)
             g_temp = torch.clamp(t_pred - self.thermal_safe, min=0.0)
-            grad_temp = 2.0 * delta * thermal_coeff * currents
+            grad_temp = 2.0 * effective_gain * currents
             step_temp = g_temp / (grad_temp.square() + eps)
             currents = torch.minimum(torch.clamp(currents - step_temp * grad_temp, min=0.0), current_max)
         return currents

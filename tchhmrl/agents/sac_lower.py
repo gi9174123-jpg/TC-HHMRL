@@ -318,13 +318,11 @@ class LowerSAC:
         next_temps = torch.tensor(batch["next_temps"], dtype=torch.float32, device=self.device)
 
         amb = torch.tensor(batch["amb_temp"], dtype=torch.float32, device=self.device)
-        gamma_env = torch.tensor(batch["gamma_env"], dtype=torch.float32, device=self.device)
-        delta_env = torch.tensor(batch["delta_env"], dtype=torch.float32, device=self.device)
         alpha_t = self._alpha_tensor(dtype=obs.dtype)
 
         with torch.no_grad():
             raw_next, logp_next = self.actor.sample(next_obs_aug_actor, z_next)
-            safe_next = self.safety.project_torch(raw_next, boost_next, mode_next, next_temps, amb, gamma_env, delta_env)
+            safe_next = self.safety.project_torch(raw_next, boost_next, mode_next, next_temps, amb)
             a_next = torch.cat(
                 [safe_next["currents_exec"], safe_next["rho_exec"], safe_next["tau_exec"]], dim=1
             )
@@ -359,7 +357,7 @@ class LowerSAC:
         self.critic_optim.step()
 
         raw_pi, logp = self.actor.sample(obs_aug_actor, z)
-        safe_pi = self.safety.project_torch(raw_pi, boost, mode, temps, amb, gamma_env, delta_env)
+        safe_pi = self.safety.project_torch(raw_pi, boost, mode, temps, amb)
         a_pi = torch.cat([safe_pi["currents_exec"], safe_pi["rho_exec"], safe_pi["tau_exec"]], dim=1)
         obs_aug_q1_pi = self._augment_torch(obs, boost, mode, physical, self.q1_phys)
         obs_aug_q2_pi = self._augment_torch(obs, boost, mode, physical, self.q2_phys)

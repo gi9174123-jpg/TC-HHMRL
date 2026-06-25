@@ -217,14 +217,16 @@ def test_agent_mutable_snapshot_restores_thermal_estimator_state():
         temps_before=np.array([30.0, 30.0, 30.0], dtype=np.float32),
         temps_after=np.array([35.0, 36.0, 37.0], dtype=np.float32),
         thermal_base=np.array([30.0, 30.0, 30.0], dtype=np.float32),
-        delta=4.0,
     )
     assert np.any(agent.safety.thermal_diagnostics()["thermal_gain_valid_count"] > 0.0)
 
     agent.restore_mutable_state(snap)
     restored = agent.safety.thermal_diagnostics()
     assert np.allclose(restored["thermal_gain_valid_count"], 0.0)
-    assert np.allclose(restored["thermal_gain_mean"], 1.0)
+    assert np.allclose(
+        restored["thermal_gain_mean"],
+        np.asarray(cfg["safety"]["effective_gain_initial"], dtype=np.float32),
+    )
 
 
 def test_support_gate_accept_keeps_adapted_parameters_without_extra_budget(tmp_path):

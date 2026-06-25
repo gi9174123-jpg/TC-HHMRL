@@ -76,6 +76,9 @@ env:
 
 safety:
   projection_mode: thermal_cap
+  thermal_parameter_source: nominal_plus_online_effective_gain
+  gamma_nominal: 0.070
+  effective_gain_initial: [5.6, 8.3, 8.3]
   action_decode_mode: tanh_affine
   min_dwell_steps: 2
   soft_alpha: 0.22
@@ -96,9 +99,9 @@ adaptive_thermal:
   innovation_clip: 3.0
   uncertainty_beta_min: 0.5
   uncertainty_beta_max: 1.5
-  min_gain: 0.5
-  max_gain: 2.0
-  initial_mean: 1.0
+  min_gain: 1.0
+  max_gain: 16.0
+  initial_effective_gain: [5.6, 8.3, 8.3]
   initial_std: 0.0
 
 physical_context:

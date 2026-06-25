@@ -41,7 +41,7 @@ def test_default_safety_uses_corrected_action_mapping_and_main_projection():
     assert float(cfg["adaptive_thermal"]["uncertainty_beta_min"]) <= float(
         cfg["adaptive_thermal"]["uncertainty_beta_max"]
     )
-    assert float(cfg["adaptive_thermal"]["initial_mean"]) == 1.0
+    assert np.allclose(cfg["adaptive_thermal"]["initial_effective_gain"], cfg["safety"]["effective_gain_initial"])
     assert cfg["physical_context"]["enabled"] is True
     assert int(cfg["physical_context"]["input_dim"]) == 18
     assert int(cfg["physical_context"]["embedding_dim"]) == 32
@@ -78,6 +78,10 @@ def test_formal_metadata_reports_model_aware_lower_components():
     meta = formal_metadata_snapshot(cfg)
 
     assert meta["adaptive_thermal_enabled"] is True
+    assert meta["adaptive_thermal_estimator"] == "ema_effective_gain"
+    assert meta["thermal_parameter_source"] == "nominal_plus_online_effective_gain"
+    assert meta["controller_uses_task_gamma_delta"] is False
+    assert np.allclose(meta["effective_gain_initial"], cfg["safety"]["effective_gain_initial"])
     assert meta["physical_context_enabled"] is True
     assert meta["constraint_critics_enabled"] is True
     assert meta["constraint_critic_dim"] == 4

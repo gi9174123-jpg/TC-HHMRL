@@ -206,7 +206,7 @@ def test_safety_smooth_relaxed_keeps_smooth_unchanged_and_relaxes_cool_margin():
     cfg_relaxed["safety"]["projection_mode"] = "smooth_relaxed"
     cfg_relaxed["safety"]["smooth_relaxed_margin_c"] = 1.0
 
-    lower_raw = np.array([0.4, 0.4, 0.4, 0.0, 0.0], dtype=np.float32)
+    lower_raw = np.array([-0.8, -0.8, -0.8, 0.0, 0.0], dtype=np.float32)
     temps = np.array([28.0, 28.0, 28.0], dtype=np.float32)
     kwargs = {
         "upper_raw": 11,
@@ -404,10 +404,12 @@ def test_adaptive_thermal_estimator_updates_only_with_valid_excitation():
     cfg = copy.deepcopy(load_cfg("configs/default.yaml"))
     cfg["adaptive_thermal"]["enabled"] = True
     cfg["adaptive_thermal"]["initial_std"] = 0.0
+    cfg["safety"]["effective_gain_initial"] = [4.0, 4.0, 4.0]
+    cfg["adaptive_thermal"]["initial_effective_gain"] = [4.0, 4.0, 4.0]
     safety = SafetyLayer(cfg)
 
     before = safety.thermal_diagnostics()
-    assert np.allclose(before["thermal_gain_mean"], 1.0)
+    assert np.allclose(before["effective_gain_mean"], 4.0)
     assert np.allclose(before["thermal_gain_valid_count"], 0.0)
 
     temps_before = np.array([30.0, 30.0, 30.0], dtype=np.float32)
@@ -421,15 +423,14 @@ def test_adaptive_thermal_estimator_updates_only_with_valid_excitation():
         temps_before=temps_before,
         temps_after=temps_after,
         thermal_base=thermal_base,
-        delta=4.0,
     )
 
     assert diag["adaptive_thermal_enabled"] is True
     assert float(diag["thermal_gain_valid_count"][0]) == 1.0
     assert float(diag["thermal_gain_valid_count"][1]) == 0.0
     assert float(diag["thermal_gain_valid_count"][2]) == 1.0
-    assert float(diag["thermal_gain_mean"][0]) > 1.0
-    assert float(diag["thermal_gain_mean"][2]) < 1.0
+    assert float(diag["effective_gain_mean"][0]) > 4.0
+    assert float(diag["effective_gain_mean"][2]) > 4.0
 
 
 def test_uncertainty_aware_thermal_cap_tightens_current_limit():
@@ -443,7 +444,7 @@ def test_uncertainty_aware_thermal_cap_tightens_current_limit():
     adaptive.load_state_dict(
         {
             "thermal_estimator": {
-                "gain_mean": np.array([1.5, 1.5, 1.5], dtype=np.float32),
+                "gain_mean": np.array([9.0, 12.0, 12.0], dtype=np.float32),
                 "gain_var": np.zeros(3, dtype=np.float32),
                 "valid_count": np.array([10, 10, 10], dtype=np.int64),
                 "temperature_slope": np.zeros(3, dtype=np.float32),
@@ -466,7 +467,7 @@ def test_uncertainty_aware_thermal_cap_tightens_current_limit():
 
     assert np.all(out_adaptive["thermal_cap_current"] <= out_nominal["thermal_cap_current"] + 1e-7)
     assert float(np.sum(out_adaptive["currents_exec"])) < float(np.sum(out_nominal["currents_exec"]))
-    assert np.allclose(out_adaptive["thermal_gain_safe_scale"], 1.5, atol=1e-6)
+    assert np.allclose(out_adaptive["effective_gain_safe"], np.array([9.0, 12.0, 12.0]), atol=1e-6)
 
 
 def test_safety_state_dict_restores_adaptive_thermal_estimator():
@@ -480,14 +481,13 @@ def test_safety_state_dict_restores_adaptive_thermal_estimator():
         temps_before=np.array([30.0, 30.0, 30.0], dtype=np.float32),
         temps_after=np.array([35.0, 36.0, 37.0], dtype=np.float32),
         thermal_base=np.array([30.0, 30.0, 30.0], dtype=np.float32),
-        delta=4.0,
     )
     assert np.any(safety.thermal_diagnostics()["thermal_gain_valid_count"] > 0.0)
 
     safety.load_state_dict(state)
     restored = safety.thermal_diagnostics()
     assert np.allclose(restored["thermal_gain_valid_count"], 0.0)
-    assert np.allclose(restored["thermal_gain_mean"], 1.0)
+    assert np.allclose(restored["thermal_gain_mean"], np.asarray(cfg["safety"]["effective_gain_initial"], dtype=np.float32))
 
 
 def test_safety_raw_to_exec_map_matches_preview():
