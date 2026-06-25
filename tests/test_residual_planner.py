@@ -11,6 +11,26 @@ from tchhmrl.planning.residual_basis import residual_basis
 from tchhmrl.utils.config import load_cfg
 
 
+def _assert_same_nested(a, b):
+    if torch.is_tensor(a):
+        if torch.is_floating_point(a):
+            assert torch.allclose(a.cpu(), b.cpu(), equal_nan=True)
+        else:
+            assert torch.equal(a.cpu(), b.cpu())
+    elif isinstance(a, np.ndarray):
+        assert np.array_equal(a, b, equal_nan=True)
+    elif isinstance(a, dict):
+        assert set(a.keys()) == set(b.keys())
+        for key in a:
+            _assert_same_nested(a[key], b[key])
+    elif isinstance(a, (list, tuple)):
+        assert len(a) == len(b)
+        for av, bv in zip(a, b):
+            _assert_same_nested(av, bv)
+    else:
+        assert a == b
+
+
 def _cfg() -> dict:
     cfg = copy.deepcopy(load_cfg("configs/default.yaml"))
     cfg["agent"]["hidden_dim"] = 64
@@ -63,6 +83,12 @@ def test_agent_act_uses_residual_planner_after_start_iter():
     assert "residual_planner_thermal_risk" in aux
     assert "residual_planner_score_improvement" in aux
     assert np.asarray(aux["act_policy_raw"], dtype=np.float32).shape == (5,)
+    assert np.asarray(aux["policy_action_raw"], dtype=np.float32).shape == (5,)
+    assert np.asarray(aux["planner_action_raw"], dtype=np.float32).shape == (5,)
+    assert np.asarray(aux["executed_action"], dtype=np.float32).shape == (5,)
+    assert np.allclose(np.asarray(aux["act_refined_raw"], dtype=np.float32), np.asarray(aux["planner_action_raw"], dtype=np.float32))
+    assert np.allclose(np.asarray(aux["act_exec"], dtype=np.float32), np.asarray(aux["executed_action"], dtype=np.float32))
+    assert isinstance(aux["planner_selected"], bool)
     assert np.asarray(action["currents_exec"], dtype=np.float32).shape == (3,)
 
 
@@ -94,6 +120,116 @@ def test_residual_planner_scores_with_target_critics_not_online_critics():
 
     assert aux["residual_planner_enabled"] is True
     assert "residual_planner_best_score_improvement" in aux
+
+
+def test_residual_planner_trust_region_rejects_non_policy_candidates():
+    cfg = _cfg()
+    cfg["residual_planner"]["trust_region_enabled"] = True
+    cfg["residual_planner"]["trust_region_raw_l2"] = 0.0
+    cfg["residual_planner"]["trust_region_exec_l2"] = 0.0
+    agent = HierarchicalAgent(cfg, torch.device("cpu"))
+    agent.set_meta_iter(1)
+
+    obs = np.zeros(int(cfg["agent"]["obs_dim"]), dtype=np.float32)
+    z = np.zeros(int(cfg["agent"]["z_dim"]), dtype=np.float32)
+    temps = np.asarray([28.0, 28.0, 28.0], dtype=np.float32)
+
+    _, aux = agent.act(
+        obs=obs,
+        temps=temps,
+        amb_temp=float(cfg["env"]["amb_temp"]),
+        gamma=float(cfg["env"]["gamma"]),
+        delta=float(cfg["env"]["delta"]),
+        z=z,
+        eval_mode=True,
+    )
+
+    assert int(aux["residual_planner_selected_idx"]) == 0
+    assert int(aux["residual_planner_trust_region_rejected_count"]) > 0
+    assert int(aux["residual_planner_valid_candidate_count"]) == 1
+
+
+def test_residual_planner_positive_margin_can_force_policy_fallback():
+    cfg = _cfg()
+    cfg["residual_planner"]["replacement_margin_mode"] = "absolute"
+    cfg["residual_planner"]["replacement_margin"] = 1.0e6
+    agent = HierarchicalAgent(cfg, torch.device("cpu"))
+    agent.set_meta_iter(1)
+
+    obs = np.zeros(int(cfg["agent"]["obs_dim"]), dtype=np.float32)
+    z = np.zeros(int(cfg["agent"]["z_dim"]), dtype=np.float32)
+    temps = np.asarray([28.0, 28.0, 28.0], dtype=np.float32)
+
+    _, aux = agent.act(
+        obs=obs,
+        temps=temps,
+        amb_temp=float(cfg["env"]["amb_temp"]),
+        gamma=float(cfg["env"]["gamma"]),
+        delta=float(cfg["env"]["delta"]),
+        z=z,
+        eval_mode=True,
+    )
+
+    assert int(aux["residual_planner_selected_idx"]) == 0
+    assert float(aux["residual_planner_replacement_margin"]) > 0.0
+    assert float(aux["residual_planner_fallback_rate"]) == 1.0
+
+
+def test_residual_planner_h2_veto_is_reported_near_thermal_boundary():
+    cfg = _cfg()
+    cfg["safety"]["thermal_safe"] = 29.0
+    cfg["residual_planner"]["h2_veto_enabled"] = True
+    agent = HierarchicalAgent(cfg, torch.device("cpu"))
+    agent.set_meta_iter(1)
+
+    obs = np.zeros(int(cfg["agent"]["obs_dim"]), dtype=np.float32)
+    z = np.zeros(int(cfg["agent"]["z_dim"]), dtype=np.float32)
+    temps = np.asarray([28.8, 28.8, 28.8], dtype=np.float32)
+
+    _, aux = agent.act(
+        obs=obs,
+        temps=temps,
+        amb_temp=28.0,
+        gamma=float(cfg["env"]["gamma"]),
+        delta=float(cfg["env"]["delta"]),
+        z=z,
+        eval_mode=True,
+    )
+
+    assert "residual_planner_h2_veto_rate" in aux
+    assert float(aux["residual_planner_h2_max_temperature"]) >= 0.0
+    assert int(aux["residual_planner_selected_idx"]) >= 0
+
+
+def test_residual_planner_preview_has_no_mutable_side_effects():
+    cfg = _cfg()
+    agent = HierarchicalAgent(cfg, torch.device("cpu"))
+    agent.set_meta_iter(1)
+    obs = np.zeros(int(cfg["agent"]["obs_dim"]), dtype=np.float32)
+    z = np.zeros(int(cfg["agent"]["z_dim"]), dtype=np.float32)
+    temps = np.asarray([28.0, 28.0, 28.0], dtype=np.float32)
+    physical = agent.current_physical_features(temps=temps)
+    policy_raw = np.zeros(5, dtype=np.float32)
+    before = copy.deepcopy(agent.snapshot_mutable_state())
+
+    _candidate, _diag = agent.residual_planner.plan(
+        lower=agent.lower,
+        safety=agent.safety,
+        obs=obs,
+        z=z,
+        upper_idx_exec=11,
+        boost_combo=3,
+        mode=2,
+        policy_raw=policy_raw,
+        physical_features=physical,
+        thermal_headroom=(float(agent.safety.thermal_safe) - temps),
+        temps=temps,
+        amb_temp=float(cfg["env"]["amb_temp"]),
+        meta_iter=1,
+    )
+
+    after = agent.snapshot_mutable_state()
+    _assert_same_nested(before, after)
 
 
 def test_agent_checkpoint_preserves_planner_stage_and_safety_state(tmp_path):

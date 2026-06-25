@@ -93,7 +93,16 @@ def test_formal_metadata_reports_model_aware_lower_components():
     assert meta["residual_planner_thermal_horizon"] == 2
     assert meta["residual_planner_start_meta_iter"] == 60
     assert meta["residual_planner_thermal_horizon_start_meta_iter"] == 86
-    assert meta["residual_planner_scoring"] == "target_critics_plus_constraint_and_thermal_risk"
+    assert meta["transition_schema_version"] == "transition_schema_v2_fail_fast"
+    assert meta["reward_schema_version"] == "raw_reward_plus_constraint_cost_vec_v1"
+    assert meta["action_contract_version"] == "policy_planner_executed_action_v1"
+    assert meta["residual_planner_scoring"] == "target_critics_plus_constraint_incremental_h2_risk"
+    assert meta["residual_planner_trust_region_enabled"] is True
+    assert meta["residual_planner_replacement_margin_mode"] == "normalized"
+    assert meta["residual_planner_replacement_margin"] is None
+    assert meta["residual_planner_normalized_margin_factor"] == 0.25
+    assert meta["residual_planner_constraint_non_degradation"] is True
+    assert meta["residual_planner_h2_veto_enabled"] is True
     assert meta["residual_planner_uses_env_reward_model"] is False
     assert meta["upper_double_dqn"] is True
     assert meta["upper_dueling_dqn"] is True

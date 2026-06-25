@@ -4,6 +4,7 @@ import copy
 import types
 
 import numpy as np
+import pytest
 import torch
 
 from tchhmrl.agents.sac_lower import LowerSAC
@@ -60,6 +61,7 @@ def _dummy_lower_batch(cfg: dict, batch_size: int = 4) -> dict:
         "z": np.random.randn(batch_size, z_dim).astype(np.float32),
         "act_exec": np.random.randn(batch_size, 5).astype(np.float32),
         "reward": np.random.randn(batch_size).astype(np.float32),
+        "reward_raw": np.random.randn(batch_size).astype(np.float32),
         "next_obs": np.random.randn(batch_size, obs_dim).astype(np.float32),
         "z_next": np.random.randn(batch_size, z_dim).astype(np.float32),
         "done": np.zeros(batch_size, dtype=np.float32),
@@ -113,6 +115,23 @@ def test_lower_reward_critic_uses_raw_reward_when_constraint_critics_are_enabled
     assert np.isclose(float(stats["reward_target_mean"]), 2.0)
 
 
+def test_lower_sac_strict_schema_rejects_missing_raw_reward_and_cost_vec():
+    cfg = _small_cfg()
+    safety = SafetyLayer(cfg)
+    sac = LowerSAC(cfg, safety, torch.device("cpu"))
+    batch = _dummy_lower_batch(cfg)
+
+    missing_raw = dict(batch)
+    missing_raw.pop("reward_raw")
+    with pytest.raises(KeyError, match="reward_raw"):
+        sac.update(missing_raw)
+
+    missing_cost = dict(batch)
+    missing_cost.pop("cost_vec")
+    with pytest.raises(KeyError, match="cost_vec"):
+        sac.update(missing_cost)
+
+
 def test_lower_update_uses_next_macro_for_target_projection():
     cfg = _small_cfg()
     safety = SafetyLayer(cfg)
@@ -130,12 +149,14 @@ def test_lower_update_uses_next_macro_for_target_projection():
     obs_dim = int(cfg["agent"]["obs_dim"])
     z_dim = int(cfg["agent"]["z_dim"])
     n_tx = int(cfg["env"]["n_tx"])
+    physical_dim = int(cfg["physical_context"]["input_dim"])
 
     batch = {
         "obs": np.random.randn(b, obs_dim).astype(np.float32),
         "z": np.random.randn(b, z_dim).astype(np.float32),
         "act_exec": np.random.randn(b, 5).astype(np.float32),
         "reward": np.random.randn(b).astype(np.float32),
+        "reward_raw": np.random.randn(b).astype(np.float32),
         "next_obs": np.random.randn(b, obs_dim).astype(np.float32),
         "z_next": np.random.randn(b, z_dim).astype(np.float32),
         "done": np.zeros(b, dtype=np.float32),
@@ -143,6 +164,9 @@ def test_lower_update_uses_next_macro_for_target_projection():
         "mode_exec": np.zeros(b, dtype=np.float32),
         "boost_combo_exec_next": np.full(b, 3, dtype=np.float32),
         "mode_exec_next": np.full(b, 2, dtype=np.float32),
+        "cost_vec": np.abs(np.random.randn(b, 4).astype(np.float32)) * 0.01,
+        "physical_features": np.random.randn(b, physical_dim).astype(np.float32),
+        "physical_features_next": np.random.randn(b, physical_dim).astype(np.float32),
         "temps": np.full((b, n_tx), 25.0, dtype=np.float32),
         "next_temps": np.full((b, n_tx), 25.0, dtype=np.float32),
         "amb_temp": np.full(b, 25.0, dtype=np.float32),

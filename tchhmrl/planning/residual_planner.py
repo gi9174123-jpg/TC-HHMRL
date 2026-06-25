@@ -28,11 +28,27 @@ class ResidualPlanner:
         self.projection_penalty = float(planner_cfg.get("projection_penalty", 0.10))
         self.constraint_beta = float(planner_cfg.get("constraint_beta", 1.0))
         self.thermal_risk_beta = float(planner_cfg.get("thermal_risk_beta", 0.05))
+        self.h2_increment_beta = float(planner_cfg.get("h2_increment_beta", self.thermal_risk_beta))
         self.thermal_margin_target_c = float(planner_cfg.get("thermal_margin_target_c", 1.0))
         self.thermal_horizon = int(planner_cfg.get("thermal_horizon", 2))
         self.start_meta_iter = int(planner_cfg.get("start_meta_iter", 60))
         self.thermal_horizon_start_meta_iter = int(planner_cfg.get("thermal_horizon_start_meta_iter", 86))
-        self.replacement_margin = float(planner_cfg.get("replacement_margin", 0.0))
+        self.trust_region_enabled = bool(planner_cfg.get("trust_region_enabled", False))
+        self.trust_region_mode = str(planner_cfg.get("trust_region_mode", "raw_and_executed"))
+        self.trust_region_raw_l2 = planner_cfg.get("trust_region_raw_l2", None)
+        self.trust_region_exec_l2 = planner_cfg.get("trust_region_exec_l2", None)
+        self.trust_region_raw_l2 = None if self.trust_region_raw_l2 is None else float(self.trust_region_raw_l2)
+        self.trust_region_exec_l2 = None if self.trust_region_exec_l2 is None else float(self.trust_region_exec_l2)
+        self.replacement_margin_mode = str(planner_cfg.get("replacement_margin_mode", "normalized"))
+        margin_cfg = planner_cfg.get("replacement_margin", None)
+        self.replacement_margin = None if margin_cfg is None else float(margin_cfg)
+        factor_cfg = planner_cfg.get("normalized_margin_factor", 0.25)
+        self.normalized_margin_factor = None if factor_cfg is None else float(factor_cfg)
+        self.constraint_tolerance = float(planner_cfg.get("constraint_tolerance", 0.0))
+        projection_limit = planner_cfg.get("projection_residual_limit", None)
+        self.projection_residual_limit = None if projection_limit is None else float(projection_limit)
+        self.h2_veto_enabled = bool(planner_cfg.get("h2_veto_enabled", True))
+        self.h2_margin = float(planner_cfg.get("h2_margin", 0.0))
         self.device = device
 
     def active(self, *, meta_iter: int) -> bool:
@@ -68,18 +84,21 @@ class ResidualPlanner:
         residual_normed = torch.cat([residual_current, residual[:, 3:]], dim=1)
         return torch.linalg.vector_norm(residual_normed, dim=1, keepdim=True)
 
-    def _thermal_risk(
+    def _thermal_risk_terms(
         self,
         *,
         safe: Dict[str, torch.Tensor],
         safety,
         amb_temp: torch.Tensor,
         thermal_horizon: int,
-    ) -> torch.Tensor:
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
         margin1 = safe["thermal_margin"]
         risk1 = torch.relu(self.thermal_margin_target_c - margin1).mean(dim=1, keepdim=True)
         if int(thermal_horizon) < 2:
-            return risk1
+            zeros = torch.zeros_like(risk1)
+            max_t1 = safe["t_pred"].max(dim=1, keepdim=True).values
+            veto = torch.zeros_like(risk1, dtype=torch.bool)
+            return risk1, zeros, zeros, max_t1, veto
 
         temps2_in = safe["t_pred"]
         base2, _ = safety._thermal_base_torch(temps2_in, amb_temp)
@@ -88,7 +107,25 @@ class ResidualPlanner:
         t2 = base2 + effective_gain * (currents**2)
         margin2 = safety.thermal_safe - t2
         risk2 = torch.relu(self.thermal_margin_target_c - margin2).mean(dim=1, keepdim=True)
-        return risk1 + 0.5 * risk2
+        incremental = torch.relu(risk2 - risk1)
+        max_t2 = t2.max(dim=1, keepdim=True).values
+        veto = max_t2 > float(safety.thermal_safe - self.h2_margin)
+        return risk1, risk2, incremental, max_t2, veto
+
+    def _replacement_margin(self, valid_scores: torch.Tensor) -> float:
+        finite = valid_scores[torch.isfinite(valid_scores)]
+        if self.replacement_margin_mode == "absolute":
+            return float(self.replacement_margin if self.replacement_margin is not None else 1.0e-6)
+        factor = float(self.normalized_margin_factor if self.normalized_margin_factor is not None else 0.25)
+        if finite.numel() <= 1:
+            normalized = 0.0
+        else:
+            normalized = float(torch.std(finite.detach(), unbiased=False).cpu().item()) * factor
+        if self.replacement_margin_mode == "absolute_or_normalized" and self.replacement_margin is not None:
+            return max(float(self.replacement_margin), normalized)
+        if self.replacement_margin is not None and self.replacement_margin_mode == "normalized":
+            return max(float(self.replacement_margin), normalized)
+        return max(1.0e-6, normalized)
 
     def plan(
         self,
@@ -142,10 +179,18 @@ class ResidualPlanner:
             reward_value = torch.minimum(q1, q2)
             disagreement = torch.abs(q1 - q2)
             projection_residual = self._projection_residual_norm(lower_raw=candidates, safe=safe, safety=safety)
+            raw_distance = torch.linalg.vector_norm(candidates - candidates[0:1], dim=1, keepdim=True)
+            current_max = torch.as_tensor(safety.current_max, dtype=executed.dtype, device=executed.device).view(1, -1)
+            exec_delta = executed - executed[0:1]
+            exec_delta_normed = torch.cat(
+                [exec_delta[:, :3] / torch.clamp(current_max, min=1.0e-6), exec_delta[:, 3:]],
+                dim=1,
+            )
+            exec_distance = torch.linalg.vector_norm(exec_delta_normed, dim=1, keepdim=True)
             effective_thermal_horizon = (
                 self.thermal_horizon if int(meta_iter) >= self.thermal_horizon_start_meta_iter else 1
             )
-            thermal_risk = self._thermal_risk(
+            h1_risk, h2_risk, incremental_h2_risk, h2_max_temperature, h2_veto = self._thermal_risk_terms(
                 safe=safe,
                 safety=safety,
                 amb_temp=amb_t.view(-1, 1),
@@ -159,17 +204,43 @@ class ResidualPlanner:
                     constraint_val = torch.relu(constraint_val)
                 constraint_penalty = (constraint_val * lower.constraint_actor_weights).sum(dim=1, keepdim=True)
 
+            trust_valid = torch.ones_like(reward_value, dtype=torch.bool)
+            if self.trust_region_enabled:
+                if self.trust_region_raw_l2 is not None and self.trust_region_mode in {"raw", "raw_and_executed"}:
+                    trust_valid = trust_valid & (raw_distance <= float(self.trust_region_raw_l2))
+                if self.trust_region_exec_l2 is not None and self.trust_region_mode in {"executed", "raw_and_executed"}:
+                    trust_valid = trust_valid & (exec_distance <= float(self.trust_region_exec_l2))
+            constraint_valid = constraint_penalty <= (constraint_penalty[0:1] + float(self.constraint_tolerance))
+            projection_valid = torch.ones_like(reward_value, dtype=torch.bool)
+            if self.projection_residual_limit is not None:
+                projection_valid = projection_residual <= float(self.projection_residual_limit)
+            h2_valid = torch.ones_like(reward_value, dtype=torch.bool)
+            if self.h2_veto_enabled and int(effective_thermal_horizon) >= 2:
+                h2_valid = ~h2_veto
+            valid = trust_valid & constraint_valid & projection_valid & h2_valid
+            valid[0] = True
+
             score = (
                 reward_value
                 - self.constraint_beta * constraint_penalty
                 - self.disagreement_beta * disagreement
                 - self.projection_penalty * projection_residual
-                - self.thermal_risk_beta * thermal_risk
+                - self.h2_increment_beta * incremental_h2_risk
             )
-            best_idx = int(torch.argmax(score.view(-1)).item())
+            valid_score = torch.where(valid, score, torch.full_like(score, -torch.inf))
+            margin = self._replacement_margin(valid_score.view(-1))
+            best_idx = int(torch.argmax(valid_score.view(-1)).item())
             best_improvement = float((score[best_idx] - score[0]).detach().cpu().item())
-            selected_idx = best_idx if best_improvement >= self.replacement_margin else 0
+            selected_idx = best_idx if best_idx != 0 and best_improvement >= margin else 0
             score_improvement = float((score[selected_idx] - score[0]).detach().cpu().item())
+            margin_rejected = bool(best_idx != 0 and best_improvement < margin)
+            trust_rejected = (
+                self.trust_region_enabled
+                and (
+                    ((self.trust_region_raw_l2 is not None) and bool((raw_distance[1:] > self.trust_region_raw_l2).any().item()))
+                    or ((self.trust_region_exec_l2 is not None) and bool((exec_distance[1:] > self.trust_region_exec_l2).any().item()))
+                )
+            )
 
         latency_ms = float((time.perf_counter() - start) * 1000.0)
         diagnostics = {
@@ -182,16 +253,42 @@ class ResidualPlanner:
             "residual_planner_score_improvement": score_improvement,
             "residual_planner_best_idx": best_idx,
             "residual_planner_best_score_improvement": best_improvement,
-            "residual_planner_replacement_margin": float(self.replacement_margin),
+            "residual_planner_replacement_margin": float(margin),
+            "residual_planner_replacement_margin_mode": self.replacement_margin_mode,
             "residual_planner_replaced_policy": bool(selected_idx != 0),
             "residual_planner_fallback_to_policy": bool(selected_idx == 0),
             "residual_planner_candidate_distance": float(
                 np.linalg.norm(candidates_np[selected_idx].astype(np.float32) - np.asarray(policy_raw, dtype=np.float32))
             ),
+            "residual_planner_candidate_raw_distance": float(raw_distance[selected_idx].detach().cpu().item()),
+            "residual_planner_candidate_exec_distance": float(exec_distance[selected_idx].detach().cpu().item()),
+            "residual_planner_trust_region_rejected_count": int((~trust_valid[1:]).sum().detach().cpu().item())
+            if self.trust_region_enabled
+            else 0,
+            "residual_planner_valid_candidate_count": int(valid.sum().detach().cpu().item()),
+            "residual_planner_max_valid_distance": float(
+                torch.where(valid, raw_distance, torch.zeros_like(raw_distance)).max().detach().cpu().item()
+            ),
+            "residual_planner_margin_rejection_rate": float(margin_rejected),
+            "residual_planner_constraint_rejection_rate": float((~constraint_valid[1:]).float().mean().detach().cpu().item())
+            if k > 1
+            else 0.0,
+            "residual_planner_projection_rejection_rate": float((~projection_valid[1:]).float().mean().detach().cpu().item())
+            if self.projection_residual_limit is not None and k > 1
+            else 0.0,
+            "residual_planner_h2_veto_rate": float(h2_veto[1:].float().mean().detach().cpu().item()) if k > 1 else 0.0,
+            "residual_planner_fallback_rate": float(selected_idx == 0),
+            "residual_planner_replacement_rate": float(selected_idx != 0),
             "residual_planner_reward_value": float(reward_value[selected_idx].detach().cpu().item()),
             "residual_planner_constraint_penalty": float(constraint_penalty[selected_idx].detach().cpu().item()),
             "residual_planner_disagreement": float(disagreement[selected_idx].detach().cpu().item()),
             "residual_planner_projection_residual": float(projection_residual[selected_idx].detach().cpu().item()),
-            "residual_planner_thermal_risk": float(thermal_risk[selected_idx].detach().cpu().item()),
+            "residual_planner_thermal_risk": float(h1_risk[selected_idx].detach().cpu().item()),
+            "residual_planner_h1_thermal_risk": float(h1_risk[selected_idx].detach().cpu().item()),
+            "residual_planner_h2_thermal_risk": float(h2_risk[selected_idx].detach().cpu().item()),
+            "residual_planner_incremental_h2_risk": float(incremental_h2_risk[selected_idx].detach().cpu().item()),
+            "residual_planner_h2_max_temperature": float(h2_max_temperature[selected_idx].detach().cpu().item()),
+            "residual_planner_h2_veto": bool(h2_veto[selected_idx].detach().cpu().item()),
+            "residual_planner_trust_region_rejected": bool(trust_rejected),
         }
         return candidates_np[selected_idx].astype(np.float32), diagnostics

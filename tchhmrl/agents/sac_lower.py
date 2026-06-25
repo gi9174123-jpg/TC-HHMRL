@@ -11,6 +11,7 @@ from tchhmrl.models.networks import ContinuousQNetwork, GaussianTanhPolicy
 from tchhmrl.models.constraint_critics import ConstraintQNetwork
 from tchhmrl.models.physical_encoder import PhysicalEncoder
 from tchhmrl.safety.safety_layer import SafetyLayer
+from tchhmrl.agents.transition_schema import require_transition_keys, validate_executed_action_shape
 
 
 class LowerSAC:
@@ -255,24 +256,21 @@ class LowerSAC:
         return torch.tensor(alpha_val, dtype=dtype, device=self.device)
 
     def update(self, batch: Dict[str, np.ndarray]) -> Dict[str, float]:
+        if self.constraint_critics_enabled:
+            require_transition_keys(batch)
         obs = torch.tensor(batch["obs"], dtype=torch.float32, device=self.device)
         batch_size = int(obs.shape[0])
         z = torch.tensor(batch["z"], dtype=torch.float32, device=self.device)
+        validate_executed_action_shape(batch, batch_size=batch_size)
         act_exec = torch.tensor(batch["act_exec"], dtype=torch.float32, device=self.device)
-        reward_key = (
-            "reward_raw"
-            if self.constraint_critics_enabled and self.reward_target_mode == "raw_reward" and "reward_raw" in batch
-            else "reward"
-        )
+        reward_key = "reward_raw" if self.constraint_critics_enabled and self.reward_target_mode == "raw_reward" else "reward"
+        if reward_key not in batch:
+            raise KeyError(f"Missing {reward_key} required by lower reward critic schema")
         rew = torch.tensor(batch[reward_key], dtype=torch.float32, device=self.device).view(-1, 1)
         next_obs = torch.tensor(batch["next_obs"], dtype=torch.float32, device=self.device)
         z_next = torch.tensor(batch["z_next"], dtype=torch.float32, device=self.device)
         done = torch.tensor(batch["done"], dtype=torch.float32, device=self.device).view(-1, 1)
-        cost_vec = torch.tensor(
-            batch.get("cost_vec", np.zeros((batch_size, self.constraint_dim), dtype=np.float32)),
-            dtype=torch.float32,
-            device=self.device,
-        )
+        cost_vec = torch.tensor(batch["cost_vec"], dtype=torch.float32, device=self.device)
         if cost_vec.dim() == 1:
             cost_vec = cost_vec.view(-1, 1)
         if cost_vec.shape[1] != self.constraint_dim:

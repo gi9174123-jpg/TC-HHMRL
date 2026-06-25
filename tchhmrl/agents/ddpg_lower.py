@@ -8,6 +8,7 @@ import torch.nn.functional as F
 
 from tchhmrl.models.networks import ContinuousQNetwork, DeterministicTanhPolicy
 from tchhmrl.safety.safety_layer import SafetyLayer, raw_from_frac01
+from tchhmrl.agents.transition_schema import validate_executed_action_shape
 
 
 class LowerDDPG:
@@ -214,6 +215,7 @@ class LowerDDPG:
     def update(self, batch: Dict[str, np.ndarray]) -> Dict[str, float]:
         obs = torch.tensor(batch["obs"], dtype=torch.float32, device=self.device)
         z = torch.tensor(batch["z"], dtype=torch.float32, device=self.device)
+        validate_executed_action_shape(batch, batch_size=int(obs.shape[0]))
         act_exec = torch.tensor(batch["act_exec"], dtype=torch.float32, device=self.device)
         rew = torch.tensor(batch["reward"], dtype=torch.float32, device=self.device).view(-1, 1)
         next_obs = torch.tensor(batch["next_obs"], dtype=torch.float32, device=self.device)

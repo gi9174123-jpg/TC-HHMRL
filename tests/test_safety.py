@@ -490,6 +490,23 @@ def test_safety_state_dict_restores_adaptive_thermal_estimator():
     assert np.allclose(restored["thermal_gain_mean"], np.asarray(cfg["safety"]["effective_gain_initial"], dtype=np.float32))
 
 
+def test_thermal_diagnostics_has_no_side_effects():
+    cfg = copy.deepcopy(load_cfg("configs/default.yaml"))
+    safety = SafetyLayer(cfg)
+    safety.observe_temperature(np.asarray([41.0, 42.0, 43.0], dtype=np.float32))
+    before = copy.deepcopy(safety.state_dict())
+
+    _ = safety.thermal_diagnostics()
+    _ = safety.thermal_diagnostics()
+    after = safety.state_dict()
+
+    for key, value in before["thermal_estimator"].items():
+        if isinstance(value, np.ndarray):
+            assert np.array_equal(value, after["thermal_estimator"][key])
+        else:
+            assert value == after["thermal_estimator"][key]
+
+
 def test_safety_raw_to_exec_map_matches_preview():
     cfg = load_cfg("configs/default.yaml")
     safety = SafetyLayer(cfg)

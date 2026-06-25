@@ -542,7 +542,12 @@ class HierarchicalAgent:
             "mode_exec": int(safe["mode_exec"]),
             "act_exec": exec_vec,
             "act_raw": lower_raw.astype(np.float32),
+            "act_refined_raw": lower_raw.astype(np.float32),
             "act_policy_raw": policy_lower_raw.astype(np.float32),
+            "policy_action_raw": policy_lower_raw.astype(np.float32),
+            "planner_action_raw": lower_raw.astype(np.float32),
+            "executed_action": exec_vec.astype(np.float32),
+            "planner_selected": bool(planner_aux.get("residual_planner_replaced_policy", False)),
             "act_desired": desired_vec.astype(np.float32),
             "projection_residual": projection_residual_norm.astype(np.float32),
             "physical_features": physical_features.astype(np.float32),
@@ -620,6 +625,16 @@ class HierarchicalAgent:
         transition: Dict,
         next_macro_fn: Optional[Callable[[np.ndarray], Dict[str, float | int]]] = None,
     ) -> np.ndarray:
+        transition = dict(transition)
+        if "policy_action_raw" not in transition:
+            transition["policy_action_raw"] = transition.get("act_policy_raw", transition.get("act_raw"))
+        if "planner_action_raw" not in transition:
+            transition["planner_action_raw"] = transition.get("act_refined_raw", transition.get("act_raw"))
+        if "act_refined_raw" not in transition:
+            transition["act_refined_raw"] = transition["planner_action_raw"]
+        if "executed_action" not in transition:
+            transition["executed_action"] = transition.get("act_exec")
+        transition["planner_selected"] = bool(transition.get("planner_selected", False))
         task_params = self._task_params_from_transition(transition)
         self.episode.add(
             {
@@ -628,6 +643,7 @@ class HierarchicalAgent:
                 "boost_combo_exec": transition.get("boost_combo_exec", 0.0),
                 "mode_exec": transition.get("mode_exec", 0.0),
                 "act_exec": transition["act_exec"],
+                "executed_action": transition["executed_action"],
                 "reward": transition["reward"],
                 "reward_raw": transition.get("reward_raw", transition["reward"]),
                 "cost": transition.get("cost", 0.0),

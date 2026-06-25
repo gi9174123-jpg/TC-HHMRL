@@ -137,7 +137,18 @@ residual_planner:
   thermal_horizon: 2
   start_meta_iter: 60
   thermal_horizon_start_meta_iter: 86
-  replacement_margin: 0.0
+  trust_region_enabled: true
+  trust_region_mode: raw_and_executed
+  trust_region_raw_l2: null
+  trust_region_exec_l2: null
+  replacement_margin_mode: normalized
+  replacement_margin: null
+  normalized_margin_factor: 0.25
+  constraint_tolerance: 0.0
+  projection_residual_limit: null
+  h2_veto_enabled: true
+  h2_margin: 0.0
+  h2_increment_beta: 0.05
 
 agent:
   obs_dim: 20

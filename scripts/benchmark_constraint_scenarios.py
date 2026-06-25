@@ -21,6 +21,11 @@ import yaml
 from tchhmrl.agents.dqn_upper import UpperDQN
 from tchhmrl.agents.ddpg_lower import LowerDDPG
 from tchhmrl.agents.sac_lower import LowerSAC
+from tchhmrl.agents.transition_schema import (
+    ACTION_CONTRACT_VERSION,
+    REWARD_SCHEMA_VERSION,
+    TRANSITION_SCHEMA_VERSION,
+)
 from tchhmrl.baselines import (
     DeepRATAssignmentPowerBaseline,
     JavadiPPODimmingBaseline,
@@ -219,6 +224,9 @@ def formal_metadata_snapshot(cfg: Dict, *, pre_alignment: bool | None = None, ta
         "physical_context_input_dim": int(physical_cfg.get("input_dim", 0) or 0),
         "physical_context_embedding_dim": int(physical_cfg.get("embedding_dim", 0) or 0),
         "constraint_critics_enabled": bool(constraint_cfg.get("enabled", False)),
+        "transition_schema_version": TRANSITION_SCHEMA_VERSION,
+        "reward_schema_version": REWARD_SCHEMA_VERSION,
+        "action_contract_version": ACTION_CONTRACT_VERSION,
         "constraint_critic_dim": int(constraint_cfg.get("out_dim", 0) or 0),
         "constraint_reward_target": str(constraint_cfg.get("reward_target", "raw_reward")),
         "constraint_actor_weights": list(constraint_cfg.get("actor_weights", [])),
@@ -230,8 +238,17 @@ def formal_metadata_snapshot(cfg: Dict, *, pre_alignment: bool | None = None, ta
         "residual_planner_thermal_horizon_start_meta_iter": int(
             planner_cfg.get("thermal_horizon_start_meta_iter", 0) or 0
         ),
-        "residual_planner_scoring": "target_critics_plus_constraint_and_thermal_risk",
-        "residual_planner_replacement_margin": float(planner_cfg.get("replacement_margin", 0.0) or 0.0),
+        "residual_planner_scoring": "target_critics_plus_constraint_incremental_h2_risk",
+        "residual_planner_trust_region_enabled": bool(planner_cfg.get("trust_region_enabled", False)),
+        "residual_planner_trust_region_mode": str(planner_cfg.get("trust_region_mode", "")),
+        "residual_planner_replacement_margin_mode": str(planner_cfg.get("replacement_margin_mode", "")),
+        "residual_planner_replacement_margin": planner_cfg.get("replacement_margin", None),
+        "residual_planner_normalized_margin_factor": planner_cfg.get("normalized_margin_factor", None),
+        "residual_planner_constraint_non_degradation": True,
+        "residual_planner_h2_veto_enabled": bool(planner_cfg.get("h2_veto_enabled", True)),
+        "residual_planner_h2_increment_beta": float(
+            planner_cfg.get("h2_increment_beta", planner_cfg.get("thermal_risk_beta", 0.0)) or 0.0
+        ),
         "residual_planner_uses_env_reward_model": False,
         "upper_double_dqn": bool(upper_cfg.get("double_dqn", False)),
         "upper_dueling_dqn": bool(upper_cfg.get("dueling", False)),
@@ -1772,6 +1789,23 @@ def _add_baseline_aux_diagnostics(row: Dict, aux: Dict) -> None:
         "residual_planner_disagreement",
         "residual_planner_projection_residual",
         "residual_planner_thermal_risk",
+        "residual_planner_candidate_raw_distance",
+        "residual_planner_candidate_exec_distance",
+        "residual_planner_trust_region_rejected_count",
+        "residual_planner_valid_candidate_count",
+        "residual_planner_max_valid_distance",
+        "residual_planner_margin_rejection_rate",
+        "residual_planner_constraint_rejection_rate",
+        "residual_planner_projection_rejection_rate",
+        "residual_planner_h2_veto_rate",
+        "residual_planner_fallback_rate",
+        "residual_planner_replacement_rate",
+        "residual_planner_h1_thermal_risk",
+        "residual_planner_h2_thermal_risk",
+        "residual_planner_incremental_h2_risk",
+        "residual_planner_h2_max_temperature",
+        "residual_planner_h2_veto",
+        "residual_planner_trust_region_rejected",
     ]
     string_keys = [
         "selected_template",
@@ -1787,6 +1821,7 @@ def _add_baseline_aux_diagnostics(row: Dict, aux: Dict) -> None:
         "selected_action_contract",
         "receiver_ratio_rule",
         "dimming_type",
+        "residual_planner_replacement_margin_mode",
     ]
     for key in numeric_keys:
         if key in aux:
@@ -2367,6 +2402,8 @@ class SacLagrangianBaseline:
             cost_vec = np.asarray(info.get("cost_vec", [cost]), dtype=np.float32).reshape(-1)
             dual_penalty = self.dual.penalty(cost_vec) if self.dual_enabled else 0.0
             penalized_reward = float(reward - dual_penalty)
+            physical_dim = int(self.cfg.get("physical_context", {}).get("input_dim", 18))
+            zero_physical = np.zeros(physical_dim, dtype=np.float32)
 
             lower_transition = {
                 "obs": obs.astype(np.float32),
@@ -2381,6 +2418,14 @@ class SacLagrangianBaseline:
                 "z": self._empty_latent(),
                 "act_exec": aux["act_exec"].astype(np.float32),
                 "act_raw": aux["act_raw"].astype(np.float32),
+                "act_refined_raw": aux.get("act_refined_raw", aux["act_raw"]).astype(np.float32),
+                "act_policy_raw": aux.get("act_policy_raw", aux["act_raw"]).astype(np.float32),
+                "policy_action_raw": aux.get("policy_action_raw", aux.get("act_policy_raw", aux["act_raw"])).astype(np.float32),
+                "planner_action_raw": aux.get("planner_action_raw", aux.get("act_refined_raw", aux["act_raw"])).astype(np.float32),
+                "executed_action": aux.get("executed_action", aux["act_exec"]).astype(np.float32),
+                "planner_selected": float(bool(aux.get("planner_selected", False))),
+                "physical_features": zero_physical,
+                "physical_features_next": zero_physical.copy(),
                 "boost_combo_exec": float(aux["boost_combo_exec"]),
                 "mode_exec": float(aux["mode_exec"]),
                 "current_template_level_exec": float(aux.get("current_template_level_exec", aux["mode_exec"])),
