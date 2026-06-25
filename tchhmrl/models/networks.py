@@ -33,6 +33,22 @@ class DiscreteQNetwork(nn.Module):
         return self.q(x)
 
 
+class DuelingDiscreteQNetwork(nn.Module):
+    def __init__(self, obs_dim: int, z_dim: int, n_actions: int, hidden_dim: int = 128):
+        super().__init__()
+        in_dim = obs_dim + z_dim
+        self.backbone = MLP(in_dim, [hidden_dim], hidden_dim)
+        self.value = MLP(hidden_dim, [hidden_dim], 1)
+        self.advantage = MLP(hidden_dim, [hidden_dim], n_actions)
+
+    def forward(self, obs: torch.Tensor, z: torch.Tensor) -> torch.Tensor:
+        x = torch.cat([obs, z], dim=-1)
+        h = self.backbone(x)
+        value = self.value(h)
+        advantage = self.advantage(h)
+        return value + advantage - advantage.mean(dim=1, keepdim=True)
+
+
 class ContinuousQNetwork(nn.Module):
     def __init__(self, obs_dim: int, z_dim: int, act_dim: int, hidden_dim: int = 128):
         super().__init__()

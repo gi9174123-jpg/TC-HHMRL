@@ -57,6 +57,8 @@ ROW_FIELDS = [
     "support_gate_score_before",
     "support_gate_score_after",
     "support_gate_score_delta",
+    "support_adaptation_episodes",
+    "support_gate_validation_episodes",
     "query_eval_after_support",
     "pre_query_eval_before_support",
     "support_global_step_delta",
@@ -175,6 +177,8 @@ def _episode_row(
     support_gate_score_before: float = 0.0,
     support_gate_score_after: float = 0.0,
     support_gate_score_delta: float = 0.0,
+    support_adaptation_episodes: int = 0,
+    support_gate_validation_episodes: int = 0,
     support_global_step_delta: int = 0,
     support_lower_update_delta: int = 0,
     support_upper_update_delta: int = 0,
@@ -221,6 +225,8 @@ def _episode_row(
         "support_gate_score_before": float(support_gate_score_before),
         "support_gate_score_after": float(support_gate_score_after),
         "support_gate_score_delta": float(support_gate_score_delta),
+        "support_adaptation_episodes": int(support_adaptation_episodes),
+        "support_gate_validation_episodes": int(support_gate_validation_episodes),
         "query_eval_after_support": phase == "query",
         "pre_query_eval_before_support": phase == "pre_query",
         "support_global_step_delta": int(support_global_step_delta),
@@ -274,6 +280,8 @@ def _prepare_cfg(
         cfg["env"]["episode_len"] = int(episode_len)
 
     cfg["meta"]["support_episodes"] = int(support_episodes)
+    cfg["meta"]["support_adaptation_episodes"] = min(3, int(support_episodes))
+    cfg["meta"]["support_gate_validation_episodes"] = max(0, int(support_episodes) - cfg["meta"]["support_adaptation_episodes"])
     cfg["meta"]["query_episodes"] = int(query_episodes)
     if ablation:
         apply_ablation(cfg, ablation)
@@ -354,22 +362,64 @@ def _collect_variant_rows(
         gate_active = bool(support_gate_enabled and support_train_adapts)
         rollback_state = trainer.agent.snapshot_mutable_state() if gate_active else None
         rollback_dual_state = copy.deepcopy(trainer.dual.state_dict()) if gate_active else None
-        n_adapt_support = int(support_episodes)
+        n_support_total = int(support_episodes)
+        n_validation_support = int(support_gate_validation_episodes) if gate_active else 0
+        n_validation_support = int(np.clip(n_validation_support, 0, max(0, n_support_total - 1)))
+        n_adapt_support = int(max(0, n_support_total - n_validation_support)) if gate_active else n_support_total
         gate_accepted = True
         gate_selected = "unconditional"
         gate_score_no_context = 0.0
         gate_score_before = 0.0
         gate_score_after = 0.0
         gate_score_delta = 0.0
+        gate_pre_stats: List[EpisodeStats] = []
+        gate_post_stats: List[EpisodeStats] = []
+        gate_validation_seeds = [
+            int(seed + task_id * 10_000 + 2_000 + val_idx)
+            for val_idx in range(n_validation_support)
+        ]
+
+        if gate_active and rollback_state is not None and rollback_dual_state is not None:
+            trainer.agent.restore_mutable_state(rollback_state)
+            trainer.dual.load_state_dict(copy.deepcopy(rollback_dual_state))
+            for val_idx, episode_seed in enumerate(gate_validation_seeds):
+                _set_episode_seed(episode_seed)
+                env = MultiTxUwSliptEnv(cfg, overrides=task.to_env_overrides())
+                env.rng = np.random.default_rng(episode_seed)
+                stats = trainer._run_episode(env, train=False, clear_context=(val_idx == 0))
+                gate_pre_stats.append(stats)
+                rows.append(
+                    _episode_row(
+                        scenario=scenario,
+                        seed=seed,
+                        variant=variant,
+                        task_id=task_id,
+                        site_id=site_id,
+                        phase="support",
+                        episode_in_phase=val_idx,
+                        episode_global=episode_global,
+                        episode_seed=episode_seed,
+                        stats=stats,
+                        context_enabled=context_enabled,
+                        explicit_inner_outer=explicit_inner_outer,
+                        support_train_adapts=False,
+                        support_gate_enabled=gate_active,
+                        support_gate_validation=True,
+                    )
+                )
+                episode_global += 1
+            trainer.agent.restore_mutable_state(rollback_state)
+            trainer.dual.load_state_dict(copy.deepcopy(rollback_dual_state))
 
         for ep_idx in range(n_adapt_support):
+            support_train_now = bool(support_train_adapts)
             episode_seed = int(seed + task_id * 10_000 + 1_000 + ep_idx)
             _set_episode_seed(episode_seed)
             env = MultiTxUwSliptEnv(cfg, overrides=task.to_env_overrides())
             env.rng = np.random.default_rng(episode_seed)
             stats = trainer._run_episode(
                 env,
-                train=support_train_adapts,
+                train=support_train_now,
                 clear_context=(ep_idx == 0),
             )
             support_stats.append(stats)
@@ -387,7 +437,9 @@ def _collect_variant_rows(
                     stats=stats,
                     context_enabled=context_enabled,
                     explicit_inner_outer=explicit_inner_outer,
-                    support_train_adapts=support_train_adapts,
+                    support_train_adapts=support_train_now,
+                    support_gate_enabled=gate_active,
+                    support_gate_validation=False,
                 )
             )
             episode_global += 1
@@ -395,7 +447,40 @@ def _collect_variant_rows(
         if gate_active and rollback_state is not None and rollback_dual_state is not None:
             current_state_for_gate = trainer.agent.snapshot_train_state()
             parameter_delta = MetaTrainer._trainable_parameter_delta_norm(rollback_state, current_state_for_gate)
-            before_stats, after_stats = MetaTrainer._support_gate_before_after(support_stats)
+            candidate_state = trainer.agent.snapshot_mutable_state()
+            candidate_dual_state = copy.deepcopy(trainer.dual.state_dict())
+            trainer.agent.restore_mutable_state(candidate_state)
+            trainer.dual.load_state_dict(copy.deepcopy(candidate_dual_state))
+            for val_idx, episode_seed in enumerate(gate_validation_seeds):
+                _set_episode_seed(episode_seed)
+                env = MultiTxUwSliptEnv(cfg, overrides=task.to_env_overrides())
+                env.rng = np.random.default_rng(episode_seed)
+                stats = trainer._run_episode(env, train=False, clear_context=(val_idx == 0))
+                gate_post_stats.append(stats)
+                rows.append(
+                    _episode_row(
+                        scenario=scenario,
+                        seed=seed,
+                        variant=variant,
+                        task_id=task_id,
+                        site_id=site_id,
+                        phase="support",
+                        episode_in_phase=n_adapt_support + val_idx,
+                        episode_global=episode_global,
+                        episode_seed=episode_seed,
+                        stats=stats,
+                        context_enabled=context_enabled,
+                        explicit_inner_outer=explicit_inner_outer,
+                        support_train_adapts=False,
+                        support_gate_enabled=gate_active,
+                        support_gate_validation=True,
+                    )
+                )
+                episode_global += 1
+            trainer.agent.restore_mutable_state(candidate_state)
+            trainer.dual.load_state_dict(copy.deepcopy(candidate_dual_state))
+            before_stats = MetaTrainer._mean_gate_stats(gate_pre_stats)
+            after_stats = MetaTrainer._mean_gate_stats(gate_post_stats)
             decision = evaluate_support_gate(
                 before_stats,
                 after_stats,
@@ -412,8 +497,9 @@ def _collect_variant_rows(
                 trainer.agent.restore_mutable_state(rollback_state)
                 trainer.dual.load_state_dict(copy.deepcopy(rollback_dual_state))
 
-        if support_train_adapts and trainer.dual_enabled and support_stats and (not gate_active or gate_accepted):
-            mean_cost_vec = np.mean(np.stack([s.cost_vec for s in support_stats], axis=0), axis=0)
+        train_support_stats = support_stats[:n_adapt_support] if gate_active else support_stats
+        if support_train_adapts and trainer.dual_enabled and train_support_stats and (not gate_active or gate_accepted):
+            mean_cost_vec = np.mean(np.stack([s.cost_vec for s in train_support_stats], axis=0), axis=0)
             trainer.dual.update(mean_cost_vec)
 
         current_state = trainer.agent.snapshot_train_state()
@@ -421,11 +507,13 @@ def _collect_variant_rows(
             "support_gate_enabled": gate_active,
             "support_gate_accepted": gate_accepted,
             "support_gate_selected": gate_selected,
-            "support_gate_metric": "support_score_non_degradation" if gate_active else "",
+            "support_gate_metric": "safety_first_support_gate" if gate_active else "",
             "support_gate_score_no_context": gate_score_no_context,
             "support_gate_score_before": gate_score_before,
             "support_gate_score_after": float(gate_score_no_context + gate_score_delta) if gate_active else gate_score_after,
             "support_gate_score_delta": gate_score_delta,
+            "support_adaptation_episodes": int(n_adapt_support if gate_active else n_support_total),
+            "support_gate_validation_episodes": int(n_validation_support if gate_active else 0),
             "support_global_step_delta": int(trainer.agent.global_step - base_global_step),
             "support_lower_update_delta": int(trainer.agent.lower.update_steps - base_lower_steps),
             "support_upper_update_delta": int(trainer.agent.upper.update_steps - base_upper_steps),
@@ -483,7 +571,7 @@ def _collect_variant_rows(
     return rows
 
 
-def _summarize_rows(rows: List[Dict[str, object]]) -> Dict[str, object]:
+def _summarize_rows(rows: List[Dict[str, object]], *, support_episodes: int) -> Dict[str, object]:
     grouped: Dict[tuple, List[Dict[str, object]]] = defaultdict(list)
     for row in rows:
         grouped[(row["variant"], row["phase"])].append(row)
@@ -683,9 +771,10 @@ def _summarize_rows(rows: List[Dict[str, object]]) -> Dict[str, object]:
                 "pre_query_eval_before_support": True,
                 "support_train_adapts": True,
                 "support_gate_enabled": True,
-                "support_gate_rule": "support_score_non_degradation_rollback_guard",
+                "support_gate_rule": "safety_first_rollback_guard",
+                "support_budget_split": "paired_pre_post_support_validation_plus_adaptation",
                 "query_used_by_gate": False,
-                "extra_support_rollouts": 0,
+                    "extra_support_rollouts": min(2, max(0, int(support_episodes) - 1)),
                 "extra_gradient_updates": 0,
                 "extra_query_evaluations": 0,
                 "query_eval_after_support": True,
@@ -932,7 +1021,7 @@ def run_meta_adaptation_diagnostics(
         "csv_path": str(csv_path),
         "plot_reward_path": str(out_path / "meta_vs_wo_meta_reward.png"),
         "plot_violation_path": str(out_path / "meta_vs_wo_meta_violation.png"),
-        **_summarize_rows(rows),
+        **_summarize_rows(rows, support_episodes=int(support_episodes)),
     }
     summary_path = out_path / "meta_adaptation_summary.json"
     with summary_path.open("w", encoding="utf-8") as f:

@@ -3,6 +3,7 @@ from __future__ import annotations
 import copy
 
 import numpy as np
+import pandas as pd
 import torch
 
 from scripts.benchmark_constraint_scenarios import (
@@ -12,8 +13,10 @@ from scripts.benchmark_constraint_scenarios import (
     apply_baseline_overrides,
     apply_scenario,
     apply_variant,
+    formal_metadata_snapshot,
     inject_default_curriculum,
     sample_fixed_tasks,
+    select_checkpoint,
     validate_training_config,
 )
 from tchhmrl.agents.ddpg_lower import LowerDDPG
@@ -33,6 +36,21 @@ def test_default_safety_uses_corrected_action_mapping_and_main_projection():
     assert cfg["safety"]["action_decode_mode"] == "tanh_affine"
     assert float(cfg["safety"]["smooth_relaxed_margin_c"]) == 1.0
     assert float(cfg["safety"]["thermal_cap_margin_c"]) == 0.5
+    assert cfg["adaptive_thermal"]["enabled"] is True
+    assert float(cfg["adaptive_thermal"]["excitation_threshold"]) == 0.03
+    assert float(cfg["adaptive_thermal"]["uncertainty_beta_min"]) <= float(
+        cfg["adaptive_thermal"]["uncertainty_beta_max"]
+    )
+    assert float(cfg["adaptive_thermal"]["initial_mean"]) == 1.0
+    assert cfg["physical_context"]["enabled"] is True
+    assert int(cfg["physical_context"]["input_dim"]) == 18
+    assert int(cfg["physical_context"]["embedding_dim"]) == 32
+    assert cfg["constraint_critics"]["enabled"] is True
+    assert int(cfg["constraint_critics"]["out_dim"]) == 4
+    assert cfg["constraint_critics"]["actor_weights"] == [0.05, 0.10, 0.10, 0.10]
+    assert cfg["constraint_critics"]["actor_penalty_nonnegative"] is True
+    assert cfg["upper_dqn"]["double_dqn"] is True
+    assert cfg["upper_dqn"]["dueling"] is True
 
 
 def test_main_cli_defaults_match_strict_meta_evaluation_scale(monkeypatch):
@@ -53,6 +71,47 @@ def test_main_cli_defaults_match_strict_meta_evaluation_scale(monkeypatch):
     assert int(args.eval_eps) == 3
     assert int(args.env_tasks) == 8
     assert int(args.env_eps) == 1
+
+
+def test_formal_metadata_reports_model_aware_lower_components():
+    cfg = load_cfg("configs/default.yaml")
+    meta = formal_metadata_snapshot(cfg)
+
+    assert meta["adaptive_thermal_enabled"] is True
+    assert meta["physical_context_enabled"] is True
+    assert meta["constraint_critics_enabled"] is True
+    assert meta["constraint_critic_dim"] == 4
+    assert meta["constraint_reward_target"] == "raw_reward"
+    assert meta["constraint_actor_weights"] == [0.05, 0.10, 0.10, 0.10]
+    assert meta["constraint_actor_penalty_nonnegative"] is True
+    assert meta["residual_planner_enabled"] is True
+    assert meta["residual_planner_candidate_count"] == 24
+    assert meta["residual_planner_thermal_horizon"] == 2
+    assert meta["residual_planner_start_meta_iter"] == 60
+    assert meta["residual_planner_thermal_horizon_start_meta_iter"] == 86
+    assert meta["residual_planner_scoring"] == "target_critics_plus_constraint_and_thermal_risk"
+    assert meta["residual_planner_uses_env_reward_model"] is False
+    assert meta["upper_double_dqn"] is True
+    assert meta["upper_dueling_dqn"] is True
+    assert meta["upper_physical_context_enabled"] is True
+
+
+def test_moderate_config_keeps_model_aware_lower_components_enabled():
+    cfg = load_cfg("configs/moderate.yaml")
+
+    assert cfg["adaptive_thermal"]["enabled"] is True
+    assert cfg["physical_context"]["enabled"] is True
+    assert int(cfg["physical_context"]["input_dim"]) == 18
+    assert cfg["constraint_critics"]["enabled"] is True
+    assert int(cfg["constraint_critics"]["out_dim"]) == 4
+    assert cfg["constraint_critics"]["reward_target"] == "raw_reward"
+    assert cfg["residual_planner"]["enabled"] is True
+    assert int(cfg["residual_planner"]["candidate_count"]) == 24
+    assert int(cfg["residual_planner"]["thermal_horizon_start_meta_iter"]) == 86
+    assert int(cfg["meta"]["checkpoint_selection"]["min_iter"]) == 86
+    assert cfg["upper_dqn"]["double_dqn"] is True
+    assert cfg["upper_dqn"]["dueling"] is True
+    assert int(cfg["context"]["input_dim"]) == 37
 
 
 def test_practical_hard_safety_is_earlier_than_env():
@@ -178,8 +237,14 @@ def test_full_hybrid_support_gate_default_and_ungated_ablation():
     cfg = load_cfg("configs/default.yaml")
     assert cfg["meta"]["support_gate"]["enabled"] is True
     assert cfg["meta"]["support_gate"]["role"] == "rollback_guard"
+    assert cfg["meta"]["support_gate"]["rule"] == "safety_first"
     assert cfg["meta"]["support_gate"]["query_leakage"] is False
-    assert int(cfg["meta"]["support_gate"]["extra_support_rollouts"]) == 0
+    assert float(cfg["meta"]["support_gate"]["max_violation_increase"]) == 1.0e-4
+    assert float(cfg["meta"]["support_gate"]["max_cost_increase"]) == 1.0e-5
+    assert int(cfg["meta"]["support_adaptation_episodes"]) == 3
+    assert int(cfg["meta"]["support_gate_validation_episodes"]) == 2
+    assert cfg["meta"]["support_gate"]["paired_validation"] is True
+    assert int(cfg["meta"]["support_gate"]["extra_support_rollouts"]) == 2
     assert int(cfg["meta"]["support_gate"]["extra_gradient_updates"]) == 0
 
     ungated = copy.deepcopy(cfg)
@@ -187,6 +252,61 @@ def test_full_hybrid_support_gate_default_and_ungated_ablation():
     assert ungated["meta"]["support_gate"]["enabled"] is False
     assert ungated["meta"]["support_update_acceptance"] == "unconditional"
     assert ungated["pilot_metadata"]["comparison_role"] == "ungated_meta_ablation"
+
+
+def test_checkpoint_selection_honors_stage_aware_min_iter(tmp_path):
+    ckpt_dir = tmp_path / "checkpoints"
+    ckpt_dir.mkdir()
+    for it in (40, 70, 90, 100):
+        (ckpt_dir / f"iter_{it}.pt").write_bytes(b"checkpoint")
+    run_df = pd.DataFrame(
+        [
+            {
+                "iter": 40,
+                "query_reward": 10.0,
+                "query_se": 0.0,
+                "query_eh": 0.0,
+                "query_cost": 0.0,
+                "query_violation_rate": 0.0,
+            },
+            {
+                "iter": 90,
+                "query_reward": 1.0,
+                "query_se": 0.0,
+                "query_eh": 0.0,
+                "query_cost": 0.0,
+                "query_violation_rate": 0.0,
+            },
+            {
+                "iter": 100,
+                "query_reward": 2.0,
+                "query_se": 0.0,
+                "query_eh": 0.0,
+                "query_cost": 0.0,
+                "query_violation_rate": 0.0,
+            },
+        ]
+    )
+
+    pick = select_checkpoint(
+        run_df=run_df,
+        ckpt_dir=ckpt_dir,
+        score_cfg={
+            "enabled": True,
+            "mode": "training_curve",
+            "min_iter": 86,
+            "reward_w": 1.0,
+            "se_w": 0.0,
+            "eh_w": 0.0,
+            "cost_w": 0.0,
+            "violation_w": 0.0,
+        },
+    )
+
+    assert pick["min_iter_satisfied"] is True
+    assert int(pick["min_iter"]) == 86
+    assert int(pick["selected_iter"]) == 100
+    assert all(int(row["iter"]) >= 86 for row in pick["selection_rows"])
 
 
 def test_ablation_wo_lagrangian_disables_dual_updates():

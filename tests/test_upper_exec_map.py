@@ -6,6 +6,7 @@ import numpy as np
 import torch
 
 from tchhmrl.agents.dqn_upper import UpperDQN
+from tchhmrl.models.networks import DuelingDiscreteQNetwork
 from tchhmrl.utils.config import load_cfg
 
 
@@ -28,3 +29,36 @@ def test_upper_dqn_select_action_uses_exec_map():
     picked = upper.select_action(obs, z, t=10_000, eval_mode=True, exec_map=exec_map)
 
     assert picked == 0
+
+
+def test_upper_dqn_uses_dueling_double_dqn_and_updates_with_exec_map():
+    cfg = load_cfg("configs/default.yaml")
+    cfg["agent"]["hidden_dim"] = 64
+    cfg["upper_dqn"]["batch_size"] = 4
+    upper = UpperDQN(cfg, torch.device("cpu"))
+
+    assert upper.double_dqn is True
+    assert upper.dueling is True
+    assert isinstance(upper.q, DuelingDiscreteQNetwork)
+    assert upper.physical_enabled is True
+    assert upper.q_phys is not None
+
+    b = 4
+    batch = {
+        "obs": np.random.randn(b, int(cfg["agent"]["obs_dim"])).astype(np.float32),
+        "z": np.random.randn(b, int(cfg["agent"]["z_dim"])).astype(np.float32),
+        "upper_idx_train": np.asarray([0, 1, 2, 3], dtype=np.float32),
+        "reward": np.random.randn(b).astype(np.float32),
+        "next_obs": np.random.randn(b, int(cfg["agent"]["obs_dim"])).astype(np.float32),
+        "z_next": np.random.randn(b, int(cfg["agent"]["z_dim"])).astype(np.float32),
+        "done": np.zeros(b, dtype=np.float32),
+        "horizon": np.ones(b, dtype=np.float32),
+        "physical_features": np.random.randn(b, int(cfg["physical_context"]["input_dim"])).astype(np.float32),
+        "physical_features_next": np.random.randn(b, int(cfg["physical_context"]["input_dim"])).astype(np.float32),
+        "next_exec_map": np.tile(np.arange(int(cfg["agent"]["n_upper_actions"]), dtype=np.float32), (b, 1)),
+    }
+
+    stats = upper.update(batch)
+
+    assert "q_loss" in stats
+    assert np.isfinite(stats["q_loss"])

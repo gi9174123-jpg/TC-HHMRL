@@ -194,6 +194,34 @@ def build_task_summary_v2(task_like: TaskSpec | Mapping[str, Any]) -> np.ndarray
     )
 
 
+def build_context_task_summary_v2(task_like: TaskSpec | Mapping[str, Any]) -> np.ndarray:
+    """Observable task summary used as the context-predictor target.
+
+    The full task summary includes simulator-only parameters such as true
+    attenuation coefficient, misalignment standard deviation, and thermal
+    dynamics. Those values are useful for offline bookkeeping and fixed-task
+    hashes, but they are privileged labels for a deployed controller. The
+    context module therefore predicts only declared/measurable task fields while
+    keeping the same 9-D site_v2 interface for checkpoint compatibility.
+    """
+
+    spec = task_like if isinstance(task_like, TaskSpec) else TaskSpec.from_mapping(task_like)
+    return np.asarray(
+        [
+            0.0,  # hidden attenuation coefficient: logging only, not controller target
+            0.0,  # hidden misalignment scale: logging only, not controller target
+            float(spec.amb_temp),
+            0.0,  # hidden thermal gamma: logging only, not controller target
+            0.0,  # hidden thermal delta: logging only, not controller target
+            float(spec.qos_min_rate),
+            float(spec.distances[0]),
+            float(spec.distances[1]),
+            float(spec.distances[2]),
+        ],
+        dtype=np.float32,
+    )
+
+
 def stable_task_payload(task_like: TaskSpec | Mapping[str, Any]) -> dict[str, Any]:
     spec = task_like if isinstance(task_like, TaskSpec) else TaskSpec.from_mapping(task_like)
     return {

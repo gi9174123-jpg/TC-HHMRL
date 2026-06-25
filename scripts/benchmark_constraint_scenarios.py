@@ -32,6 +32,7 @@ from tchhmrl.baselines.common import BasePaperBaseline, PolicyEpisodeStats, expe
 from tchhmrl.buffers.replay_buffer import ReplayBuffer
 from tchhmrl.constraints.dual_layer import DualLayer
 from tchhmrl.envs.task_contract import (
+    build_context_task_summary_v2,
     build_task_summary_v2,
     filter_formal_ranking_records,
     filter_formally_comparable_records,
@@ -78,11 +79,16 @@ def apply_common_settings(
     if fast_mode:
         cfg["meta"]["n_tasks_per_iter"] = int(min(3, cfg["meta"]["n_tasks_per_iter"]))
         cfg["meta"]["support_episodes"] = int(min(1, cfg["meta"]["support_episodes"]))
+        cfg["meta"]["support_adaptation_episodes"] = int(min(1, cfg["meta"]["support_episodes"]))
+        cfg["meta"]["support_gate_validation_episodes"] = 0
+        cfg["meta"].setdefault("support_gate", {})["paired_validation"] = False
+        cfg["meta"]["support_gate"]["extra_support_rollouts"] = 0
         cfg["meta"]["query_episodes"] = int(min(1, cfg["meta"]["query_episodes"]))
 
         cfg["agent"]["warmup_steps"] = int(min(100, cfg["agent"]["warmup_steps"]))
         cfg["agent"]["batch_size"] = int(min(48, cfg["agent"]["batch_size"]))
         cfg["env"]["episode_len"] = int(min(60, cfg["env"]["episode_len"]))
+        cfg.setdefault("meta", {}).setdefault("checkpoint_selection", {})["min_iter"] = 0
     return cfg
 
 
@@ -92,6 +98,8 @@ def apply_strict_meta_protocol(cfg: Dict) -> None:
     meta_cfg["n_tasks_per_iter"] = max(int(meta_cfg.get("n_tasks_per_iter", 0)), 8)
     meta_cfg["meta_iters"] = max(int(meta_cfg.get("meta_iters", 0)), 100)
     meta_cfg["support_episodes"] = 5
+    meta_cfg["support_adaptation_episodes"] = 3
+    meta_cfg["support_gate_validation_episodes"] = 2
     meta_cfg["query_episodes"] = 2
     meta_cfg["query_updates_enabled"] = False
     meta_cfg["query_context_updates_enabled"] = True
@@ -100,10 +108,15 @@ def apply_strict_meta_protocol(cfg: Dict) -> None:
     meta_cfg["protocol_name"] = "strict_support_query"
     support_gate = meta_cfg.setdefault("support_gate", {})
     support_gate.setdefault("role", "rollback_guard")
-    support_gate.setdefault("rule", "support_score_non_degradation")
+    support_gate["rule"] = "safety_first"
     support_gate["enabled"] = True
+    support_gate["normalized_reward_threshold"] = 0.0
+    support_gate["reward_normalization_eps"] = 1.0
+    support_gate["max_cost_increase"] = 1.0e-5
+    support_gate["max_violation_increase"] = 1.0e-4
+    support_gate["paired_validation"] = True
     support_gate["query_leakage"] = False
-    support_gate["extra_support_rollouts"] = 0
+    support_gate["extra_support_rollouts"] = int(meta_cfg["support_gate_validation_episodes"])
     support_gate["extra_gradient_updates"] = 0
     support_gate["extra_query_evaluations"] = 0
     cfg.setdefault("buffer", {})["context_max_len"] = max(
@@ -114,6 +127,7 @@ def apply_strict_meta_protocol(cfg: Dict) -> None:
     ckpt_cfg = meta_cfg.setdefault("checkpoint_selection", {})
     ckpt_cfg["enabled"] = True
     ckpt_cfg["mode"] = "heldout_eval"
+    ckpt_cfg["min_iter"] = int(cfg.get("residual_planner", {}).get("thermal_horizon_start_meta_iter", 0) or 0)
     ckpt_cfg["eval_tasks"] = 10
     ckpt_cfg["eval_eps"] = 3
 
@@ -129,6 +143,8 @@ def apply_online_meta_protocol(cfg: Dict) -> None:
     meta_cfg = cfg.setdefault("meta", {})
     meta_cfg["n_tasks_per_iter"] = 6
     meta_cfg["support_episodes"] = 3
+    meta_cfg["support_adaptation_episodes"] = 3
+    meta_cfg["support_gate_validation_episodes"] = 0
     meta_cfg["query_episodes"] = 2
     meta_cfg["explicit_inner_outer"] = True
     meta_cfg["outer_step_size"] = 0.15
@@ -137,8 +153,13 @@ def apply_online_meta_protocol(cfg: Dict) -> None:
     meta_cfg["protocol_name"] = "online_adaptation_main"
     support_gate = meta_cfg.setdefault("support_gate", {})
     support_gate.setdefault("role", "rollback_guard")
-    support_gate.setdefault("rule", "support_score_non_degradation")
+    support_gate["rule"] = "safety_first"
     support_gate["enabled"] = True
+    support_gate["normalized_reward_threshold"] = 0.0
+    support_gate["reward_normalization_eps"] = 1.0
+    support_gate["max_cost_increase"] = 1.0e-5
+    support_gate["max_violation_increase"] = 1.0e-4
+    support_gate["paired_validation"] = False
     support_gate["query_leakage"] = False
     support_gate["extra_support_rollouts"] = 0
     support_gate["extra_gradient_updates"] = 0
@@ -151,6 +172,7 @@ def apply_online_meta_protocol(cfg: Dict) -> None:
     ckpt_cfg = meta_cfg.setdefault("checkpoint_selection", {})
     ckpt_cfg["enabled"] = True
     ckpt_cfg["mode"] = "heldout_eval"
+    ckpt_cfg["min_iter"] = int(cfg.get("residual_planner", {}).get("thermal_horizon_start_meta_iter", 0) or 0)
     ckpt_cfg["eval_tasks"] = 8
     ckpt_cfg["eval_eps"] = 2
 
@@ -171,9 +193,40 @@ def alignment_snapshot(cfg: Dict, *, pre_alignment: bool | None = None, task_sou
 
 
 def formal_metadata_snapshot(cfg: Dict, *, pre_alignment: bool | None = None, task_source: str | None = None) -> Dict[str, object]:
+    adaptive_cfg = cfg.get("adaptive_thermal", {}) or {}
+    physical_cfg = cfg.get("physical_context", {}) or {}
+    constraint_cfg = cfg.get("constraint_critics", {}) or {}
+    planner_cfg = cfg.get("residual_planner", {}) or {}
+    upper_cfg = cfg.get("upper_dqn", {}) or {}
     return {
         **alignment_snapshot(cfg, pre_alignment=pre_alignment, task_source=task_source),
         **physics_snapshot_from_cfg(cfg),
+        "adaptive_thermal_enabled": bool(adaptive_cfg.get("enabled", False)),
+        "adaptive_thermal_estimator": "ema_gain_scale" if bool(adaptive_cfg.get("enabled", False)) else "disabled",
+        "adaptive_thermal_projection": "mean_plus_beta_std" if bool(adaptive_cfg.get("enabled", False)) else "nominal",
+        "adaptive_thermal_extra_rollouts": 0,
+        "adaptive_thermal_extra_gradient_updates": 0,
+        "physical_context_enabled": bool(physical_cfg.get("enabled", False)),
+        "physical_context_input_dim": int(physical_cfg.get("input_dim", 0) or 0),
+        "physical_context_embedding_dim": int(physical_cfg.get("embedding_dim", 0) or 0),
+        "constraint_critics_enabled": bool(constraint_cfg.get("enabled", False)),
+        "constraint_critic_dim": int(constraint_cfg.get("out_dim", 0) or 0),
+        "constraint_reward_target": str(constraint_cfg.get("reward_target", "raw_reward")),
+        "constraint_actor_weights": list(constraint_cfg.get("actor_weights", [])),
+        "constraint_actor_penalty_nonnegative": bool(constraint_cfg.get("actor_penalty_nonnegative", True)),
+        "residual_planner_enabled": bool(planner_cfg.get("enabled", False)),
+        "residual_planner_candidate_count": int(planner_cfg.get("candidate_count", 0) or 0),
+        "residual_planner_thermal_horizon": int(planner_cfg.get("thermal_horizon", 0) or 0),
+        "residual_planner_start_meta_iter": int(planner_cfg.get("start_meta_iter", 0) or 0),
+        "residual_planner_thermal_horizon_start_meta_iter": int(
+            planner_cfg.get("thermal_horizon_start_meta_iter", 0) or 0
+        ),
+        "residual_planner_scoring": "target_critics_plus_constraint_and_thermal_risk",
+        "residual_planner_replacement_margin": float(planner_cfg.get("replacement_margin", 0.0) or 0.0),
+        "residual_planner_uses_env_reward_model": False,
+        "upper_double_dqn": bool(upper_cfg.get("double_dqn", False)),
+        "upper_dueling_dqn": bool(upper_cfg.get("dueling", False)),
+        "upper_physical_context_enabled": bool(physical_cfg.get("enabled", False)),
     }
 
 
@@ -1409,14 +1462,14 @@ def select_checkpoint(
             "selected_metrics": {},
         }
 
-    iter_to_path = {}
+    iter_to_path_all = {}
     for p in ckpt_paths:
         try:
             it = int(p.stem.split("_")[-1])
-            iter_to_path[it] = p
+            iter_to_path_all[it] = p
         except ValueError:
             continue
-    if not iter_to_path:
+    if not iter_to_path_all:
         return {
             "strategy": "none",
             "selected_iter": -1,
@@ -1425,16 +1478,23 @@ def select_checkpoint(
             "selection_rows": [],
             "selected_metrics": {},
         }
+    min_iter = int(max(0, int(score_cfg.get("min_iter", 0) or 0)))
+    iter_to_path = {it: p for it, p in iter_to_path_all.items() if int(it) >= min_iter}
+    min_iter_satisfied = bool(iter_to_path)
+    if not iter_to_path:
+        iter_to_path = dict(iter_to_path_all)
 
     if not enabled:
         best_iter = max(iter_to_path.keys())
         return {
-            "strategy": "last_checkpoint",
+            "strategy": "last_checkpoint" if min_iter_satisfied else "last_checkpoint_min_iter_unavailable",
             "selected_iter": int(best_iter),
             "selected_score": float("nan"),
             "selected_path": str(iter_to_path[best_iter]),
             "selection_rows": [],
             "selected_metrics": {},
+            "min_iter": int(min_iter),
+            "min_iter_satisfied": bool(min_iter_satisfied),
         }
 
     if mode == "heldout_eval" and evaluator is not None:
@@ -1457,12 +1517,14 @@ def select_checkpoint(
             best = max(rows, key=lambda r: float(r["score"]))
             best_iter = int(best["iter"])
             return {
-                "strategy": "heldout_eval_score",
+                "strategy": "heldout_eval_score" if min_iter_satisfied else "heldout_eval_score_min_iter_unavailable",
                 "selected_iter": best_iter,
                 "selected_score": float(best["score"]),
                 "selected_path": str(iter_to_path[best_iter]),
                 "selection_rows": rows,
                 "selected_metrics": dict(best),
+                "min_iter": int(min_iter),
+                "min_iter_satisfied": bool(min_iter_satisfied),
             }
 
     cand = run_df.copy()
@@ -1471,12 +1533,14 @@ def select_checkpoint(
     if cand.empty:
         best_iter = max(iter_to_path.keys())
         return {
-            "strategy": "last_checkpoint_fallback",
+            "strategy": "last_checkpoint_fallback" if min_iter_satisfied else "last_checkpoint_fallback_min_iter_unavailable",
             "selected_iter": int(best_iter),
             "selected_score": float("nan"),
             "selected_path": str(iter_to_path[best_iter]),
             "selection_rows": [],
             "selected_metrics": {},
+            "min_iter": int(min_iter),
+            "min_iter_satisfied": bool(min_iter_satisfied),
         }
 
     cand["score"] = cand.apply(
@@ -1522,6 +1586,8 @@ def select_checkpoint(
             "violation_rate": float(best_row["query_violation_rate"]),
             "score": float(best_row["score"]),
         },
+        "min_iter": int(min_iter),
+        "min_iter_satisfied": bool(min_iter_satisfied),
     }
 
 
@@ -1552,6 +1618,14 @@ def _safe_projection_aux(safe: Dict) -> Dict[str, object]:
         "bus_projected_current_total": safe.get("bus_projected_current_total"),
         "projected_current_total": safe.get("projected_current_total"),
         "projection_compression_ratio": safe.get("projection_compression_ratio"),
+        "adaptive_thermal_enabled": safe.get("adaptive_thermal_enabled"),
+        "thermal_gain_mean": safe.get("thermal_gain_mean"),
+        "thermal_gain_std": safe.get("thermal_gain_std"),
+        "thermal_gain_safe_scale": safe.get("thermal_gain_safe_scale"),
+        "thermal_gain_beta": safe.get("thermal_gain_beta"),
+        "thermal_gain_valid_count": safe.get("thermal_gain_valid_count"),
+        "temperature_slope": safe.get("temperature_slope"),
+        "thermal_headroom": safe.get("thermal_headroom"),
     }
     if "thermal_coupling_term" in safe:
         out["thermal_coupling_term"] = safe.get("thermal_coupling_term")
@@ -1600,6 +1674,7 @@ def _add_projection_diagnostics(row: Dict, aux: Dict, currents_exec: np.ndarray)
     row["projection_compression_ratio"] = _projection_scalar(aux, "projection_compression_ratio")
     row["thermal_margin_min"] = _projection_scalar(aux, "thermal_margin_min")
     row["thermal_cap_margin_c"] = _projection_scalar(aux, "thermal_cap_margin_c")
+    row["adaptive_thermal_enabled"] = bool(aux.get("adaptive_thermal_enabled", row.get("adaptive_thermal_enabled", False)))
     row["rho_raw_decoded"] = _projection_scalar(aux, "rho_raw_decoded")
     row["tau_raw_decoded"] = _projection_scalar(aux, "tau_raw_decoded")
 
@@ -1618,6 +1693,13 @@ def _add_projection_diagnostics(row: Dict, aux: Dict, currents_exec: np.ndarray)
         ("thermal_base", "thermal_base"),
         ("thermal_pred_temp", "thermal_pred_temp"),
         ("thermal_pred_margin", "thermal_pred_margin"),
+        ("thermal_gain_mean", "thermal_gain_mean"),
+        ("thermal_gain_std", "thermal_gain_std"),
+        ("thermal_gain_safe_scale", "thermal_gain_safe_scale"),
+        ("thermal_gain_beta", "thermal_gain_beta"),
+        ("thermal_gain_valid_count", "thermal_gain_valid_count"),
+        ("temperature_slope", "temperature_slope"),
+        ("thermal_headroom", "thermal_headroom"),
     ]:
         arr = _projection_vector(aux, key)
         for tx_idx, val in enumerate(arr.tolist()):
@@ -1670,6 +1752,17 @@ def _add_baseline_aux_diagnostics(row: Dict, aux: Dict) -> None:
         "joint_dimming_scale",
         "pdqn_selected_k",
         "pdqn_argmax_q",
+        "residual_planner_candidate_count",
+        "residual_planner_effective_thermal_horizon",
+        "residual_planner_selected_idx",
+        "residual_planner_latency_ms",
+        "residual_planner_score",
+        "residual_planner_score_improvement",
+        "residual_planner_reward_value",
+        "residual_planner_constraint_penalty",
+        "residual_planner_disagreement",
+        "residual_planner_projection_residual",
+        "residual_planner_thermal_risk",
     ]
     string_keys = [
         "selected_template",
@@ -1750,6 +1843,10 @@ def collect_env_data(
                 )
 
                 next_obs, reward, terminated, truncated, info = env.step(action)
+                trainer.agent.update_safety_estimator(
+                    temps_before=temps_before,
+                    info=info,
+                )
                 done = bool(terminated or truncated)
                 currents_exec = np.asarray(info.get("currents_exec", action["currents_exec"]), dtype=np.float32)
                 current_total = float(info.get("current_total", float(np.sum(currents_exec))))
@@ -1852,7 +1949,7 @@ def collect_env_data(
                         "reward_raw": float(reward),
                         "cost": float(info["cost"]),
                         "cost_vec": np.asarray(info.get("cost_vec", [float(info["cost"])]), dtype=np.float32),
-                        "task_params": build_task_summary_v2(
+                        "task_params": build_context_task_summary_v2(
                             {
                                 "attenuation_c": env.attenuation_c,
                                 "misalign_std": env.misalign_std,
@@ -2917,7 +3014,7 @@ def _run_heuristic_episode(trainer: MetaTrainer, env: MultiTxUwSliptEnv) -> Dict
                 "reward_raw": float(reward),
                 "cost": float(info["cost"]),
                 "cost_vec": np.asarray(info.get("cost_vec", [float(info["cost"])]), dtype=np.float32),
-                "task_params": build_task_summary_v2(
+                "task_params": build_context_task_summary_v2(
                     {
                         "attenuation_c": env.attenuation_c,
                         "misalign_std": env.misalign_std,
@@ -4529,6 +4626,7 @@ def run_one_scenario(
                     "inner_upper_warmup_steps": int(run_meta_cfg.get("inner_upper_warmup_steps", 0)),
                     "checkpoint_selection_eval_tasks": int(run_ckpt_cfg.get("eval_tasks", eval_tasks)),
                     "checkpoint_selection_eval_eps": int(run_ckpt_cfg.get("eval_eps", 1)),
+                    "checkpoint_selection_min_iter": int(run_ckpt_cfg.get("min_iter", 0) or 0),
                     "selection_tasks": int(len(selection_tasks)),
                     "selection_eps": int(selection_eps),
                     "eval_tasks": int(eval_tasks),
@@ -4538,6 +4636,8 @@ def run_one_scenario(
                     "env_eps": int(env_eps),
                     "checkpoint_strategy": str(ckpt_pick.get("strategy", "none")),
                     "checkpoint_iter": int(ckpt_pick.get("selected_iter", -1)),
+                    "checkpoint_min_iter": int(ckpt_pick.get("min_iter", run_ckpt_cfg.get("min_iter", 0) or 0)),
+                    "checkpoint_min_iter_satisfied": bool(ckpt_pick.get("min_iter_satisfied", True)),
                     "checkpoint_score": (
                         float(ckpt_pick.get("selected_score"))
                         if np.isfinite(float(ckpt_pick.get("selected_score", float("nan"))))
@@ -4966,7 +5066,7 @@ def run_one_scenario(
                 "support_gate_role": "rollback_guard" if hybrid_gate_enabled else "",
                 "support_gate_uses_query": False,
                 "support_update_acceptance": "unconditional" if is_meta_ungated else "support_side_gated" if hybrid_meta_enabled else "none",
-                "support_gate_extra_rollouts": 0,
+                "support_gate_extra_rollouts": 2 if hybrid_gate_enabled else 0,
                 "support_gate_extra_gradient_updates": 0,
                 "support_gate_extra_query_evaluations": 0,
                 "strong_safety_baseline": True if is_qos_aware_hard_clip else False if is_hard_clip else None,
@@ -5008,7 +5108,7 @@ def run_one_scenario(
                 "support_gate_role": "rollback_guard" if structural_meta and not structural_ungated else "",
                 "support_gate_uses_query": False,
                 "support_update_acceptance": "unconditional" if structural_ungated else "support_side_gated" if structural_meta else "none",
-                "support_gate_extra_rollouts": 0,
+                "support_gate_extra_rollouts": 2 if structural_meta and not structural_ungated else 0,
                 "support_gate_extra_gradient_updates": 0,
                 "support_gate_extra_query_evaluations": 0,
                 "description": "LED-only structural ablation with the same meta/context/gated adaptation pipeline as Full Hybrid.",
@@ -5028,7 +5128,7 @@ def run_one_scenario(
                 "support_gate_role": "rollback_guard" if structural_meta and not structural_ungated else "",
                 "support_gate_uses_query": False,
                 "support_update_acceptance": "unconditional" if structural_ungated else "support_side_gated" if structural_meta else "none",
-                "support_gate_extra_rollouts": 0,
+                "support_gate_extra_rollouts": 2 if structural_meta and not structural_ungated else 0,
                 "support_gate_extra_gradient_updates": 0,
                 "support_gate_extra_query_evaluations": 0,
                 "description": "LD-only structural ablation with the same meta/context/gated adaptation pipeline as Full Hybrid.",

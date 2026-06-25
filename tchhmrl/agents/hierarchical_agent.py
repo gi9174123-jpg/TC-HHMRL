@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import copy
+import random
 from pathlib import Path
 from typing import Callable, Dict, Optional, Tuple
 
@@ -13,7 +14,12 @@ from tchhmrl.agents.dqn_upper import UpperDQN
 from tchhmrl.agents.sac_lower import LowerSAC
 from tchhmrl.buffers.replay_buffer import EpisodeBuffer, ReplayBuffer
 from tchhmrl.models.context_encoder import ContextEncoder
-from tchhmrl.envs.task_contract import build_task_summary_v2, is_formally_comparable_record, physics_snapshot_from_cfg
+from tchhmrl.envs.task_contract import (
+    build_context_task_summary_v2,
+    is_formally_comparable_record,
+    physics_snapshot_from_cfg,
+)
+from tchhmrl.planning import ResidualPlanner
 from tchhmrl.safety.safety_layer import SafetyLayer
 
 
@@ -25,6 +31,7 @@ class HierarchicalAgent:
         self.safety = SafetyLayer(cfg)
         self.upper = UpperDQN(cfg, device)
         self.lower = LowerSAC(cfg, self.safety, device)
+        self.residual_planner = ResidualPlanner(cfg, device)
 
         replay_size = int(cfg["buffer"]["replay_size"])
         self.replay = ReplayBuffer(replay_size)
@@ -91,9 +98,40 @@ class HierarchicalAgent:
         self.hard_boost_switch_bonus = float(hard_cfg.get("boost_switch_bonus", 0.5))
 
         self.global_step = 0
+        self.current_meta_iter = 0
         self.safety_mem = {"current_boost": 0, "dwell_count": cfg["safety"]["min_dwell_steps"]}
         self.upper_mem = {"upper_idx": 0, "hold_left": 0}
         self.upper_plan: Optional[int] = None
+        self.physical_feature_dim = int(cfg.get("physical_context", {}).get("input_dim", 18))
+        self.prev_projection_residual = np.zeros(5, dtype=np.float32)
+        self.prev_bus_headroom = 1.0
+
+    def set_meta_iter(self, it: int) -> None:
+        self.current_meta_iter = int(max(0, it))
+
+    @staticmethod
+    def _rng_state() -> Dict:
+        state = {
+            "python": random.getstate(),
+            "numpy": np.random.get_state(),
+            "torch": torch.get_rng_state(),
+        }
+        if torch.cuda.is_available():
+            state["torch_cuda"] = torch.cuda.get_rng_state_all()
+        return state
+
+    @staticmethod
+    def _restore_rng_state(state: Dict) -> None:
+        if not state:
+            return
+        if "python" in state:
+            random.setstate(state["python"])
+        if "numpy" in state:
+            np.random.set_state(state["numpy"])
+        if "torch" in state:
+            torch.set_rng_state(state["torch"])
+        if "torch_cuda" in state and torch.cuda.is_available():
+            torch.cuda.set_rng_state_all(state["torch_cuda"])
 
     def _context_cost_vec(self, tr: Dict) -> np.ndarray:
         cost_vec = tr.get("cost_vec", None)
@@ -130,7 +168,7 @@ class HierarchicalAgent:
         ).astype(np.float32)
 
     def _task_params_from_transition(self, tr: Dict) -> np.ndarray:
-        return build_task_summary_v2(tr)
+        return build_context_task_summary_v2(tr)
 
     def _alignment_meta(self, *, pre_alignment: bool | None = None) -> Dict[str, object]:
         return {
@@ -176,6 +214,8 @@ class HierarchicalAgent:
         }
         self.upper_mem = {"upper_idx": 0, "hold_left": 0}
         self.upper_plan = None
+        self.prev_projection_residual = np.zeros(5, dtype=np.float32)
+        self.prev_bus_headroom = 1.0
 
     def reset_episode_state(self) -> None:
         self.reset_rollout_state(clear_context=True)
@@ -187,7 +227,9 @@ class HierarchicalAgent:
             "context_encoder": copy.deepcopy(self.context_encoder.state_dict()),
             "context_predictor": copy.deepcopy(self.context_predictor.state_dict()),
             "context_optim": copy.deepcopy(self.context_optim.state_dict()),
+            "safety": copy.deepcopy(self.safety.state_dict()),
             "global_step": int(self.global_step),
+            "current_meta_iter": int(self.current_meta_iter),
         }
 
     def restore_train_state(self, state: Dict) -> None:
@@ -196,7 +238,10 @@ class HierarchicalAgent:
         self.context_encoder.load_state_dict(copy.deepcopy(state["context_encoder"]))
         self.context_predictor.load_state_dict(copy.deepcopy(state["context_predictor"]))
         self.context_optim.load_state_dict(copy.deepcopy(state["context_optim"]))
+        if "safety" in state:
+            self.safety.load_state_dict(copy.deepcopy(state["safety"]))
         self.global_step = int(state.get("global_step", 0))
+        self.current_meta_iter = int(state.get("current_meta_iter", self.current_meta_iter))
 
     def snapshot_mutable_state(self) -> Dict:
         state = self.snapshot_train_state()
@@ -208,6 +253,9 @@ class HierarchicalAgent:
                 "safety_mem": copy.deepcopy(self.safety_mem),
                 "upper_mem": copy.deepcopy(self.upper_mem),
                 "upper_plan": copy.deepcopy(self.upper_plan),
+                "prev_projection_residual": self.prev_projection_residual.copy(),
+                "prev_bus_headroom": float(self.prev_bus_headroom),
+                "rng": self._rng_state(),
             }
         )
         return state
@@ -223,6 +271,50 @@ class HierarchicalAgent:
         self.safety_mem = copy.deepcopy(state.get("safety_mem", self.safety_mem))
         self.upper_mem = copy.deepcopy(state.get("upper_mem", self.upper_mem))
         self.upper_plan = copy.deepcopy(state.get("upper_plan", None))
+        self.prev_projection_residual = np.asarray(
+            state.get("prev_projection_residual", self.prev_projection_residual),
+            dtype=np.float32,
+        ).copy()
+        self.prev_bus_headroom = float(state.get("prev_bus_headroom", self.prev_bus_headroom))
+        self._restore_rng_state(state.get("rng", {}))
+
+    def current_physical_features(self, temps: np.ndarray | None = None) -> np.ndarray:
+        diag = self.safety.thermal_diagnostics(temps=temps)
+        gain_mean = np.asarray(diag.get("thermal_gain_mean", np.ones(3)), dtype=np.float32).reshape(-1)[:3]
+        gain_std = np.asarray(diag.get("thermal_gain_std", np.zeros(3)), dtype=np.float32).reshape(-1)[:3]
+        temp_slope = np.asarray(diag.get("temperature_slope", np.zeros(3)), dtype=np.float32).reshape(-1)[:3] / 10.0
+        headroom = np.asarray(diag.get("thermal_headroom", np.zeros(3)), dtype=np.float32).reshape(-1)[:3]
+        headroom = np.nan_to_num(headroom / max(float(self.safety.thermal_safe), 1.0e-6), nan=0.0)
+        bus_headroom = np.asarray([float(self.prev_bus_headroom)], dtype=np.float32)
+        residual = np.asarray(self.prev_projection_residual, dtype=np.float32).reshape(-1)[:5]
+        features = np.concatenate([gain_mean, gain_std, temp_slope, headroom, bus_headroom, residual]).astype(np.float32)
+        if features.size != self.physical_feature_dim:
+            out = np.zeros((self.physical_feature_dim,), dtype=np.float32)
+            out[: min(features.size, self.physical_feature_dim)] = features[: self.physical_feature_dim]
+            features = out
+        return features
+
+    def update_safety_estimator(
+        self,
+        *,
+        temps_before: np.ndarray,
+        info: Dict,
+    ) -> Dict[str, np.ndarray | bool]:
+        thermal_base = np.asarray(
+            [
+                float(info.get("thermal_base_tx0", 0.0)),
+                float(info.get("thermal_base_tx1", 0.0)),
+                float(info.get("thermal_base_tx2", 0.0)),
+            ],
+            dtype=np.float32,
+        )
+        return self.safety.update_thermal_estimator(
+            currents=np.asarray(info.get("currents_exec", np.zeros(3, dtype=np.float32)), dtype=np.float32),
+            temps_before=np.asarray(temps_before, dtype=np.float32),
+            temps_after=np.asarray(info.get("temps", temps_before), dtype=np.float32),
+            thermal_base=thermal_base,
+            delta=float(info.get("delta", 0.0)),
+        )
 
     @staticmethod
     def _average_state_dict(states: list[Dict[str, torch.Tensor]]) -> Dict[str, torch.Tensor]:
@@ -268,11 +360,38 @@ class HierarchicalAgent:
 
         self._blend_module_state(self.upper.q, upper_q, step_size)
         self._blend_module_state(self.upper.q_tgt, upper_q_tgt, step_size)
+        if self.upper.q_phys is not None and all(s["upper"].get("q_phys") is not None for s in adapted_states):
+            upper_q_phys = self._average_state_dict([s["upper"]["q_phys"] for s in adapted_states])
+            self._blend_module_state(self.upper.q_phys, upper_q_phys, step_size)
+        if self.upper.q_tgt_phys is not None and all(s["upper"].get("q_tgt_phys") is not None for s in adapted_states):
+            upper_q_tgt_phys = self._average_state_dict([s["upper"]["q_tgt_phys"] for s in adapted_states])
+            self._blend_module_state(self.upper.q_tgt_phys, upper_q_tgt_phys, step_size)
         self._blend_module_state(self.lower.actor, lower_actor, step_size)
         self._blend_module_state(self.lower.q1, lower_q1, step_size)
         self._blend_module_state(self.lower.q2, lower_q2, step_size)
         self._blend_module_state(self.lower.q1_tgt, lower_q1_tgt, step_size)
         self._blend_module_state(self.lower.q2_tgt, lower_q2_tgt, step_size)
+        if self.lower.actor_phys is not None and all(s["lower"].get("actor_phys") is not None for s in adapted_states):
+            actor_phys = self._average_state_dict([s["lower"]["actor_phys"] for s in adapted_states])
+            self._blend_module_state(self.lower.actor_phys, actor_phys, step_size)
+        if self.lower.q1_phys is not None and all(s["lower"].get("q1_phys") is not None for s in adapted_states):
+            q1_phys = self._average_state_dict([s["lower"]["q1_phys"] for s in adapted_states])
+            self._blend_module_state(self.lower.q1_phys, q1_phys, step_size)
+        if self.lower.q2_phys is not None and all(s["lower"].get("q2_phys") is not None for s in adapted_states):
+            q2_phys = self._average_state_dict([s["lower"]["q2_phys"] for s in adapted_states])
+            self._blend_module_state(self.lower.q2_phys, q2_phys, step_size)
+        if self.lower.q1_tgt_phys is not None and all(s["lower"].get("q1_tgt_phys") is not None for s in adapted_states):
+            q1_tgt_phys = self._average_state_dict([s["lower"]["q1_tgt_phys"] for s in adapted_states])
+            self._blend_module_state(self.lower.q1_tgt_phys, q1_tgt_phys, step_size)
+        if self.lower.q2_tgt_phys is not None and all(s["lower"].get("q2_tgt_phys") is not None for s in adapted_states):
+            q2_tgt_phys = self._average_state_dict([s["lower"]["q2_tgt_phys"] for s in adapted_states])
+            self._blend_module_state(self.lower.q2_tgt_phys, q2_tgt_phys, step_size)
+        if self.lower.constraint_q is not None and all(s["lower"].get("constraint_q") is not None for s in adapted_states):
+            constraint_q = self._average_state_dict([s["lower"]["constraint_q"] for s in adapted_states])
+            self._blend_module_state(self.lower.constraint_q, constraint_q, step_size)
+        if self.lower.constraint_q_tgt is not None and all(s["lower"].get("constraint_q_tgt") is not None for s in adapted_states):
+            constraint_q_tgt = self._average_state_dict([s["lower"]["constraint_q_tgt"] for s in adapted_states])
+            self._blend_module_state(self.lower.constraint_q_tgt, constraint_q_tgt, step_size)
         self._blend_module_state(self.context_encoder, ctx_enc, step_size)
         self._blend_module_state(self.context_predictor, ctx_pred, step_size)
         if self.lower.auto_alpha and self.lower.log_alpha is not None:
@@ -321,6 +440,7 @@ class HierarchicalAgent:
 
         macro_new = self.upper_mem["hold_left"] <= 0
         exec_map = self.safety.raw_to_exec_map(self.safety_mem)
+        physical_features = self.current_physical_features(temps=temps)
         if macro_new:
             if self.upper_plan is not None:
                 upper_idx_raw = int(self.upper_plan)
@@ -332,6 +452,7 @@ class HierarchicalAgent:
                     t=self.global_step,
                     eval_mode=eval_mode,
                     exec_map=exec_map,
+                    physical_features=physical_features,
                 )
             self.upper_mem["upper_idx"] = int(upper_idx_raw)
             self.upper_mem["hold_left"] = max(1, self.upper_hold_steps)
@@ -341,7 +462,39 @@ class HierarchicalAgent:
 
         boost_preview, mode_preview = self.safety.preview_exec(upper_idx_raw, self.safety_mem)
         upper_idx_exec = self.safety.encode_exec(boost_preview, mode_preview)
-        lower_raw = self.lower.select_action(obs, z, upper_idx=upper_idx_exec, eval_mode=eval_mode)
+        lower_raw = self.lower.select_action(
+            obs,
+            z,
+            upper_idx=upper_idx_exec,
+            physical_features=physical_features,
+            eval_mode=eval_mode,
+        )
+        policy_lower_raw = lower_raw.copy().astype(np.float32)
+        planner_aux: Dict[str, object] = {
+            "residual_planner_enabled": False,
+            "residual_planner_candidate_count": 0,
+            "residual_planner_latency_ms": 0.0,
+            "residual_planner_score_improvement": 0.0,
+        }
+        if self.residual_planner.active(meta_iter=self.current_meta_iter):
+            thermal_diag = self.safety.thermal_diagnostics(temps=temps)
+            lower_raw, planner_aux = self.residual_planner.plan(
+                lower=self.lower,
+                safety=self.safety,
+                obs=obs,
+                z=z,
+                upper_idx_exec=int(upper_idx_exec),
+                boost_combo=int(boost_preview),
+                mode=int(mode_preview),
+                policy_raw=lower_raw,
+                physical_features=physical_features,
+                thermal_headroom=np.asarray(thermal_diag.get("thermal_headroom", np.zeros(3)), dtype=np.float32),
+                temps=temps,
+                amb_temp=amb_temp,
+                gamma=gamma,
+                delta=delta,
+                meta_iter=int(self.current_meta_iter),
+            )
 
         safe, self.safety_mem = self.safety.project_np(
             upper_idx_raw,
@@ -366,6 +519,25 @@ class HierarchicalAgent:
         exec_vec = np.concatenate(
             [safe["currents_exec"], np.asarray([safe["rho_exec"], safe["tau_exec"]], dtype=np.float32)]
         ).astype(np.float32)
+        desired_currents = np.asarray(safe["raw_current_frac"], dtype=np.float32) * self.safety.current_max
+        desired_vec = np.concatenate(
+            [
+                desired_currents.astype(np.float32),
+                np.asarray([safe["rho_raw_decoded"], safe["tau_raw_decoded"]], dtype=np.float32),
+            ]
+        ).astype(np.float32)
+        projection_residual = exec_vec - desired_vec
+        projection_residual_norm = projection_residual.copy()
+        projection_residual_norm[:3] = projection_residual_norm[:3] / np.maximum(self.safety.current_max, 1.0e-6)
+        self.prev_projection_residual = projection_residual_norm.astype(np.float32)
+        self.prev_bus_headroom = float(
+            np.clip(
+                (self.safety.bus_current_max - float(safe.get("projected_current_total", 0.0)))
+                / max(self.safety.bus_current_max, 1.0e-6),
+                0.0,
+                1.0,
+            )
+        )
 
         aux = {
             "z": z,
@@ -375,6 +547,11 @@ class HierarchicalAgent:
             "mode_exec": int(safe["mode_exec"]),
             "act_exec": exec_vec,
             "act_raw": lower_raw.astype(np.float32),
+            "act_policy_raw": policy_lower_raw.astype(np.float32),
+            "act_desired": desired_vec.astype(np.float32),
+            "projection_residual": projection_residual_norm.astype(np.float32),
+            "physical_features": physical_features.astype(np.float32),
+            **planner_aux,
             "t_pred": safe["t_pred"],
             "thermal_scale": safe["thermal_scale"],
             "thermal_soft_scale": safe.get("thermal_soft_scale"),
@@ -392,6 +569,14 @@ class HierarchicalAgent:
             "bus_projected_current_total": safe.get("bus_projected_current_total"),
             "projected_current_total": safe.get("projected_current_total"),
             "projection_compression_ratio": safe.get("projection_compression_ratio"),
+            "adaptive_thermal_enabled": safe.get("adaptive_thermal_enabled"),
+            "thermal_gain_mean": safe.get("thermal_gain_mean"),
+            "thermal_gain_std": safe.get("thermal_gain_std"),
+            "thermal_gain_safe_scale": safe.get("thermal_gain_safe_scale"),
+            "thermal_gain_beta": safe.get("thermal_gain_beta"),
+            "thermal_gain_valid_count": safe.get("thermal_gain_valid_count"),
+            "temperature_slope": safe.get("temperature_slope"),
+            "thermal_headroom": safe.get("thermal_headroom"),
             "macro_new": bool(macro_new),
             "hold_left": int(self.upper_mem["hold_left"]),
         }
@@ -404,6 +589,7 @@ class HierarchicalAgent:
         self,
         next_obs: np.ndarray,
         z_next: np.ndarray,
+        physical_features_next: np.ndarray | None = None,
         eval_mode: bool = False,
         commit_plan: bool = False,
     ) -> Dict[str, int]:
@@ -417,6 +603,7 @@ class HierarchicalAgent:
                     t=self.global_step + 1,
                     eval_mode=eval_mode,
                     exec_map=next_exec_map,
+                    physical_features=physical_features_next,
                 )
             )
             if commit_plan:
@@ -562,13 +749,18 @@ class HierarchicalAgent:
             "context_encoder": self.context_encoder.state_dict(),
             "context_predictor": self.context_predictor.state_dict(),
             "context_optim": self.context_optim.state_dict(),
+            "safety": self.safety.state_dict(),
             "global_step": self.global_step,
+            "current_meta_iter": int(self.current_meta_iter),
             "alignment_meta": self._alignment_meta(pre_alignment=False),
         }
         torch.save(ckpt, ckpt_path)
 
     def load(self, ckpt_path: str | Path) -> None:
-        ckpt = torch.load(ckpt_path, map_location=self.device)
+        try:
+            ckpt = torch.load(ckpt_path, map_location=self.device, weights_only=False)
+        except TypeError:
+            ckpt = torch.load(ckpt_path, map_location=self.device)
         self.upper.load_state_dict(ckpt["upper"])
         self.lower.load_state_dict(ckpt["lower"])
         self.context_encoder.load_state_dict(ckpt["context_encoder"])
@@ -584,6 +776,8 @@ class HierarchicalAgent:
             except ValueError:
                 # Allow loading older checkpoints saved before predictor params were added.
                 pass
+        if "safety" in ckpt:
+            self.safety.load_state_dict(ckpt["safety"])
         self.loaded_alignment_meta = dict(
             ckpt.get(
                 "alignment_meta",
@@ -593,3 +787,4 @@ class HierarchicalAgent:
         if "pre_alignment" not in self.loaded_alignment_meta:
             self.loaded_alignment_meta["pre_alignment"] = True
         self.global_step = int(ckpt.get("global_step", 0))
+        self.current_meta_iter = int(ckpt.get("current_meta_iter", self.current_meta_iter))

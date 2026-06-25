@@ -22,7 +22,7 @@ from scripts.benchmark_constraint_scenarios import (
 from tchhmrl.agents.hierarchical_agent import HierarchicalAgent
 from tchhmrl.agents.sac_lower import LowerSAC
 from tchhmrl.envs.uw_slipt_env import MultiTxUwSliptEnv
-from tchhmrl.envs.task_contract import build_task_summary_v2
+from tchhmrl.envs.task_contract import build_context_task_summary_v2
 from tchhmrl.utils.config import apply_cli_overrides, load_cfg, resolve_device
 
 
@@ -51,6 +51,7 @@ class ProfileSample:
     mode_exec: int
     upper_ctx_t: torch.Tensor
     obs_aug_t: torch.Tensor
+    physical_features_np: np.ndarray
     lower_raw_np: np.ndarray
 
 
@@ -242,7 +243,13 @@ def _collect_real_eval_samples(
                     upper_idx_exec = agent.safety.encode_exec(boost_exec, mode_exec)
                     upper_ctx_t = _upper_ctx_tensor(upper_idx_exec, agent.device)
                     obs_t = torch.tensor(obs.astype(np.float32), dtype=torch.float32, device=agent.device).unsqueeze(0)
-                    obs_aug_t = torch.cat([obs_t, upper_ctx_t], dim=1)
+                    physical_features_np = agent.current_physical_features(temps=env.temps)
+                    obs_aug_t = agent.lower._augment_np(
+                        obs.astype(np.float32),
+                        upper_idx=upper_idx_exec,
+                        physical_features=physical_features_np,
+                        encoder=agent.lower.actor_phys,
+                    )
 
                     lower_raw_t = agent.lower.actor.deterministic(obs_aug_t, z_t)
                     lower_raw_np = lower_raw_t.squeeze(0).detach().cpu().numpy().astype(np.float32)
@@ -267,6 +274,7 @@ def _collect_real_eval_samples(
                             mode_exec=int(mode_exec),
                             upper_ctx_t=upper_ctx_t.detach(),
                             obs_aug_t=obs_aug_t.detach(),
+                            physical_features_np=physical_features_np.astype(np.float32).copy(),
                             lower_raw_np=lower_raw_np.copy(),
                         )
                     )
@@ -311,7 +319,10 @@ def _collect_real_eval_samples(
                         "qos_min_rate_env": float(env.qos_min_rate),
                         "distances_env": np.asarray(env.distances, dtype=np.float32).copy(),
                     }
-                    transition["task_params"] = np.asarray(build_task_summary_v2(transition), dtype=np.float32)
+                    transition["task_params"] = np.asarray(
+                        build_context_task_summary_v2(transition),
+                        dtype=np.float32,
+                    )
                     agent.episode.add(transition)
                     obs = next_obs
 
@@ -503,8 +514,12 @@ def main() -> None:
             upper_idx_raw = int(s.held_upper_idx_raw)
         boost_exec, mode_exec = safety.preview_exec(upper_idx_raw, s.safety_mem)
         upper_idx_exec = safety.encode_exec(boost_exec, mode_exec)
-        upper_ctx = _upper_ctx_tensor(upper_idx_exec, device)
-        obs_aug = torch.cat([s.obs_t, upper_ctx], dim=1)
+        obs_aug = agent.lower._augment_np(
+            s.obs_np,
+            upper_idx=upper_idx_exec,
+            physical_features=s.physical_features_np,
+            encoder=agent.lower.actor_phys,
+        )
         raw_t = agent.lower.actor.deterministic(obs_aug, z_t)
         raw_np = raw_t.squeeze(0).detach().cpu().numpy().astype(np.float32)
         return safety.project_np(

@@ -3,9 +3,11 @@ from __future__ import annotations
 import copy
 import csv
 
+import numpy as np
 import torch
 
 from scripts.meta_adaptation_diagnostics import run_meta_adaptation_diagnostics
+from tchhmrl.agents.hierarchical_agent import HierarchicalAgent
 from tchhmrl.meta.support_gate import SupportGateStats, evaluate_support_gate
 from tchhmrl.meta.meta_trainer import MetaTrainer
 from tchhmrl.utils.config import load_cfg
@@ -17,13 +19,18 @@ def test_default_meta_protocol_uses_heldout_query_and_stable_checkpoint_selectio
         assert int(cfg["meta"]["meta_iters"]) == 100
         assert int(cfg["meta"]["n_tasks_per_iter"]) == 8
         assert int(cfg["meta"]["support_episodes"]) == 5
+        assert int(cfg["meta"]["support_adaptation_episodes"]) == 3
+        assert int(cfg["meta"]["support_gate_validation_episodes"]) == 2
         assert int(cfg["meta"]["query_episodes"]) == 2
         assert bool(cfg["meta"]["query_updates_enabled"]) is False
         assert bool(cfg["meta"]["query_context_updates_enabled"]) is True
         assert str(cfg["meta"]["protocol_name"]) == "strict_support_query"
         assert bool(cfg["meta"]["support_gate"]["enabled"]) is True
         assert str(cfg["meta"]["support_gate"]["role"]) == "rollback_guard"
+        assert str(cfg["meta"]["support_gate"]["rule"]) == "safety_first"
         assert cfg["meta"]["support_gate"]["query_leakage"] is False
+        assert float(cfg["meta"]["support_gate"]["max_violation_increase"]) == 1.0e-4
+        assert float(cfg["meta"]["support_gate"]["max_cost_increase"]) == 1.0e-5
         assert int(cfg["buffer"]["context_max_len"]) >= int(cfg["env"]["episode_len"]) * (
             int(cfg["meta"]["support_episodes"]) + int(cfg["meta"]["query_episodes"])
         )
@@ -35,6 +42,7 @@ def test_default_meta_protocol_uses_heldout_query_and_stable_checkpoint_selectio
         selection = cfg["meta"]["checkpoint_selection"]
         assert bool(selection["enabled"]) is True
         assert str(selection["mode"]) == "heldout_eval"
+        assert int(selection["min_iter"]) == int(cfg["residual_planner"]["thermal_horizon_start_meta_iter"])
         assert int(selection["eval_tasks"]) == 10
         assert int(selection["eval_eps"]) == 3
 
@@ -116,6 +124,42 @@ def test_support_gate_accept_reject_and_query_independence():
     assert rejected.reason == "reject_support_score_degradation"
 
 
+def test_safety_first_support_gate_rejects_safety_degradation_despite_reward_gain():
+    cfg = {
+        "rule": "safety_first",
+        "normalized_reward_threshold": 0.0,
+        "reward_normalization_eps": 1.0,
+        "max_cost_increase": 1.0e-5,
+        "max_violation_increase": 1.0e-4,
+    }
+    violation_rejected = evaluate_support_gate(
+        SupportGateStats(reward=1.0, cost=0.1, violation_rate=0.0),
+        SupportGateStats(reward=2.0, cost=0.1, violation_rate=2.0e-4),
+        parameter_delta=0.5,
+        config={**cfg, "query_reward": 999.0},
+    )
+    cost_rejected = evaluate_support_gate(
+        SupportGateStats(reward=1.0, cost=0.1, violation_rate=0.0),
+        SupportGateStats(reward=2.0, cost=0.10002, violation_rate=0.0),
+        parameter_delta=0.5,
+        config=cfg,
+    )
+    accepted = evaluate_support_gate(
+        SupportGateStats(reward=1.0, cost=0.1, violation_rate=0.0),
+        SupportGateStats(reward=1.1, cost=0.1, violation_rate=0.0),
+        parameter_delta=0.5,
+        config={**cfg, "query_reward": -999.0},
+    )
+
+    assert violation_rejected.accepted is False
+    assert violation_rejected.reason == "reject_support_violation_increase"
+    assert violation_rejected.query_leakage is False
+    assert cost_rejected.accepted is False
+    assert cost_rejected.reason == "reject_support_cost_increase"
+    assert accepted.accepted is True
+    assert accepted.reason == "accept_safety_first_support_gate"
+
+
 def test_support_gate_reject_rolls_back_full_training_state(tmp_path):
     cfg = load_cfg("configs/default.yaml")
     cfg["experiment"]["log_dir"] = str(tmp_path)
@@ -137,7 +181,7 @@ def test_support_gate_reject_rolls_back_full_training_state(tmp_path):
     cfg["meta"]["inner_warmup_steps"] = 4
     cfg["meta"]["inner_upper_warmup_steps"] = 2
     cfg["meta"]["support_gate"]["enabled"] = True
-    cfg["meta"]["support_gate"]["score_threshold"] = 1.0e9
+    cfg["meta"]["support_gate"]["normalized_reward_threshold"] = 1.0e9
     cfg["upper_dqn"]["epsilon_decay_steps"] = 10
     cfg["context"]["gru_hidden"] = 16
 
@@ -155,9 +199,32 @@ def test_support_gate_reject_rolls_back_full_training_state(tmp_path):
     assert row["optimizer_state_restored"] == "True"
     assert row["context_state_restored"] == "True"
     assert row["dual_state_restored"] == "True"
+    assert row["thermal_estimator_state_restored"] == "True"
+    assert float(row["rollback_safety_estimator_residual"]) == 0.0
     assert int(float(row["extra_support_rollouts"])) == 0
     assert int(float(row["extra_gradient_updates"])) == 0
     assert int(float(row["extra_query_evaluations"])) == 0
+
+
+def test_agent_mutable_snapshot_restores_thermal_estimator_state():
+    cfg = copy.deepcopy(load_cfg("configs/default.yaml"))
+    cfg["experiment"]["device"] = "cpu"
+    agent = HierarchicalAgent(cfg, torch.device("cpu"))
+
+    snap = agent.snapshot_mutable_state()
+    agent.safety.update_thermal_estimator(
+        currents=np.array([1.0, 1.0, 1.0], dtype=np.float32),
+        temps_before=np.array([30.0, 30.0, 30.0], dtype=np.float32),
+        temps_after=np.array([35.0, 36.0, 37.0], dtype=np.float32),
+        thermal_base=np.array([30.0, 30.0, 30.0], dtype=np.float32),
+        delta=4.0,
+    )
+    assert np.any(agent.safety.thermal_diagnostics()["thermal_gain_valid_count"] > 0.0)
+
+    agent.restore_mutable_state(snap)
+    restored = agent.safety.thermal_diagnostics()
+    assert np.allclose(restored["thermal_gain_valid_count"], 0.0)
+    assert np.allclose(restored["thermal_gain_mean"], 1.0)
 
 
 def test_support_gate_accept_keeps_adapted_parameters_without_extra_budget(tmp_path):
@@ -196,6 +263,51 @@ def test_support_gate_accept_keeps_adapted_parameters_without_extra_budget(tmp_p
     assert int(float(row["extra_support_rollouts"])) == 0
     assert int(float(row["extra_gradient_updates"])) == 0
     assert int(float(row["extra_query_evaluations"])) == 0
+
+
+def test_support_gate_uses_paired_pre_post_validation_seeds(tmp_path):
+    cfg = load_cfg("configs/default.yaml")
+    cfg["experiment"]["log_dir"] = str(tmp_path)
+    cfg["experiment"]["run_name"] = "gate_paired_validation_smoke"
+    cfg["experiment"]["seed"] = 29
+    cfg["env"]["episode_len"] = 4
+    cfg["agent"]["hidden_dim"] = 32
+    cfg["agent"]["batch_size"] = 4
+    cfg["agent"]["warmup_steps"] = 4
+    cfg["agent"]["upper_batch_size"] = 2
+    cfg["upper_dqn"]["batch_size"] = 2
+    cfg["agent"]["upper_update_every"] = 1
+    cfg["buffer"]["replay_size"] = 128
+    cfg["buffer"]["context_max_len"] = 64
+    cfg["meta"]["meta_iters"] = 1
+    cfg["meta"]["n_tasks_per_iter"] = 1
+    cfg["meta"]["support_episodes"] = 2
+    cfg["meta"]["support_adaptation_episodes"] = 1
+    cfg["meta"]["support_gate_validation_episodes"] = 1
+    cfg["meta"]["query_episodes"] = 0
+    cfg["meta"]["inner_warmup_steps"] = 4
+    cfg["meta"]["inner_upper_warmup_steps"] = 2
+    cfg["meta"]["support_gate"]["enabled"] = True
+    cfg["meta"]["support_gate"]["paired_validation"] = True
+    cfg["meta"]["support_gate"]["score_threshold"] = -1.0e9
+    cfg["upper_dqn"]["epsilon_decay_steps"] = 10
+    cfg["context"]["gru_hidden"] = 16
+
+    trainer = MetaTrainer(cfg)
+    csv_path = trainer.train(meta_iters=1)
+    with open(csv_path, newline="") as f:
+        row = list(csv.DictReader(f))[0]
+
+    assert row["support_gate_enabled"] == "True"
+    assert row["support_gate_paired_validation"] == "True"
+    assert row["support_gate_same_validation_seeds"] == "True"
+    assert int(float(row["support_gate_pre_validation_episodes"])) == 1
+    assert int(float(row["support_gate_post_validation_episodes"])) == 1
+    assert int(float(row["support_gate_validation_seed_pairs"])) == 1
+    assert int(float(row["support_gate_extra_rollouts"])) == 1
+    assert int(float(row["extra_gradient_updates"])) == 0
+    assert int(float(row["extra_query_evaluations"])) == 0
+    assert row["query_leakage"] == "False"
 
 
 def test_support_delta_norm_ignores_optimizer_state():
@@ -436,10 +548,13 @@ def test_support_gated_meta_uses_support_validation_not_query(tmp_path):
     gated_rows = [row for row in rows if row["variant"] == "hybrid_meta_support_gated"]
     assert gated_rows
     validation_rows = [row for row in gated_rows if row["support_gate_validation"] == "True"]
-    assert not validation_rows
+    assert validation_rows
+    assert all(row["support_train_adapts"] == "False" for row in validation_rows)
     support_rows = [row for row in gated_rows if row["phase"] == "support"]
     assert support_rows
-    assert all(row["support_train_adapts"] == "True" for row in support_rows)
+    adaptation_rows = [row for row in support_rows if row["support_gate_validation"] != "True"]
+    assert adaptation_rows
+    assert all(row["support_train_adapts"] == "True" for row in adaptation_rows)
     assert all(row["support_gate_selected"] in {"adapted", "rollback"} for row in support_rows)
     query_rows = [row for row in gated_rows if row["phase"] == "query"]
     assert query_rows

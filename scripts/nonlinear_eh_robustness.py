@@ -18,7 +18,7 @@ from scripts.benchmark_constraint_scenarios import (
 )
 from scripts.profile_online_latency import _choose_checkpoint, _load_yaml
 from tchhmrl.agents.hierarchical_agent import HierarchicalAgent
-from tchhmrl.envs.task_contract import build_task_summary_v2
+from tchhmrl.envs.task_contract import build_context_task_summary_v2
 from tchhmrl.envs.uw_slipt_env import MultiTxUwSliptEnv
 from tchhmrl.envs.physics_v2 import INDEPENDENT_SAFETY_PROJECTION_VERSION, normalize_safety_projection_version
 from tchhmrl.utils.config import resolve_device
@@ -158,7 +158,7 @@ def _run_eval(
                             "cost": float(info.get("cost", 0.0)),
                             "cost_vec": cost_vec.astype(np.float32),
                             "task_params": np.asarray(
-                                build_task_summary_v2(
+                                build_context_task_summary_v2(
                                     {
                                         "attenuation_c_env": float(env.attenuation_c),
                                         "misalign_std_env": float(env.misalign_std),

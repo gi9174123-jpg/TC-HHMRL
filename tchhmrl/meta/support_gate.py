@@ -45,7 +45,13 @@ def evaluate_support_gate(
     config: Mapping | None = None,
 ) -> SupportGateDecision:
     cfg = dict(config or {})
-    threshold = float(cfg.get("score_threshold", 0.0))
+    rule = str(cfg.get("rule", "support_score_non_degradation"))
+    reward_norm_eps = float(cfg.get("reward_normalization_eps", 1.0))
+    threshold = float(
+        cfg.get("normalized_reward_threshold", cfg.get("score_threshold", 0.0))
+        if rule == "safety_first"
+        else cfg.get("score_threshold", 0.0)
+    )
     max_param_delta = float(cfg.get("max_parameter_delta_norm", float("inf")))
     min_param_delta = float(cfg.get("min_parameter_delta_norm", 0.0))
     max_cost_increase = float(cfg.get("max_cost_increase", float("inf")))
@@ -58,6 +64,11 @@ def evaluate_support_gate(
     cost_delta = float(post_support_stats.cost - pre_support_stats.cost)
     violation_delta = float(post_support_stats.violation_rate - pre_support_stats.violation_rate)
     parameter_delta = float(parameter_delta)
+    normalized_reward_delta = float(
+        reward_delta / max(abs(float(pre_support_stats.reward)), reward_norm_eps)
+    )
+    if rule == "safety_first":
+        gate_score = normalized_reward_delta
 
     finite_values = [
         before_score,
@@ -72,6 +83,72 @@ def evaluate_support_gate(
         return SupportGateDecision(
             accepted=False,
             reason="reject_nonfinite_support_or_parameter_metric",
+            gate_score=gate_score,
+            threshold=threshold,
+            support_stats_before=pre_support_stats,
+            support_stats_after=post_support_stats,
+            reward_delta=reward_delta,
+            cost_delta=cost_delta,
+            violation_delta=violation_delta,
+            parameter_delta_norm=parameter_delta,
+        )
+    if rule == "safety_first":
+        if violation_delta > max_violation_increase:
+            return SupportGateDecision(
+                accepted=False,
+                reason="reject_support_violation_increase",
+                gate_score=gate_score,
+                threshold=threshold,
+                support_stats_before=pre_support_stats,
+                support_stats_after=post_support_stats,
+                reward_delta=reward_delta,
+                cost_delta=cost_delta,
+                violation_delta=violation_delta,
+                parameter_delta_norm=parameter_delta,
+            )
+        if cost_delta > max_cost_increase:
+            return SupportGateDecision(
+                accepted=False,
+                reason="reject_support_cost_increase",
+                gate_score=gate_score,
+                threshold=threshold,
+                support_stats_before=pre_support_stats,
+                support_stats_after=post_support_stats,
+                reward_delta=reward_delta,
+                cost_delta=cost_delta,
+                violation_delta=violation_delta,
+                parameter_delta_norm=parameter_delta,
+            )
+        if parameter_delta > max_param_delta:
+            return SupportGateDecision(
+                accepted=False,
+                reason="reject_parameter_delta_too_large",
+                gate_score=gate_score,
+                threshold=threshold,
+                support_stats_before=pre_support_stats,
+                support_stats_after=post_support_stats,
+                reward_delta=reward_delta,
+                cost_delta=cost_delta,
+                violation_delta=violation_delta,
+                parameter_delta_norm=parameter_delta,
+            )
+        if parameter_delta < min_param_delta:
+            return SupportGateDecision(
+                accepted=False,
+                reason="reject_parameter_delta_too_small",
+                gate_score=gate_score,
+                threshold=threshold,
+                support_stats_before=pre_support_stats,
+                support_stats_after=post_support_stats,
+                reward_delta=reward_delta,
+                cost_delta=cost_delta,
+                violation_delta=violation_delta,
+                parameter_delta_norm=parameter_delta,
+            )
+        accepted = bool(normalized_reward_delta >= threshold)
+        return SupportGateDecision(
+            accepted=accepted,
+            reason="accept_safety_first_support_gate" if accepted else "reject_support_reward_not_improved",
             gate_score=gate_score,
             threshold=threshold,
             support_stats_before=pre_support_stats,
@@ -147,4 +224,3 @@ def evaluate_support_gate(
         violation_delta=violation_delta,
         parameter_delta_norm=parameter_delta,
     )
-

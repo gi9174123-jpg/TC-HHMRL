@@ -89,6 +89,53 @@ safety:
   thermal_safe: 49.0
   thermal_cutoff: 59.0
 
+adaptive_thermal:
+  enabled: true
+  excitation_threshold: 0.03
+  ema_alpha: 0.10
+  innovation_clip: 3.0
+  uncertainty_beta_min: 0.5
+  uncertainty_beta_max: 1.5
+  min_gain: 0.5
+  max_gain: 2.0
+  initial_mean: 1.0
+  initial_std: 0.0
+
+physical_context:
+  enabled: true
+  input_dim: 18
+  hidden_dim: 64
+  embedding_dim: 32
+  include_gain_mean: true
+  include_gain_std: true
+  include_temp_slope: true
+  include_headroom: true
+  include_bus_headroom: true
+  include_projection_residual: true
+
+constraint_critics:
+  enabled: true
+  out_dim: 4
+  reward_target: raw_reward
+  actor_weights: [0.05, 0.10, 0.10, 0.10]
+  target_nonnegative: true
+  actor_penalty_nonnegative: true
+
+residual_planner:
+  enabled: true
+  candidate_count: 24
+  current_step: 0.05
+  ratio_step: 0.05
+  disagreement_beta: 0.10
+  projection_penalty: 0.10
+  constraint_beta: 1.0
+  thermal_risk_beta: 0.05
+  thermal_margin_target_c: 1.0
+  thermal_horizon: 2
+  start_meta_iter: 60
+  thermal_horizon_start_meta_iter: 86
+  replacement_margin: 0.0
+
 agent:
   obs_dim: 20
   act_lower_dim: 5
@@ -106,6 +153,8 @@ agent:
   warmup_steps: 1500
 
 upper_dqn:
+  double_dqn: true
+  dueling: true
   batch_size: 64
   lr: 2.0e-4
   epsilon_start: 1.0
@@ -188,6 +237,8 @@ meta:
   n_tasks_per_iter: 8
   meta_iters: 100
   support_episodes: 5
+  support_adaptation_episodes: 3
+  support_gate_validation_episodes: 2
   query_episodes: 2
   dual_lr: 0.05
   dual_lrs: [0.02, 0.05, 0.05, 0.05]
@@ -204,17 +255,20 @@ meta:
   support_gate:
     enabled: true
     role: rollback_guard
-    rule: support_score_non_degradation
+    rule: safety_first
+    paired_validation: true
     reward_weight: 1.0
     cost_weight: 1.0
     violation_weight: 1.0
     score_threshold: 0.0
-    max_cost_increase: .inf
-    max_violation_increase: .inf
+    normalized_reward_threshold: 0.0
+    reward_normalization_eps: 1.0
+    max_cost_increase: 1.0e-5
+    max_violation_increase: 1.0e-4
     min_parameter_delta_norm: 0.0
     max_parameter_delta_norm: .inf
     query_leakage: false
-    extra_support_rollouts: 0
+    extra_support_rollouts: 2
     extra_gradient_updates: 0
     extra_query_evaluations: 0
   inner_warmup_steps: 128
@@ -222,6 +276,7 @@ meta:
   checkpoint_selection:
     enabled: true
     mode: heldout_eval
+    min_iter: 86
     eval_tasks: 10
     eval_eps: 3
     reward_w: 1.0

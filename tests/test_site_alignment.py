@@ -7,6 +7,7 @@ import numpy as np
 from scripts.benchmark_constraint_scenarios import apply_scenario, apply_variant, sample_fixed_tasks, validate_training_config
 from tchhmrl.agents.hierarchical_agent import HierarchicalAgent
 from tchhmrl.envs.task_contract import (
+    build_context_task_summary_v2,
     build_task_summary_v2,
     filter_formally_comparable_records,
     is_formally_comparable_record,
@@ -144,7 +145,32 @@ def test_context_site_v2_task_summary_reaches_eval_and_train_paths(tmp_path):
     assert np.allclose(np.asarray(tr["distances_env"]), np.asarray(task.distances, dtype=np.float32))
     extracted = trainer.agent._task_params_from_transition(tr)
     assert extracted.shape == (9,)
+    assert np.allclose(extracted[[0, 1, 3, 4]], 0.0)
+    assert np.isclose(extracted[2], float(task.amb_temp))
+    assert np.isclose(extracted[5], float(task.qos_min_rate))
     assert np.allclose(extracted[-3:], np.asarray(task.distances, dtype=np.float32))
+
+
+def test_context_task_summary_masks_hidden_true_environment_parameters():
+    task_like = {
+        "attenuation_c_env": 0.88,
+        "misalign_std_env": 0.17,
+        "amb_temp_env": 30.0,
+        "gamma_env": 0.12,
+        "delta_env": 3.4,
+        "qos_min_rate_env": 0.05,
+        "distances_env": np.asarray([1.2, 2.3, 3.4], dtype=np.float32),
+    }
+    full = build_task_summary_v2(task_like)
+    context = build_context_task_summary_v2(task_like)
+
+    assert full.shape == (9,)
+    assert context.shape == (9,)
+    assert not np.allclose(full[[0, 1, 3, 4]], 0.0)
+    assert np.allclose(context[[0, 1, 3, 4]], 0.0)
+    assert np.isclose(context[2], 30.0)
+    assert np.isclose(context[5], 0.05)
+    assert np.allclose(context[-3:], np.asarray([1.2, 2.3, 3.4], dtype=np.float32))
 
 
 def test_site_bank_validation_and_fixed_task_sharing_across_variants():

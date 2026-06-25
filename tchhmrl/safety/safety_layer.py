@@ -14,6 +14,7 @@ from tchhmrl.envs.physics_v2 import (
     normalize_safety_projection_version,
     validate_coupling_matrix,
 )
+from tchhmrl.safety.thermal_estimator import ThermalGainEstimator
 
 
 def _sigmoid_np(x: np.ndarray) -> np.ndarray:
@@ -99,8 +100,51 @@ class SafetyLayer:
         thermal_led_coeff = float(hybrid_cfg.get("thermal_led_coeff", 1.00))
         thermal_ld_coeff = float(hybrid_cfg.get("thermal_ld_coeff", 1.25))
         self.tx_thermal_coeff = tx_is_led * thermal_led_coeff + tx_is_ld * thermal_ld_coeff
+        self.thermal_estimator = ThermalGainEstimator(
+            cfg.get("adaptive_thermal", {}),
+            n_tx=int(self.current_max.shape[0]),
+            thermal_safe=self.thermal_safe,
+        )
         self._dalal_eps = 1.0e-6
         self._dalal_iters = 4
+
+    def state_dict(self) -> Dict:
+        return {"thermal_estimator": self.thermal_estimator.state_dict()}
+
+    def load_state_dict(self, state: Dict) -> None:
+        if not state:
+            return
+        if "thermal_estimator" in state:
+            self.thermal_estimator.load_state_dict(state["thermal_estimator"])
+
+    def update_thermal_estimator(
+        self,
+        *,
+        currents: np.ndarray,
+        temps_before: np.ndarray,
+        temps_after: np.ndarray,
+        thermal_base: np.ndarray,
+        delta: float,
+    ) -> Dict[str, np.ndarray | bool]:
+        return self.thermal_estimator.update(
+            currents=currents,
+            temps_before=temps_before,
+            temps_after=temps_after,
+            thermal_base=thermal_base,
+            delta=float(delta),
+            thermal_coeff=self.tx_thermal_coeff,
+        )
+
+    def thermal_diagnostics(self, *, temps: np.ndarray | None = None) -> Dict[str, np.ndarray | bool]:
+        return self.thermal_estimator.diagnostics(temps=temps)
+
+    def _safe_thermal_coeff_np(self) -> np.ndarray:
+        return (self.tx_thermal_coeff * self.thermal_estimator.safe_gain_scale()).astype(np.float32)
+
+    def _safe_thermal_coeff_torch(self, *, dtype: torch.dtype, device: torch.device) -> torch.Tensor:
+        scale = torch.as_tensor(self.thermal_estimator.safe_gain_scale(), dtype=dtype, device=device).view(1, -1)
+        coeff = torch.as_tensor(self.tx_thermal_coeff, dtype=dtype, device=device).view(1, -1)
+        return coeff * scale
 
     @staticmethod
     def decode_upper(upper_raw: int | np.ndarray) -> Tuple[int, int]:
@@ -244,7 +288,7 @@ class SafetyLayer:
     ) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
         base, coupling = self._thermal_base_np(temps, amb_temp, gamma)
         allowed_rise = self.thermal_safe - self.thermal_cap_margin_c - base
-        denom = max(float(delta), 0.0) * self.tx_thermal_coeff + 1.0e-6
+        denom = max(float(delta), 0.0) * self._safe_thermal_coeff_np() + 1.0e-6
         cap = np.sqrt(np.maximum(allowed_rise / denom, 0.0)).astype(np.float32)
         cap = np.minimum(cap, self.current_max).astype(np.float32)
         safe_currents = np.minimum(currents, cap).astype(np.float32)
@@ -443,7 +487,8 @@ class SafetyLayer:
 
         temps = np.asarray(temps, dtype=np.float32)
         thermal_base, thermal_source_term = self._thermal_base_np(temps, float(amb_temp), float(gamma))
-        T_pred = thermal_base + delta * self.tx_thermal_coeff * (currents**2)
+        thermal_coeff_safe_np = self._safe_thermal_coeff_np()
+        T_pred = thermal_base + delta * thermal_coeff_safe_np * (currents**2)
         thermal_cap_current = self.current_max.astype(np.float32)
         thermal_cap_scale = np.ones_like(currents, dtype=np.float32)
 
@@ -462,7 +507,8 @@ class SafetyLayer:
                 gamma=float(gamma),
                 delta=float(delta),
             )
-            T_pred = thermal_base + delta * self.tx_thermal_coeff * (currents**2)
+            thermal_coeff_safe_np = self._safe_thermal_coeff_np()
+            T_pred = thermal_base + delta * thermal_coeff_safe_np * (currents**2)
             thermal_cap_scale = thermal_scale.astype(np.float32)
             soft_scale = thermal_scale.astype(np.float32)
             cutoff_scale = np.ones_like(currents, dtype=np.float32)
@@ -476,7 +522,8 @@ class SafetyLayer:
                 gamma=float(gamma),
                 delta=float(delta),
             )
-            T_pred = thermal_base + delta * self.tx_thermal_coeff * (currents**2)
+            thermal_coeff_safe_np = self._safe_thermal_coeff_np()
+            T_pred = thermal_base + delta * thermal_coeff_safe_np * (currents**2)
             thermal_cap_scale = thermal_scale.astype(np.float32)
             soft_scale = thermal_scale.astype(np.float32)
             cutoff_scale = np.ones_like(currents, dtype=np.float32)
@@ -528,6 +575,7 @@ class SafetyLayer:
             "projected_current_total": projected_current_total,
             "projection_compression_ratio": projection_compression_ratio,
         }
+        out.update(self.thermal_diagnostics(temps=temps))
         if self.thermal_model == "coupled":
             out["thermal_coupling_term"] = thermal_source_term.astype(np.float32)
             out["thermal_base_coupled"] = thermal_base.astype(np.float32)
@@ -598,11 +646,7 @@ class SafetyLayer:
         if delta.dim() == 1:
             delta = delta.unsqueeze(1)
 
-        thermal_coeff = torch.as_tensor(
-            self.tx_thermal_coeff,
-            dtype=lower_raw.dtype,
-            device=device,
-        ).view(1, -1)
+        thermal_coeff = self._safe_thermal_coeff_torch(dtype=lower_raw.dtype, device=device)
         thermal_base, thermal_source_term = self._thermal_base_torch(temps, amb_temp, gamma)
         T_pred = thermal_base + delta * thermal_coeff * (currents**2)
         thermal_cap_current = current_max.expand_as(currents)
@@ -700,6 +744,15 @@ class SafetyLayer:
             "projected_current_total": projected_current_total,
             "projection_compression_ratio": projection_compression_ratio,
         }
+        diag = self.thermal_diagnostics(temps=temps.detach().cpu().numpy().reshape(-1)[: self.current_max.shape[0]])
+        for key, val in diag.items():
+            if isinstance(val, np.ndarray):
+                tensor = torch.as_tensor(val, dtype=lower_raw.dtype, device=device)
+                if tensor.dim() == 1:
+                    tensor = tensor.view(1, -1).expand(lower_raw.shape[0], -1)
+                out[key] = tensor
+            else:
+                out[key] = torch.full((lower_raw.shape[0],), float(bool(val)), dtype=lower_raw.dtype, device=device)
         if self.thermal_model == "coupled":
             out["thermal_coupling_term"] = thermal_source_term
             out["thermal_base_coupled"] = thermal_base

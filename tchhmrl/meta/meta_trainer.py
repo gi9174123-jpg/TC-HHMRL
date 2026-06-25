@@ -13,7 +13,7 @@ import torch
 from tchhmrl.agents.hierarchical_agent import HierarchicalAgent
 from tchhmrl.constraints.dual_layer import DualLayer
 from tchhmrl.envs.task_sampler import TaskSampler
-from tchhmrl.envs.task_contract import build_task_summary_v2, task_defaults_from_cfg
+from tchhmrl.envs.task_contract import build_context_task_summary_v2, task_defaults_from_cfg
 from tchhmrl.envs.uw_slipt_env import MultiTxUwSliptEnv
 from tchhmrl.meta.support_gate import SupportGateDecision, SupportGateStats, evaluate_support_gate
 from tchhmrl.utils.config import resolve_device
@@ -39,6 +39,13 @@ class EpisodeStats:
     eh_metric_raw_nonlinear: float = 0.0
     eh_saturation_fraction: float = 0.0
     eh_near_zero_fraction: float = 0.0
+    residual_planner_active_rate: float = 0.0
+    residual_planner_replacement_rate: float = 0.0
+    residual_planner_fallback_rate: float = 0.0
+    residual_planner_score_improvement: float = 0.0
+    residual_planner_best_score_improvement: float = 0.0
+    residual_planner_candidate_distance: float = 0.0
+    residual_planner_disagreement: float = 0.0
 
 
 class MetaTrainer:
@@ -78,6 +85,18 @@ class MetaTrainer:
         self.support_gate_enabled = bool(support_gate_cfg.get("enabled", False))
         self.support_gate_role = str(support_gate_cfg.get("role", "rollback_guard"))
         self.support_gate_rule = str(support_gate_cfg.get("rule", "support_score_non_degradation"))
+        self.support_gate_paired_validation = bool(support_gate_cfg.get("paired_validation", True))
+        support_eps = int(meta_cfg.get("support_episodes", 0))
+        default_adapt_eps = min(3, max(0, support_eps))
+        self.support_adaptation_episodes = int(meta_cfg.get("support_adaptation_episodes", default_adapt_eps))
+        self.support_adaptation_episodes = int(np.clip(self.support_adaptation_episodes, 0, max(0, support_eps)))
+        default_validation_eps = max(0, support_eps - self.support_adaptation_episodes)
+        self.support_gate_validation_episodes = int(
+            meta_cfg.get("support_gate_validation_episodes", default_validation_eps)
+        )
+        self.support_gate_validation_episodes = int(
+            np.clip(self.support_gate_validation_episodes, 0, max(0, support_eps - self.support_adaptation_episodes))
+        )
         self.inner_warmup_steps = int(meta_cfg.get("inner_warmup_steps", max(self.agent.batch_size, 64)))
         self.inner_upper_warmup_steps = int(
             meta_cfg.get("inner_upper_warmup_steps", max(self.agent.batch_size // 2, 32))
@@ -199,6 +218,25 @@ class MetaTrainer:
         return float(np.sqrt(float(np.sum(diff * diff))))
 
     @staticmethod
+    def _safety_state_delta_norm(reference: Dict, current: Dict) -> float:
+        ref_est = (reference or {}).get("thermal_estimator", {})
+        cur_est = (current or {}).get("thermal_estimator", {})
+        keys = ["gain_mean", "gain_var", "valid_count", "temperature_slope", "last_headroom"]
+        total = 0.0
+        for key in keys:
+            ref = np.asarray(ref_est.get(key, []), dtype=np.float32).reshape(-1)
+            cur = np.asarray(cur_est.get(key, []), dtype=np.float32).reshape(-1)
+            if ref.shape != cur.shape:
+                return float("inf")
+            ref_nan = np.isnan(ref)
+            cur_nan = np.isnan(cur)
+            if np.any(ref_nan != cur_nan):
+                return float("inf")
+            diff = np.where(ref_nan & cur_nan, 0.0, cur - ref)
+            total += float(np.sum(diff * diff))
+        return float(np.sqrt(total))
+
+    @staticmethod
     def _mean_gate_stats(stats: List[EpisodeStats]) -> SupportGateStats:
         if not stats:
             return SupportGateStats()
@@ -208,16 +246,18 @@ class MetaTrainer:
             violation_rate=float(np.mean([s.violations for s in stats])),
         )
 
-    @classmethod
-    def _support_gate_before_after(cls, stats: List[EpisodeStats]) -> tuple[SupportGateStats, SupportGateStats]:
+    def _support_gate_before_after(self, stats: List[EpisodeStats]) -> tuple[SupportGateStats, SupportGateStats]:
         if not stats:
             empty = SupportGateStats()
             return empty, empty
         if len(stats) == 1:
-            one = cls._mean_gate_stats(stats)
+            one = self._mean_gate_stats(stats)
             return one, one
-        split = max(1, len(stats) // 2)
-        return cls._mean_gate_stats(stats[:split]), cls._mean_gate_stats(stats[split:])
+        if self.support_gate_validation_episodes > 0 and len(stats) > self.support_adaptation_episodes:
+            split = int(np.clip(self.support_adaptation_episodes, 1, len(stats) - 1))
+        else:
+            split = max(1, len(stats) // 2)
+        return self._mean_gate_stats(stats[:split]), self._mean_gate_stats(stats[split:])
 
     def _support_gate_active(self) -> bool:
         return bool(self.support_gate_enabled and self.explicit_inner_outer)
@@ -227,8 +267,14 @@ class MetaTrainer:
         *,
         support_stats: List[EpisodeStats],
         parameter_delta: float,
+        pre_validation_stats: List[EpisodeStats] | None = None,
+        post_validation_stats: List[EpisodeStats] | None = None,
     ) -> SupportGateDecision:
-        before, after = self._support_gate_before_after(support_stats)
+        if pre_validation_stats is not None and post_validation_stats is not None:
+            before = self._mean_gate_stats(pre_validation_stats)
+            after = self._mean_gate_stats(post_validation_stats)
+        else:
+            before, after = self._support_gate_before_after(support_stats)
         return evaluate_support_gate(
             pre_support_stats=before,
             post_support_stats=after,
@@ -236,8 +282,77 @@ class MetaTrainer:
             config=self.support_gate_cfg,
         )
 
-    def _run_episode(self, env: MultiTxUwSliptEnv, train: bool, clear_context: bool = True) -> EpisodeStats:
-        obs, _ = env.reset()
+    def _support_gate_validation_seed(self, iteration: int, task_idx: int, validation_idx: int) -> int:
+        base_seed = int(self.cfg.get("experiment", {}).get("seed", 0))
+        seed = (
+            int(base_seed) * 1_000_003
+            + int(iteration) * 10_007
+            + int(task_idx) * 1_009
+            + int(validation_idx) * 37
+            + 17
+        )
+        return int(seed % (2**32 - 1))
+
+    def _run_gate_validation_pair(
+        self,
+        *,
+        task,
+        iteration: int,
+        task_idx: int,
+        candidate_state: Dict,
+        candidate_dual_state: Dict,
+        pre_state: Dict,
+        pre_dual_state: Dict,
+    ) -> tuple[List[EpisodeStats], List[EpisodeStats], List[int], float]:
+        seeds = [
+            self._support_gate_validation_seed(iteration, task_idx, val_idx)
+            for val_idx in range(int(self.support_gate_validation_episodes))
+        ]
+        if not seeds:
+            return [], [], [], 0.0
+
+        validation_start = time.perf_counter()
+        pre_stats: List[EpisodeStats] = []
+        self.agent.restore_mutable_state(pre_state)
+        self.dual.load_state_dict(copy.deepcopy(pre_dual_state))
+        for val_idx, seed in enumerate(seeds):
+            val_env = MultiTxUwSliptEnv(self.cfg, overrides=task.to_env_overrides())
+            pre_stats.append(
+                self._run_episode(
+                    val_env,
+                    train=False,
+                    clear_context=(val_idx == 0),
+                    reset_seed=seed,
+                )
+            )
+
+        post_stats: List[EpisodeStats] = []
+        self.agent.restore_mutable_state(candidate_state)
+        self.dual.load_state_dict(copy.deepcopy(candidate_dual_state))
+        for val_idx, seed in enumerate(seeds):
+            val_env = MultiTxUwSliptEnv(self.cfg, overrides=task.to_env_overrides())
+            post_stats.append(
+                self._run_episode(
+                    val_env,
+                    train=False,
+                    clear_context=(val_idx == 0),
+                    reset_seed=seed,
+                )
+            )
+
+        self.agent.restore_mutable_state(candidate_state)
+        self.dual.load_state_dict(copy.deepcopy(candidate_dual_state))
+        validation_latency_ms = float((time.perf_counter() - validation_start) * 1000.0)
+        return pre_stats, post_stats, seeds, validation_latency_ms
+
+    def _run_episode(
+        self,
+        env: MultiTxUwSliptEnv,
+        train: bool,
+        clear_context: bool = True,
+        reset_seed: int | None = None,
+    ) -> EpisodeStats:
+        obs, _ = env.reset(seed=reset_seed)
         self.agent.reset_rollout_state(clear_context=clear_context)
 
         ep_reward = 0.0
@@ -256,9 +371,17 @@ class MetaTrainer:
         ep_eh_raw_nonlinear = 0.0
         ep_eh_sat = 0.0
         ep_eh_near_zero = 0.0
+        ep_planner_active = 0.0
+        ep_planner_replaced = 0.0
+        ep_planner_fallback = 0.0
+        ep_planner_score_improvement = 0.0
+        ep_planner_best_score_improvement = 0.0
+        ep_planner_candidate_distance = 0.0
+        ep_planner_disagreement = 0.0
 
         macro_start_obs = None
         macro_start_z = None
+        macro_start_physical = None
         macro_upper_idx_raw = 0.0
         macro_upper_idx_exec = 0.0
         macro_reward = 0.0
@@ -280,6 +403,13 @@ class MetaTrainer:
             )
 
             next_obs, reward, terminated, truncated, info = env.step(action)
+            thermal_estimator_diag = self.agent.update_safety_estimator(
+                temps_before=temps_before,
+                info=info,
+            )
+            physical_features_next = self.agent.current_physical_features(
+                temps=np.asarray(info.get("temps", temps_before), dtype=np.float32)
+            )
             done = bool(terminated or truncated)
             ep_len += 1
 
@@ -299,6 +429,12 @@ class MetaTrainer:
                 "z": z.astype(np.float32),
                 "act_exec": aux["act_exec"].astype(np.float32),
                 "act_raw": aux["act_raw"].astype(np.float32),
+                "act_policy_raw": aux.get("act_policy_raw", aux["act_raw"]).astype(np.float32),
+                "act_desired": aux.get("act_desired", aux["act_exec"]).astype(np.float32),
+                "projection_residual": aux.get("projection_residual", np.zeros(5, dtype=np.float32)).astype(np.float32),
+                "residual_planner_score_improvement": float(aux.get("residual_planner_score_improvement", 0.0)),
+                "physical_features": aux.get("physical_features", np.zeros(18, dtype=np.float32)).astype(np.float32),
+                "physical_features_next": physical_features_next.astype(np.float32),
                 "boost_combo_exec": float(aux["boost_combo_exec"]),
                 "mode_exec": float(aux["mode_exec"]),
                 "temps": temps_before.astype(np.float32),
@@ -314,11 +450,32 @@ class MetaTrainer:
                 "distances_env": np.asarray(env.distances, dtype=np.float32).copy(),
                 "cost": cost,
                 "cost_vec": cost_vec.astype(np.float32),
+                "thermal_gain_mean": np.asarray(
+                    thermal_estimator_diag.get("thermal_gain_mean", np.ones(3, dtype=np.float32)),
+                    dtype=np.float32,
+                ),
+                "thermal_gain_std": np.asarray(
+                    thermal_estimator_diag.get("thermal_gain_std", np.zeros(3, dtype=np.float32)),
+                    dtype=np.float32,
+                ),
+                "thermal_gain_safe_scale": np.asarray(
+                    thermal_estimator_diag.get("thermal_gain_safe_scale", np.ones(3, dtype=np.float32)),
+                    dtype=np.float32,
+                ),
+                "temperature_slope": np.asarray(
+                    thermal_estimator_diag.get("temperature_slope", np.zeros(3, dtype=np.float32)),
+                    dtype=np.float32,
+                ),
+                "thermal_headroom": np.asarray(
+                    thermal_estimator_diag.get("thermal_headroom", np.zeros(3, dtype=np.float32)),
+                    dtype=np.float32,
+                ),
             }
 
             if bool(aux.get("macro_new", False)) or macro_start_obs is None:
                 macro_start_obs = obs.astype(np.float32)
                 macro_start_z = z.astype(np.float32)
+                macro_start_physical = aux.get("physical_features", np.zeros(18, dtype=np.float32)).astype(np.float32)
                 macro_upper_idx_raw = float(aux["upper_idx_raw"])
                 macro_upper_idx_exec = float(aux["upper_idx_exec"])
                 macro_reward = 0.0
@@ -346,6 +503,7 @@ class MetaTrainer:
                         nxt = self.agent.preview_next_macro(
                             next_obs=next_obs.astype(np.float32),
                             z_next=z_next_val.astype(np.float32),
+                            physical_features_next=physical_features_next.astype(np.float32),
                             eval_mode=False,
                             commit_plan=True,
                         )
@@ -364,6 +522,12 @@ class MetaTrainer:
                     upper_transition = {
                         "obs": macro_start_obs,
                         "next_obs": next_obs.astype(np.float32),
+                        "physical_features": (
+                            macro_start_physical
+                            if macro_start_physical is not None
+                            else np.zeros(18, dtype=np.float32)
+                        ),
+                        "physical_features_next": physical_features_next.astype(np.float32),
                         "upper_idx_raw": macro_upper_idx_raw,
                         "upper_idx_exec": macro_upper_idx_exec,
                         "reward": float(macro_reward),
@@ -394,7 +558,7 @@ class MetaTrainer:
                         "cost": lower_transition["cost"],
                         "cost_vec": lower_transition["cost_vec"],
                         "task_params": np.asarray(
-                            build_task_summary_v2(lower_transition),
+                            build_context_task_summary_v2(lower_transition),
                             dtype=np.float32,
                         ),
                     }
@@ -415,6 +579,13 @@ class MetaTrainer:
             ep_eh_raw_nonlinear += float(info.get("eh_metric_raw_nonlinear", info.get("eh_metric", 0.0)))
             ep_eh_sat += float(info.get("eh_saturation_fraction", 0.0))
             ep_eh_near_zero += float(info.get("eh_near_zero_fraction", 0.0))
+            ep_planner_active += float(bool(aux.get("residual_planner_enabled", False)))
+            ep_planner_replaced += float(bool(aux.get("residual_planner_replaced_policy", False)))
+            ep_planner_fallback += float(bool(aux.get("residual_planner_fallback_to_policy", False)))
+            ep_planner_score_improvement += float(aux.get("residual_planner_score_improvement", 0.0))
+            ep_planner_best_score_improvement += float(aux.get("residual_planner_best_score_improvement", 0.0))
+            ep_planner_candidate_distance += float(aux.get("residual_planner_candidate_distance", 0.0))
+            ep_planner_disagreement += float(aux.get("residual_planner_disagreement", 0.0))
 
             obs = next_obs
 
@@ -435,6 +606,13 @@ class MetaTrainer:
             eh_metric_raw_nonlinear=ep_eh_raw_nonlinear / max(ep_len, 1),
             eh_saturation_fraction=ep_eh_sat / max(ep_len, 1),
             eh_near_zero_fraction=ep_eh_near_zero / max(ep_len, 1),
+            residual_planner_active_rate=ep_planner_active / max(ep_len, 1),
+            residual_planner_replacement_rate=ep_planner_replaced / max(ep_len, 1),
+            residual_planner_fallback_rate=ep_planner_fallback / max(ep_len, 1),
+            residual_planner_score_improvement=ep_planner_score_improvement / max(ep_len, 1),
+            residual_planner_best_score_improvement=ep_planner_best_score_improvement / max(ep_len, 1),
+            residual_planner_candidate_distance=ep_planner_candidate_distance / max(ep_len, 1),
+            residual_planner_disagreement=ep_planner_disagreement / max(ep_len, 1),
         )
 
     def train(self, meta_iters: int | None = None) -> Path:
@@ -442,6 +620,7 @@ class MetaTrainer:
         meta_iters = int(meta_iters or meta_cfg["meta_iters"])
 
         for it in range(1, meta_iters + 1):
+            self.agent.set_meta_iter(it)
             iter_global_step_start = int(self.agent.global_step)
             iter_upper_steps_start = int(self.agent.upper.update_steps)
             iter_lower_steps_start = int(self.agent.lower.update_steps)
@@ -462,7 +641,7 @@ class MetaTrainer:
             shared_upper_steps = int(self.agent.upper.update_steps)
             shared_lower_steps = int(self.agent.lower.update_steps)
 
-            for task in tasks:
+            for task_idx, task in enumerate(tasks):
                 env = MultiTxUwSliptEnv(self.cfg, overrides=task.to_env_overrides())
                 if self.explicit_inner_outer and base_state is not None:
                     self.agent.restore_train_state(base_state)
@@ -479,8 +658,25 @@ class MetaTrainer:
                 rollback_dual_state = copy.deepcopy(self.dual.state_dict()) if gate_active else None
                 support_adapt_start = time.perf_counter()
                 task_support_stats: List[EpisodeStats] = []
-                for ep_idx in range(int(meta_cfg["support_episodes"])):
-                    ep_stats = self._run_episode(env, train=True, clear_context=(ep_idx == 0))
+                gate_pre_validation_stats: List[EpisodeStats] = []
+                gate_post_validation_stats: List[EpisodeStats] = []
+                gate_validation_seeds: List[int] = []
+                gate_validation_latency_ms = 0.0
+                paired_gate_validation = bool(
+                    gate_active and self.support_gate_paired_validation and self.support_gate_validation_episodes > 0
+                )
+                support_train_episode_count = 0
+                support_validation_episode_count = 0
+                support_episode_budget = (
+                    int(self.support_adaptation_episodes)
+                    if gate_active
+                    else int(meta_cfg["support_episodes"])
+                )
+                for ep_idx in range(support_episode_budget):
+                    support_train = bool((not gate_active) and ep_idx < self.support_adaptation_episodes) or bool(gate_active)
+                    support_train_episode_count += int(support_train)
+                    support_validation_episode_count += int(not support_train)
+                    ep_stats = self._run_episode(env, train=support_train, clear_context=(ep_idx == 0))
                     support_stats.append(ep_stats)
                     task_support_stats.append(ep_stats)
                 support_adapt_latency_ms = float((time.perf_counter() - support_adapt_start) * 1000.0)
@@ -505,16 +701,38 @@ class MetaTrainer:
                 rollback_context_residual = 0
                 rollback_lower_replay_residual = 0
                 rollback_upper_replay_residual = 0
+                rollback_safety_residual = 0.0
+                rng_state_restored = True
                 gate_latency_ms = 0.0
                 rollback_latency_ms = 0.0
 
                 if gate_active and rollback_state is not None and rollback_dual_state is not None:
-                    gate_start = time.perf_counter()
                     candidate_state = self.agent.snapshot_train_state()
+                    candidate_mutable_state = self.agent.snapshot_mutable_state()
+                    candidate_dual_state = copy.deepcopy(self.dual.state_dict())
+                    if paired_gate_validation:
+                        (
+                            gate_pre_validation_stats,
+                            gate_post_validation_stats,
+                            gate_validation_seeds,
+                            gate_validation_latency_ms,
+                        ) = self._run_gate_validation_pair(
+                            task=task,
+                            iteration=it,
+                            task_idx=task_idx,
+                            candidate_state=candidate_mutable_state,
+                            candidate_dual_state=candidate_dual_state,
+                            pre_state=rollback_state,
+                            pre_dual_state=rollback_dual_state,
+                        )
+                        support_validation_episode_count = len(gate_post_validation_stats)
+                    gate_start = time.perf_counter()
                     gate_parameter_delta_norm = self._trainable_parameter_delta_norm(rollback_state, candidate_state)
                     decision = self._evaluate_support_gate(
                         support_stats=task_support_stats,
                         parameter_delta=gate_parameter_delta_norm,
+                        pre_validation_stats=gate_pre_validation_stats if paired_gate_validation else None,
+                        post_validation_stats=gate_post_validation_stats if paired_gate_validation else None,
                     )
                     gate_accepted = bool(decision.accepted)
                     gate_reason = str(decision.reason)
@@ -542,6 +760,10 @@ class MetaTrainer:
                             rollback_dual_state,
                             self.dual.state_dict(),
                         )
+                        rollback_safety_residual = self._safety_state_delta_norm(
+                            rollback_state.get("safety", {}),
+                            self.agent.safety.state_dict(),
+                        )
                         rollback_context_residual = abs(
                             int(len(self.agent.episode))
                             - int(len(rollback_state.get("episode", {}).get("items", [])))
@@ -554,6 +776,7 @@ class MetaTrainer:
                             int(len(self.agent.upper_replay))
                             - int(len(rollback_state.get("upper_replay", {}).get("items", [])))
                         )
+                        rng_state_restored = "rng" in rollback_state
 
                 if self.explicit_inner_outer and self.dual_enabled and task_support_stats and gate_accepted:
                     task_support_mean_cost_vec = np.mean(
@@ -585,19 +808,38 @@ class MetaTrainer:
                         "rollback_context_residual": int(rollback_context_residual),
                         "rollback_lower_replay_residual": int(rollback_lower_replay_residual),
                         "rollback_upper_replay_residual": int(rollback_upper_replay_residual),
+                        "rollback_safety_estimator_residual": float(rollback_safety_residual),
+                        "thermal_estimator_state_restored": bool(rollback_safety_residual <= 1.0e-8),
+                        "rng_state_restored": bool(rng_state_restored),
                         "gate_latency_ms": float(gate_latency_ms),
                         "rollback_latency_ms": float(rollback_latency_ms),
                         "support_adaptation_latency_ms": float(support_adapt_latency_ms),
+                        "support_adaptation_episodes": int(support_train_episode_count),
+                        "support_gate_validation_episodes": int(support_validation_episode_count),
+                        "support_gate_paired_validation": bool(paired_gate_validation),
+                        "support_gate_pre_validation_episodes": int(len(gate_pre_validation_stats)),
+                        "support_gate_post_validation_episodes": int(len(gate_post_validation_stats)),
+                        "support_gate_validation_seed_pairs": int(len(gate_validation_seeds)),
+                        "support_gate_same_validation_seeds": bool(
+                            (not paired_gate_validation) or len(gate_pre_validation_stats) == len(gate_post_validation_stats)
+                        ),
+                        "support_gate_validation_latency_ms": float(gate_validation_latency_ms),
                         "total_adaptation_latency_ms": float(
-                            support_adapt_latency_ms + gate_latency_ms + rollback_latency_ms
+                            support_adapt_latency_ms
+                            + gate_validation_latency_ms
+                            + gate_latency_ms
+                            + rollback_latency_ms
                         ),
                         "ungated_support_adaptation_latency_ms": float(support_adapt_latency_ms),
                         "gated_support_adaptation_latency_ms": float(
-                            support_adapt_latency_ms + gate_latency_ms + rollback_latency_ms
+                            support_adapt_latency_ms
+                            + gate_validation_latency_ms
+                            + gate_latency_ms
+                            + rollback_latency_ms
                         )
                         if gate_active
                         else 0.0,
-                        "extra_support_rollouts": 0,
+                        "extra_support_rollouts": int(len(gate_pre_validation_stats)),
                         "extra_gradient_updates": 0,
                         "extra_query_evaluations": 0,
                         "query_leakage": False,
@@ -696,6 +938,27 @@ class MetaTrainer:
                 ),
                 "support_eh_saturation_fraction": float(np.mean([s.eh_saturation_fraction for s in support_stats])),
                 "support_eh_near_zero_fraction": float(np.mean([s.eh_near_zero_fraction for s in support_stats])),
+                "support_residual_planner_active_rate": float(
+                    np.mean([s.residual_planner_active_rate for s in support_stats])
+                ),
+                "support_residual_planner_replacement_rate": float(
+                    np.mean([s.residual_planner_replacement_rate for s in support_stats])
+                ),
+                "support_residual_planner_fallback_rate": float(
+                    np.mean([s.residual_planner_fallback_rate for s in support_stats])
+                ),
+                "support_residual_planner_score_improvement": float(
+                    np.mean([s.residual_planner_score_improvement for s in support_stats])
+                ),
+                "support_residual_planner_best_score_improvement": float(
+                    np.mean([s.residual_planner_best_score_improvement for s in support_stats])
+                ),
+                "support_residual_planner_candidate_distance": float(
+                    np.mean([s.residual_planner_candidate_distance for s in support_stats])
+                ),
+                "support_residual_planner_disagreement": float(
+                    np.mean([s.residual_planner_disagreement for s in support_stats])
+                ),
                 "query_reward": float(np.mean([s.reward for s in query_stats])) if query_stats else 0.0,
                 "query_se": float(np.mean([s.se for s in query_stats])) if query_stats else 0.0,
                 "query_eh": float(np.mean([s.eh for s in query_stats])) if query_stats else 0.0,
@@ -720,6 +983,41 @@ class MetaTrainer:
                 "query_eh_near_zero_fraction": float(np.mean([s.eh_near_zero_fraction for s in query_stats]))
                 if query_stats
                 else 0.0,
+                "query_residual_planner_active_rate": float(
+                    np.mean([s.residual_planner_active_rate for s in query_stats])
+                )
+                if query_stats
+                else 0.0,
+                "query_residual_planner_replacement_rate": float(
+                    np.mean([s.residual_planner_replacement_rate for s in query_stats])
+                )
+                if query_stats
+                else 0.0,
+                "query_residual_planner_fallback_rate": float(
+                    np.mean([s.residual_planner_fallback_rate for s in query_stats])
+                )
+                if query_stats
+                else 0.0,
+                "query_residual_planner_score_improvement": float(
+                    np.mean([s.residual_planner_score_improvement for s in query_stats])
+                )
+                if query_stats
+                else 0.0,
+                "query_residual_planner_best_score_improvement": float(
+                    np.mean([s.residual_planner_best_score_improvement for s in query_stats])
+                )
+                if query_stats
+                else 0.0,
+                "query_residual_planner_candidate_distance": float(
+                    np.mean([s.residual_planner_candidate_distance for s in query_stats])
+                )
+                if query_stats
+                else 0.0,
+                "query_residual_planner_disagreement": float(
+                    np.mean([s.residual_planner_disagreement for s in query_stats])
+                )
+                if query_stats
+                else 0.0,
                 "lambda": lambda_val,
                 "curriculum_stage": curriculum_stage,
                 "outer_step_size": float(self.outer_step_size if self.explicit_inner_outer else 0.0),
@@ -732,9 +1030,18 @@ class MetaTrainer:
                 "support_gate_rule": self.support_gate_rule if gate_enabled_fraction > 0.0 else "",
                 "support_update_acceptance": "support_side_gated" if gate_enabled_fraction > 0.0 else "unconditional",
                 "support_gate_uses_query": False,
-                "support_gate_extra_rollouts": 0,
+                "support_gate_paired_validation": bool(_gate_mean("support_gate_paired_validation") > 0.0),
+                "support_gate_same_validation_seeds": bool(
+                    gate_enabled_fraction == 0.0 or _gate_mean("support_gate_same_validation_seeds") >= 1.0
+                ),
+                "support_gate_pre_validation_episodes": int(round(_gate_mean("support_gate_pre_validation_episodes"))),
+                "support_gate_post_validation_episodes": int(round(_gate_mean("support_gate_post_validation_episodes"))),
+                "support_gate_validation_seed_pairs": int(round(_gate_mean("support_gate_validation_seed_pairs"))),
+                "support_gate_extra_rollouts": int(round(_gate_mean("extra_support_rollouts"))),
                 "support_gate_extra_gradient_updates": 0,
                 "support_gate_extra_query_evaluations": 0,
+                "support_adaptation_episodes": int(round(_gate_mean("support_adaptation_episodes"))),
+                "support_gate_validation_episodes": int(round(_gate_mean("support_gate_validation_episodes"))),
                 "support_gate_accept_rate": gate_accept_rate,
                 "support_gate_reject_rate": gate_reject_rate,
                 "accepted_update_count": accepted_update_count,
@@ -761,10 +1068,16 @@ class MetaTrainer:
                 "rollback_context_residual": _gate_mean("rollback_context_residual"),
                 "rollback_lower_replay_residual": _gate_mean("rollback_lower_replay_residual"),
                 "rollback_upper_replay_residual": _gate_mean("rollback_upper_replay_residual"),
+                "rollback_safety_estimator_residual": _gate_mean("rollback_safety_estimator_residual"),
                 "optimizer_state_restored": bool(gate_reject_rate == 0.0 or _gate_mean("rollback_parameter_residual") <= 1.0e-8),
                 "context_state_restored": bool(gate_reject_rate == 0.0 or _gate_mean("rollback_context_residual") == 0.0),
                 "dual_state_restored": bool(gate_reject_rate == 0.0 or _gate_mean("rollback_dual_residual") <= 1.0e-8),
+                "thermal_estimator_state_restored": bool(
+                    gate_reject_rate == 0.0 or _gate_mean("rollback_safety_estimator_residual") <= 1.0e-8
+                ),
+                "rng_state_restored": bool(gate_reject_rate == 0.0 or _gate_mean("rng_state_restored") >= 1.0),
                 "gate_latency_ms": _gate_mean("gate_latency_ms"),
+                "support_gate_validation_latency_ms": _gate_mean("support_gate_validation_latency_ms"),
                 "support_adaptation_latency_ms": _gate_mean("support_adaptation_latency_ms"),
                 "total_adaptation_latency_ms": _gate_mean("total_adaptation_latency_ms"),
                 "ungated_support_adaptation_latency_ms": _gate_mean("ungated_support_adaptation_latency_ms"),
