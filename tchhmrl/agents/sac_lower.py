@@ -514,30 +514,49 @@ class LowerSAC:
             )
             self.constraint_optim.step()
 
-        raw_pi, logp, logp_dim = self.actor.sample(obs_aug_actor, z, return_log_prob_per_dim=True)
-        logp_eff = self._masked_logp(logp_dim, boost, mode)
-        safe_pi = self.safety.project_torch(raw_pi, boost, mode, temps, amb)
-        a_pi = torch.cat([safe_pi["currents_exec"], safe_pi["rho_exec"], safe_pi["tau_exec"]], dim=1)
-        obs_aug_q1_pi = self._augment_torch(obs, boost, mode, physical, self.q1_phys)
-        obs_aug_q2_pi = self._augment_torch(obs, boost, mode, physical, self.q2_phys)
-        obs_aug_constraint_pi = (
-            self._augment_torch(obs, boost, mode, physical, self.constraint_phys)
-            if self.constraint_q is not None
-            else obs_aug_q1_pi
-        )
-        q_pi = torch.min(self.q1(obs_aug_q1_pi, z, a_pi), self.q2(obs_aug_q2_pi, z, a_pi))
-        constraint_pi_weighted = torch.zeros_like(q_pi)
-        constraint_pi_mean = 0.0
-        if self.constraint_q is not None:
-            constraint_pi = self.constraint_q(obs_aug_constraint_pi, z, a_pi)
-            if self.constraint_actor_penalty_nonnegative:
-                constraint_pi = torch.relu(constraint_pi)
-            constraint_pi_weighted = (constraint_pi * self.constraint_actor_weights).sum(dim=1, keepdim=True)
-            constraint_pi_mean = float(constraint_pi_weighted.detach().mean().item())
-        loss_pi = (alpha_t * logp_eff - q_pi + constraint_pi_weighted).mean()
+        critic_actor_params = []
+        for module in (
+            self.q1,
+            self.q2,
+            self.q1_phys,
+            self.q2_phys,
+            self.constraint_q,
+            self.constraint_phys,
+        ):
+            if module is not None:
+                critic_actor_params.extend(list(module.parameters()))
+        critic_requires_grad = [p.requires_grad for p in critic_actor_params]
+        for p in critic_actor_params:
+            p.requires_grad_(False)
+        try:
+            raw_pi, logp, logp_dim = self.actor.sample(obs_aug_actor, z, return_log_prob_per_dim=True)
+            logp_eff = self._masked_logp(logp_dim, boost, mode)
+            safe_pi = self.safety.project_torch(raw_pi, boost, mode, temps, amb)
+            a_pi = torch.cat([safe_pi["currents_exec"], safe_pi["rho_exec"], safe_pi["tau_exec"]], dim=1)
+            obs_aug_q1_pi = self._augment_torch(obs, boost, mode, physical, self.q1_phys)
+            obs_aug_q2_pi = self._augment_torch(obs, boost, mode, physical, self.q2_phys)
+            obs_aug_constraint_pi = (
+                self._augment_torch(obs, boost, mode, physical, self.constraint_phys)
+                if self.constraint_q is not None
+                else obs_aug_q1_pi
+            )
+            q_pi = torch.min(self.q1(obs_aug_q1_pi, z, a_pi), self.q2(obs_aug_q2_pi, z, a_pi))
+            constraint_pi_weighted = torch.zeros_like(q_pi)
+            constraint_pi_mean = 0.0
+            if self.constraint_q is not None:
+                constraint_pi = self.constraint_q(obs_aug_constraint_pi, z, a_pi)
+                if self.constraint_actor_penalty_nonnegative:
+                    constraint_pi = torch.relu(constraint_pi)
+                constraint_pi_weighted = (constraint_pi * self.constraint_actor_weights).sum(dim=1, keepdim=True)
+                constraint_pi_mean = float(constraint_pi_weighted.detach().mean().item())
+            loss_pi = (alpha_t * logp_eff - q_pi + constraint_pi_weighted).mean()
 
-        self.actor_optim.zero_grad()
-        loss_pi.backward()
+            self.actor_optim.zero_grad()
+            loss_pi.backward()
+        finally:
+            for p, requires_grad in zip(critic_actor_params, critic_requires_grad):
+                p.requires_grad_(requires_grad)
+
         torch.nn.utils.clip_grad_norm_(
             [p for group in self.actor_optim.param_groups for p in group["params"]],
             self.grad_clip,

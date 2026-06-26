@@ -2,9 +2,13 @@ from __future__ import annotations
 
 import argparse
 import copy
+import hashlib
 import itertools
 import json
 import math
+import os
+import platform
+import subprocess
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
@@ -59,6 +63,89 @@ from tchhmrl.utils.logger import Logger
 from tchhmrl.utils.seed import set_seed
 
 
+def _git_output(args: List[str]) -> str:
+    try:
+        repo_root = Path(__file__).resolve().parents[1]
+        proc = subprocess.run(
+            ["git", *args],
+            cwd=str(repo_root),
+            check=False,
+            capture_output=True,
+            text=True,
+            timeout=5,
+        )
+    except Exception:
+        return ""
+    return proc.stdout.strip() if proc.returncode == 0 else ""
+
+
+def build_formal_run_manifest(
+    *,
+    cfg_path: str,
+    base_cfg: Dict,
+    out_root: Path,
+    scenarios: List[str],
+    seeds: List[int],
+    variants: List[str] | None,
+    ablations: List[str] | None,
+    baselines: List[str] | None,
+    effective_meta_iters: int,
+    eval_tasks: int,
+    eval_eps: int,
+    env_tasks: int,
+    env_eps: int,
+) -> Dict:
+    cfg_json = json.dumps(base_cfg, sort_keys=True, default=str, ensure_ascii=True)
+    support_gate_cfg = dict(base_cfg.get("meta", {}).get("support_gate", {}) or {})
+    manifest = {
+        "manifest_version": "formal_run_manifest_v1",
+        "generated_at": datetime.now().isoformat(timespec="seconds"),
+        "cfg_path": str(cfg_path),
+        "config_sha256": hashlib.sha256(cfg_json.encode("utf-8")).hexdigest(),
+        "git_commit": _git_output(["rev-parse", "HEAD"]),
+        "git_commit_short": _git_output(["rev-parse", "--short", "HEAD"]),
+        "git_branch": _git_output(["rev-parse", "--abbrev-ref", "HEAD"]),
+        "git_tracked_dirty": bool(_git_output(["status", "--porcelain", "--untracked-files=no"])),
+        "entry_script": str(Path(__file__).name),
+        "out_root": str(out_root),
+        "python_version": platform.python_version(),
+        "platform": platform.platform(),
+        "torch_version": str(torch.__version__),
+        "cuda_available": bool(torch.cuda.is_available()),
+        "cuda_device_count": int(torch.cuda.device_count()) if torch.cuda.is_available() else 0,
+        "cuda_device_name": torch.cuda.get_device_name(0) if torch.cuda.is_available() else "",
+        "torch_num_threads": int(torch.get_num_threads()),
+        "torch_num_interop_threads": int(torch.get_num_interop_threads()),
+        "torch_deterministic_algorithms": bool(torch.are_deterministic_algorithms_enabled()),
+        "cudnn_deterministic": bool(getattr(torch.backends.cudnn, "deterministic", False)),
+        "cudnn_benchmark": bool(getattr(torch.backends.cudnn, "benchmark", False)),
+        "pythonhashseed": str(os.environ.get("PYTHONHASHSEED", "")),
+        "scenarios": list(scenarios),
+        "seeds": [int(s) for s in seeds],
+        "variants": list(variants or ["hybrid", "single_led", "single_ld"]),
+        "ablations": list(ablations or ["full"]),
+        "baselines": list(baselines or []),
+        "meta_iters": int(effective_meta_iters),
+        "eval_tasks": int(eval_tasks),
+        "eval_eps": int(eval_eps),
+        "env_tasks": int(env_tasks),
+        "env_eps": int(env_eps),
+        "meta_protocol_name": str(base_cfg.get("meta", {}).get("protocol_name", "")),
+        "reset_optimizer_after_outer_update": bool(
+            base_cfg.get("meta", {}).get("reset_optimizer_after_outer_update", False)
+        ),
+        "support_gate": bool(support_gate_cfg.get("enabled", False)),
+        "support_gate_role": str(support_gate_cfg.get("role", "")),
+        "support_gate_rule": str(support_gate_cfg.get("rule", "")),
+        "support_gate_budget_mode": str(support_gate_cfg.get("budget_mode", "")),
+        "support_gate_uses_query": bool(support_gate_cfg.get("query_leakage", False)),
+        "support_gate_extra_rollouts": int(support_gate_cfg.get("extra_support_rollouts", 0)),
+        "support_gate_extra_gradient_updates": int(support_gate_cfg.get("extra_gradient_updates", 0)),
+        "support_gate_extra_query_evaluations": int(support_gate_cfg.get("extra_query_evaluations", 0)),
+    }
+    return manifest
+
+
 def apply_common_settings(
     cfg: Dict,
     meta_iters: int,
@@ -87,6 +174,7 @@ def apply_common_settings(
         cfg["meta"]["support_adaptation_episodes"] = int(min(1, cfg["meta"]["support_episodes"]))
         cfg["meta"]["support_gate_validation_episodes"] = 0
         cfg["meta"].setdefault("support_gate", {})["paired_validation"] = False
+        cfg["meta"]["support_gate"]["budget_mode"] = "support_adaptation_only"
         cfg["meta"]["support_gate"]["extra_support_rollouts"] = 0
         cfg["meta"]["query_episodes"] = int(min(1, cfg["meta"]["query_episodes"]))
 
@@ -107,9 +195,10 @@ def apply_strict_meta_protocol(cfg: Dict) -> None:
     meta_cfg["support_gate_validation_episodes"] = 2
     meta_cfg["query_episodes"] = 2
     meta_cfg["query_updates_enabled"] = False
-    meta_cfg["query_context_updates_enabled"] = True
+    meta_cfg["query_context_updates_enabled"] = False
     meta_cfg["explicit_inner_outer"] = True
     meta_cfg["outer_step_size"] = 0.15
+    meta_cfg["reset_optimizer_after_outer_update"] = True
     meta_cfg["protocol_name"] = "strict_support_query"
     support_gate = meta_cfg.setdefault("support_gate", {})
     support_gate.setdefault("role", "rollback_guard")
@@ -121,6 +210,7 @@ def apply_strict_meta_protocol(cfg: Dict) -> None:
     support_gate["max_violation_increase"] = 1.0e-4
     support_gate["paired_validation"] = True
     support_gate["query_leakage"] = False
+    support_gate["budget_mode"] = "paired_support_validation"
     support_gate["extra_support_rollouts"] = int(meta_cfg["support_gate_validation_episodes"])
     support_gate["extra_gradient_updates"] = 0
     support_gate["extra_query_evaluations"] = 0
@@ -166,6 +256,7 @@ def apply_online_meta_protocol(cfg: Dict) -> None:
     support_gate["max_violation_increase"] = 1.0e-4
     support_gate["paired_validation"] = False
     support_gate["query_leakage"] = False
+    support_gate["budget_mode"] = "support_adaptation_only"
     support_gate["extra_support_rollouts"] = 0
     support_gate["extra_gradient_updates"] = 0
     support_gate["extra_query_evaluations"] = 0
@@ -403,10 +494,57 @@ def dump_resolved_config(cfg: Dict, out_path: Path) -> None:
         yaml.safe_dump(cfg, f, allow_unicode=True, sort_keys=False)
 
 
+def sync_thermal_gain_prior_with_tx_devices(
+    cfg: Dict,
+    *,
+    reference_devices: List[str] | None = None,
+    reference_gains: List[float] | np.ndarray | None = None,
+) -> None:
+    """Keep adaptive thermal priors consistent with the selected source type."""
+
+    env_cfg = cfg.setdefault("env", {})
+    hybrid_cfg = env_cfg.setdefault("hybrid", {})
+    n_tx = int(env_cfg.get("n_tx", 3))
+    tx_device = [str(v).upper() for v in hybrid_cfg.get("tx_device", ["LED", "LD", "LD"])[:n_tx]]
+    if len(tx_device) < n_tx:
+        tx_device = tx_device + ["LED"] * (n_tx - len(tx_device))
+
+    if reference_devices is None:
+        reference_devices = tx_device
+    ref_devices = [str(v).upper() for v in list(reference_devices)[:n_tx]]
+    if len(ref_devices) < n_tx:
+        ref_devices = ref_devices + tx_device[len(ref_devices) :]
+
+    if reference_gains is None:
+        reference_gains = cfg.get("safety", {}).get("effective_gain_initial", [])
+    ref_gains = np.asarray(reference_gains, dtype=np.float32).reshape(-1)
+    if ref_gains.size < n_tx:
+        fallback = float(np.mean(ref_gains)) if ref_gains.size else 1.0
+        ref_gains = np.pad(ref_gains, (0, n_tx - ref_gains.size), constant_values=fallback)
+
+    by_device: Dict[str, float] = {}
+    for device in sorted(set(ref_devices + tx_device)):
+        vals = [float(ref_gains[i]) for i, d in enumerate(ref_devices[:n_tx]) if d == device and i < ref_gains.size]
+        if vals:
+            by_device[device] = float(np.mean(vals))
+
+    if "LED" not in by_device and "LD" in by_device:
+        by_device["LED"] = by_device["LD"]
+    if "LD" not in by_device and "LED" in by_device:
+        by_device["LD"] = by_device["LED"]
+
+    synced = [float(by_device.get(device, float(ref_gains[min(i, ref_gains.size - 1)]))) for i, device in enumerate(tx_device)]
+    cfg.setdefault("safety", {})["effective_gain_initial"] = synced
+    cfg.setdefault("adaptive_thermal", {})["initial_effective_gain"] = list(synced)
+
+
 def apply_variant(cfg: Dict, variant: str) -> None:
+    old_devices = list(cfg.get("env", {}).get("hybrid", {}).get("tx_device", ["LED", "LD", "LD"]))
+    old_gains = list(cfg.get("safety", {}).get("effective_gain_initial", []))
     if variant == "hybrid":
         cfg["env"]["hybrid"]["tx_device"] = ["LED", "LD", "LD"]
         cfg["env"]["hybrid"]["tx_enabled"] = [1.0, 1.0, 1.0]
+        sync_thermal_gain_prior_with_tx_devices(cfg, reference_devices=old_devices, reference_gains=old_gains)
         sync_site_bank_with_cfg(cfg)
         return
     if variant == "single_led":
@@ -414,6 +552,7 @@ def apply_variant(cfg: Dict, variant: str) -> None:
         n_tx = int(cfg["env"]["n_tx"])
         cfg["env"]["hybrid"]["tx_device"] = ["LED"] * n_tx
         cfg["env"]["hybrid"]["tx_enabled"] = [1.0] + [0.0] * max(0, n_tx - 1)
+        sync_thermal_gain_prior_with_tx_devices(cfg, reference_devices=old_devices, reference_gains=old_gains)
         sync_site_bank_with_cfg(cfg)
         return
     if variant == "single_ld":
@@ -421,6 +560,7 @@ def apply_variant(cfg: Dict, variant: str) -> None:
         n_tx = int(cfg["env"]["n_tx"])
         cfg["env"]["hybrid"]["tx_device"] = ["LD"] * n_tx
         cfg["env"]["hybrid"]["tx_enabled"] = [1.0] + [0.0] * max(0, n_tx - 1)
+        sync_thermal_gain_prior_with_tx_devices(cfg, reference_devices=old_devices, reference_gains=old_gains)
         sync_site_bank_with_cfg(cfg)
         return
     raise ValueError(f"Unknown variant: {variant}")
@@ -621,6 +761,8 @@ def apply_baseline_overrides(cfg: Dict, baseline: str) -> None:
         cfg.setdefault("meta", {})["explicit_inner_outer"] = False
         cfg["meta"]["query_updates_enabled"] = False
         cfg["meta"].setdefault("support_gate", {})["enabled"] = False
+        cfg.setdefault("constraint_critics", {})["enabled"] = False
+        cfg["constraint_critics"]["reward_target"] = "penalized_reward"
         cfg["baseline_metadata"] = {
             "baseline_family": "sac_lagrangian",
             "uses_task_oracle": False,
@@ -629,6 +771,8 @@ def apply_baseline_overrides(cfg: Dict, baseline: str) -> None:
             "meta_learning": False,
             "support_gate": False,
             "support_update_acceptance": "none",
+            "constraint_critics_enabled": False,
+            "lower_reward_target": "penalized_reward",
             "safety_protocol": f"common_{cfg.get('safety', {}).get('projection_mode', 'thermal_cap')}_projection",
             "comparison_role": "learning_baseline",
         }
@@ -1693,6 +1837,8 @@ def _safe_projection_aux(safe: Dict) -> Dict[str, object]:
         "rho_raw_decoded": safe.get("rho_raw_decoded"),
         "tau_raw_decoded": safe.get("tau_raw_decoded"),
         "raw_current_total": safe.get("raw_current_total"),
+        "current_requested": safe.get("current_requested"),
+        "current_requested_pre_static_cap": safe.get("current_requested_pre_static_cap"),
         "masked_current_total": safe.get("masked_current_total"),
         "bus_projected_current_total": safe.get("bus_projected_current_total"),
         "projected_current_total": safe.get("projected_current_total"),
@@ -1760,6 +1906,22 @@ def _add_projection_diagnostics(row: Dict, aux: Dict, currents_exec: np.ndarray)
     raw_frac = _projection_vector(aux, "raw_current_frac")
     for tx_idx, val in enumerate(raw_frac.tolist()):
         row[f"raw_current_frac_tx{tx_idx}"] = float(val)
+    for prefix, key in [
+        ("current_requested", "current_requested"),
+        ("current_requested_pre_static_cap", "current_requested_pre_static_cap"),
+    ]:
+        arr = _projection_vector(aux, key)
+        for tx_idx, val in enumerate(arr.tolist()):
+            row[f"{prefix}_tx{tx_idx}"] = float(val)
+    for prefix, key in [
+        ("projection_residual", "projection_residual"),
+        ("decoder_residual", "decoder_residual"),
+        ("safety_projection_residual", "safety_projection_residual"),
+        ("total_projection_residual", "total_projection_residual"),
+    ]:
+        arr = _projection_vector(aux, key, n=5)
+        for idx, val in enumerate(arr.tolist()):
+            row[f"{prefix}_{idx}"] = float(val)
 
     for prefix, key in [
         ("thermal_scale", "thermal_scale"),
@@ -1930,6 +2092,27 @@ def _add_env_thermal_diagnostics(row: Dict, info: Dict, n: int = 3) -> None:
             row[f"thermal_base_coupled_env_tx{tx_idx}"] = float(info[f"thermal_base_coupled_tx{tx_idx}"])
 
 
+def _update_runner_safety_estimator(runner, temps_before: np.ndarray, info: Dict[str, object]) -> Dict[str, object]:
+    if hasattr(runner, "agent") and hasattr(runner.agent, "update_safety_estimator"):
+        return runner.agent.update_safety_estimator(temps_before=temps_before, info=info)
+    if hasattr(runner, "_update_safety_estimator"):
+        return runner._update_safety_estimator(temps_before, info)
+    safety = getattr(runner, "safety", None)
+    if safety is None or not hasattr(safety, "update_thermal_estimator"):
+        return {}
+    currents = np.asarray(info.get("currents_exec", np.zeros(3, dtype=np.float32)), dtype=np.float32)
+    temps_after = np.asarray(info.get("temps", temps_before), dtype=np.float32)
+    amb_temp = float(info.get("amb_temp", 10.0))
+    gamma = float(info.get("gamma", 0.95))
+    thermal_base, _ = safety._thermal_base_np(np.asarray(temps_before, dtype=np.float32), amb_temp, gamma)
+    return safety.update_thermal_estimator(
+        currents=currents,
+        temps_before=np.asarray(temps_before, dtype=np.float32),
+        temps_after=temps_after,
+        thermal_base=thermal_base,
+    )
+
+
 def collect_env_data(
     trainer: MetaTrainer,
     cfg: Dict,
@@ -1965,10 +2148,7 @@ def collect_env_data(
                 )
 
                 next_obs, reward, terminated, truncated, info = env.step(action)
-                trainer.agent.update_safety_estimator(
-                    temps_before=temps_before,
-                    info=info,
-                )
+                _update_runner_safety_estimator(trainer, temps_before, info)
                 done = bool(terminated or truncated)
                 currents_exec = np.asarray(info.get("currents_exec", action["currents_exec"]), dtype=np.float32)
                 current_total = float(info.get("current_total", float(np.sum(currents_exec))))
@@ -2476,6 +2656,7 @@ class SacLagrangianBaseline:
             temps_before = env.temps.copy().astype(np.float32)
             action, aux = self.act(obs, env, eval_mode=not train)
             next_obs, reward, terminated, truncated, info = env.step(action)
+            _update_runner_safety_estimator(self, temps_before, info)
             done = bool(terminated or truncated)
             ep_len += 1
 
@@ -2539,7 +2720,7 @@ class SacLagrangianBaseline:
                 macro_reward = 0.0
                 macro_steps = 0
 
-            macro_reward += penalized_reward
+            macro_reward += (float(self.upper.gamma) ** int(macro_steps)) * penalized_reward
             macro_steps += 1
             macro_done = bool(done)
             macro_end = macro_done or (int(aux.get("hold_left", 0)) <= 0)
@@ -3221,8 +3402,10 @@ def _run_mpc_lite_episode(policy: MpcLiteOracleBaseline, env: MultiTxUwSliptEnv)
     ep_reward = ep_se = ep_eh = ep_cost = ep_viol = 0.0
     ep_len = 0
     while not done:
+        temps_before = env.temps.copy().astype(np.float32)
         action, _ = policy.act(obs, env, eval_mode=True)
         next_obs, reward, terminated, truncated, info = env.step(action)
+        _update_runner_safety_estimator(policy, temps_before, info)
         done = bool(terminated or truncated)
         obs = next_obs
         ep_reward += float(reward)
@@ -3359,6 +3542,7 @@ def collect_env_data_heuristic(
                 temps_before = env.temps.copy().astype(np.float32)
                 action, aux = heuristic_safe_action(env, trainer)
                 next_obs, reward, terminated, truncated, info = env.step(action)
+                _update_runner_safety_estimator(trainer, temps_before, info)
                 done = bool(terminated or truncated)
                 currents_exec = np.asarray(info.get("currents_exec", action["currents_exec"]), dtype=np.float32)
                 current_total = float(info.get("current_total", float(np.sum(currents_exec))))
@@ -3481,6 +3665,7 @@ def collect_env_data_plain_hierarchical_baseline(
                 temps_before = env.temps.copy().astype(np.float32)
                 action, aux = trainer.act(obs, env, eval_mode=True)
                 next_obs, reward, terminated, truncated, info = env.step(action)
+                _update_runner_safety_estimator(trainer, temps_before, info)
                 done = bool(terminated or truncated)
                 currents_exec = np.asarray(info.get("currents_exec", action["currents_exec"]), dtype=np.float32)
                 current_total = float(info.get("current_total", float(np.sum(currents_exec))))
@@ -4742,11 +4927,15 @@ def run_one_scenario(
                     "query_context_updates_enabled": bool(run_meta_cfg.get("query_context_updates_enabled", True)),
                     "explicit_inner_outer": bool(run_meta_cfg.get("explicit_inner_outer", False)),
                     "outer_step_size": float(run_meta_cfg.get("outer_step_size", 0.0)),
+                    "reset_optimizer_after_outer_update": bool(
+                        run_meta_cfg.get("reset_optimizer_after_outer_update", False)
+                    ),
                     "meta_learning": bool(run_meta_cfg.get("explicit_inner_outer", False)),
                     "support_gate": bool(run_support_gate_cfg.get("enabled", False)),
                     "support_gate_role": str(run_support_gate_cfg.get("role", "")),
                     "support_gate_rule": str(run_support_gate_cfg.get("rule", "")),
                     "support_gate_uses_query": bool(run_support_gate_cfg.get("query_leakage", False)),
+                    "support_gate_budget_mode": str(run_support_gate_cfg.get("budget_mode", "")),
                     "support_gate_extra_rollouts": int(run_support_gate_cfg.get("extra_support_rollouts", 0)),
                     "support_gate_extra_gradient_updates": int(run_support_gate_cfg.get("extra_gradient_updates", 0)),
                     "support_gate_extra_query_evaluations": int(
@@ -5027,6 +5216,11 @@ def run_one_scenario(
         )
 
     common_projection_protocol = f"common_{base_cfg.get('safety', {}).get('projection_mode', 'thermal_cap')}_projection"
+    definition_gate_cfg = dict(base_cfg.get("meta", {}).get("support_gate", {}) or {})
+    definition_gate_extra_rollouts = 0 if fast_mode else int(definition_gate_cfg.get("extra_support_rollouts", 0))
+    definition_gate_budget_mode = (
+        "support_adaptation_only" if fast_mode else str(definition_gate_cfg.get("budget_mode", ""))
+    )
     variant_definitions = {}
     for spec in exp_specs:
         label = str(spec["label"])
@@ -5208,8 +5402,9 @@ def run_one_scenario(
                 "support_gate": bool(hybrid_gate_enabled),
                 "support_gate_role": "rollback_guard" if hybrid_gate_enabled else "",
                 "support_gate_uses_query": False,
+                "support_gate_budget_mode": definition_gate_budget_mode if hybrid_gate_enabled else "",
                 "support_update_acceptance": "unconditional" if is_meta_ungated else "support_side_gated" if hybrid_meta_enabled else "none",
-                "support_gate_extra_rollouts": 2 if hybrid_gate_enabled else 0,
+                "support_gate_extra_rollouts": definition_gate_extra_rollouts if hybrid_gate_enabled else 0,
                 "support_gate_extra_gradient_updates": 0,
                 "support_gate_extra_query_evaluations": 0,
                 "strong_safety_baseline": True if is_qos_aware_hard_clip else False if is_hard_clip else None,
@@ -5250,8 +5445,9 @@ def run_one_scenario(
                 "support_gate": bool(structural_meta and not structural_ungated),
                 "support_gate_role": "rollback_guard" if structural_meta and not structural_ungated else "",
                 "support_gate_uses_query": False,
+                "support_gate_budget_mode": definition_gate_budget_mode if structural_meta and not structural_ungated else "",
                 "support_update_acceptance": "unconditional" if structural_ungated else "support_side_gated" if structural_meta else "none",
-                "support_gate_extra_rollouts": 2 if structural_meta and not structural_ungated else 0,
+                "support_gate_extra_rollouts": definition_gate_extra_rollouts if structural_meta and not structural_ungated else 0,
                 "support_gate_extra_gradient_updates": 0,
                 "support_gate_extra_query_evaluations": 0,
                 "description": "LED-only structural ablation with the same meta/context/gated adaptation pipeline as Full Hybrid.",
@@ -5270,8 +5466,9 @@ def run_one_scenario(
                 "support_gate": bool(structural_meta and not structural_ungated),
                 "support_gate_role": "rollback_guard" if structural_meta and not structural_ungated else "",
                 "support_gate_uses_query": False,
+                "support_gate_budget_mode": definition_gate_budget_mode if structural_meta and not structural_ungated else "",
                 "support_update_acceptance": "unconditional" if structural_ungated else "support_side_gated" if structural_meta else "none",
-                "support_gate_extra_rollouts": 2 if structural_meta and not structural_ungated else 0,
+                "support_gate_extra_rollouts": definition_gate_extra_rollouts if structural_meta and not structural_ungated else 0,
                 "support_gate_extra_gradient_updates": 0,
                 "support_gate_extra_query_evaluations": 0,
                 "description": "LD-only structural ablation with the same meta/context/gated adaptation pipeline as Full Hybrid.",
@@ -5540,8 +5737,31 @@ def run_benchmark(
     ):
         stats_artifacts[str(artifact["artifact"])] = write_statistics_artifact(out_root, artifact)
 
+    manifest = build_formal_run_manifest(
+        cfg_path=cfg_path,
+        base_cfg=base_cfg,
+        out_root=out_root,
+        scenarios=scenarios,
+        seeds=seeds,
+        variants=variants,
+        ablations=ablations,
+        baselines=baselines,
+        effective_meta_iters=effective_meta_iters,
+        eval_tasks=eval_tasks,
+        eval_eps=eval_eps,
+        env_tasks=env_tasks,
+        env_eps=env_eps,
+    )
+    manifest_path = out_root / "formal_run_manifest.json"
+    with manifest_path.open("w", encoding="utf-8") as f:
+        json.dump(manifest, f, ensure_ascii=False, indent=2)
+
     report = {
         "cfg_path": cfg_path,
+        "formal_run_manifest": str(manifest_path),
+        "config_sha256": str(manifest.get("config_sha256", "")),
+        "git_commit": str(manifest.get("git_commit", "")),
+        "git_tracked_dirty": bool(manifest.get("git_tracked_dirty", False)),
         "alignment": alignment_snapshot(base_cfg),
         "physics": physics_snapshot_from_cfg(base_cfg),
         "effective_eh_model": effective_eh_model_from_cfg(base_cfg),
@@ -5567,6 +5787,7 @@ def run_benchmark(
         "support_gate": bool(base_cfg.get("meta", {}).get("support_gate", {}).get("enabled", False)),
         "support_gate_role": str(base_cfg.get("meta", {}).get("support_gate", {}).get("role", "")),
         "support_gate_uses_query": bool(base_cfg.get("meta", {}).get("support_gate", {}).get("query_leakage", False)),
+        "support_gate_budget_mode": str(base_cfg.get("meta", {}).get("support_gate", {}).get("budget_mode", "")),
         "support_gate_extra_rollouts": int(
             base_cfg.get("meta", {}).get("support_gate", {}).get("extra_support_rollouts", 0)
         ),

@@ -21,11 +21,11 @@ class ContextEncoder(nn.Module):
         logvar = torch.clamp(self.logvar(h), min=-8.0, max=8.0)
         return mu, logvar
 
-    def infer(self, seq: torch.Tensor):
+    def infer(self, seq: torch.Tensor, deterministic: bool = False):
         mu, logvar = self.forward(seq)
         std = torch.exp(0.5 * logvar)
         q = Normal(mu, std)
         p = Normal(torch.zeros_like(mu), torch.ones_like(std))
-        z = q.rsample()
+        z = mu if deterministic else q.rsample()
         kl = kl_divergence(q, p).sum(dim=1).mean()
         return z, kl, mu, logvar

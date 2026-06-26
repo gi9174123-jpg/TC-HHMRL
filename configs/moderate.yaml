@@ -54,6 +54,7 @@ env:
     burst_ld_factor: 1.25
 
 safety:
+  projection_mode: thermal_cap
   thermal_parameter_source: nominal_plus_online_effective_gain
   gamma_nominal: 0.055
   effective_gain_initial: [4.4, 6.0, 6.0]
@@ -69,6 +70,9 @@ safety:
   bus_current_max: 5.8
   thermal_safe: 55.0
   thermal_cutoff: 65.0
+
+observation:
+  misalign_normalization_scale: 0.42
 
 adaptive_thermal:
   enabled: true
@@ -148,7 +152,7 @@ residual_planner:
   budget_medium_constraint: 0.05
   budget_high_projection_residual: 0.25
   budget_medium_projection_residual: 0.10
-  trust_region_enabled: true
+  trust_region_enabled: false
   trust_region_mode: raw_and_executed
   trust_region_raw_l2: null
   trust_region_exec_l2: null
@@ -210,8 +214,9 @@ meta:
   dual_max_lambdas: [50.0, 50.0, 50.0, 50.0]
   explicit_inner_outer: true
   outer_step_size: 0.15
+  reset_optimizer_after_outer_update: true
   query_updates_enabled: false
-  query_context_updates_enabled: true
+  query_context_updates_enabled: false
   protocol_name: strict_support_query
   support_gate:
     enabled: true
@@ -229,6 +234,7 @@ meta:
     min_parameter_delta_norm: 0.0
     max_parameter_delta_norm: .inf
     query_leakage: false
+    budget_mode: paired_support_validation
     extra_support_rollouts: 2
     extra_gradient_updates: 0
     extra_query_evaluations: 0
@@ -258,6 +264,12 @@ context:
   kl_beta: 1.0e-3
   pred_w: 0.5
   lr: 3.0e-4
+  policy_deterministic: true
+  updates_per_env_step: 1
+  train_window_len: 128
+  target_mask: [0, 0, 1, 0, 0, 1, 1, 1, 1]
+  target_mean: [0.0, 0.0, 30.0, 0.0, 0.0, 0.05, 6.0, 6.0, 6.0]
+  target_scale: [1.0, 1.0, 10.0, 1.0, 1.0, 0.05, 3.0, 3.0, 3.0]
 
 sampler:
   attenuation_c_range: [0.14, 0.24]

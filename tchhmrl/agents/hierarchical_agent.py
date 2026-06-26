@@ -65,6 +65,24 @@ class HierarchicalAgent:
             hidden_dim=int(ctx_cfg["gru_hidden"]),
             z_dim=int(ctx_cfg["z_dim"]),
         ).to(device)
+        self.context_policy_deterministic = bool(ctx_cfg.get("policy_deterministic", True))
+        self.context_updates_per_env_step = max(0, int(ctx_cfg.get("updates_per_env_step", 1)))
+        self.context_train_window_len = int(ctx_cfg.get("train_window_len", 0))
+        self.context_target_mask = self._context_target_vector(
+            ctx_cfg.get("target_mask", [0, 0, 1, 0, 0, 1, 1, 1, 1]),
+            default=1.0,
+        )
+        self.context_target_mean = self._context_target_vector(
+            ctx_cfg.get("target_mean", [0.0, 0.0, 30.0, 0.0, 0.0, 0.05, 6.0, 6.0, 6.0]),
+            default=0.0,
+        )
+        self.context_target_scale = np.maximum(
+            self._context_target_vector(
+                ctx_cfg.get("target_scale", [1.0, 1.0, 10.0, 1.0, 1.0, 0.05, 3.0, 3.0, 3.0]),
+                default=1.0,
+            ),
+            1.0e-6,
+        ).astype(np.float32)
         self.context_predictor = nn.Sequential(
             nn.Linear(self.z_dim, 32),
             nn.ReLU(),
@@ -133,6 +151,7 @@ class HierarchicalAgent:
                 )
 
         self.global_step = 0
+        self.rollout_step = 0
         self.current_meta_iter = 0
         self.safety_mem = {"current_boost": 0, "dwell_count": cfg["safety"]["min_dwell_steps"]}
         self.upper_mem = {"upper_idx": 0, "hold_left": 0}
@@ -223,6 +242,12 @@ class HierarchicalAgent:
         keys = metrics_list[0].keys()
         return {k: float(np.mean([m[k] for m in metrics_list])) for k in keys}
 
+    def _context_target_vector(self, raw, *, default: float) -> np.ndarray:
+        arr = np.asarray(raw if raw is not None else [], dtype=np.float32).reshape(-1)
+        if arr.size < self.context_task_dim:
+            arr = np.pad(arr, (0, self.context_task_dim - arr.size), constant_values=float(default))
+        return arr[: self.context_task_dim].astype(np.float32)
+
     def _hard_score(self, tr: Dict) -> float:
         cost = max(float(tr.get("cost", 0.0)), 0.0)
         mode_cur = int(round(float(tr.get("mode_exec", 0.0))))
@@ -249,6 +274,7 @@ class HierarchicalAgent:
         }
         self.upper_mem = {"upper_idx": 0, "hold_left": 0}
         self.upper_plan = None
+        self.rollout_step = 0
         self.prev_projection_residual = np.zeros(5, dtype=np.float32)
         self.prev_bus_headroom = 1.0
 
@@ -264,6 +290,7 @@ class HierarchicalAgent:
             "context_optim": copy.deepcopy(self.context_optim.state_dict()),
             "safety": copy.deepcopy(self.safety.state_dict()),
             "global_step": int(self.global_step),
+            "rollout_step": int(self.rollout_step),
             "current_meta_iter": int(self.current_meta_iter),
         }
 
@@ -276,6 +303,7 @@ class HierarchicalAgent:
         if "safety" in state:
             self.safety.load_state_dict(copy.deepcopy(state["safety"]))
         self.global_step = int(state.get("global_step", 0))
+        self.rollout_step = int(state.get("rollout_step", 0))
         self.current_meta_iter = int(state.get("current_meta_iter", self.current_meta_iter))
 
     def snapshot_mutable_state(self) -> Dict:
@@ -312,6 +340,19 @@ class HierarchicalAgent:
         ).copy()
         self.prev_bus_headroom = float(state.get("prev_bus_headroom", self.prev_bus_headroom))
         self._restore_rng_state(state.get("rng", {}))
+
+    def reset_optimizer_states(self) -> None:
+        optimizers = [
+            self.upper.optim,
+            self.lower.actor_optim,
+            self.lower.critic_optim,
+            self.lower.constraint_optim,
+            self.lower.alpha_optim,
+            self.context_optim,
+        ]
+        for optim in optimizers:
+            if optim is not None:
+                optim.state.clear()
 
     def current_physical_features(self, temps: np.ndarray | None = None) -> np.ndarray:
         diag = self.safety.thermal_diagnostics()
@@ -474,7 +515,7 @@ class HierarchicalAgent:
             )
         seq = torch.tensor(np.stack(rows), dtype=torch.float32, device=self.device).unsqueeze(0)
         with torch.no_grad():
-            z, _, _, _ = self.context_encoder.infer(seq)
+            z, _, _, _ = self.context_encoder.infer(seq, deterministic=self.context_policy_deterministic)
         return z.squeeze(0).cpu().numpy().astype(np.float32)
 
     def act(
@@ -527,6 +568,7 @@ class HierarchicalAgent:
             "residual_planner_latency_ms": 0.0,
             "residual_planner_score_improvement": 0.0,
         }
+        planner_step = int(self.rollout_step)
         if self.residual_planner.active(meta_iter=self.current_meta_iter):
             lower_raw, planner_aux = self.residual_planner.plan(
                 lower=self.lower,
@@ -542,7 +584,7 @@ class HierarchicalAgent:
                 temps=temps,
                 amb_temp=amb_temp,
                 meta_iter=int(self.current_meta_iter),
-                global_step=int(self.global_step),
+                global_step=planner_step,
                 previous_projection_residual=self.prev_projection_residual,
             )
 
@@ -571,15 +613,49 @@ class HierarchicalAgent:
             safe.get("current_requested", np.asarray(safe["raw_current_frac"], dtype=np.float32) * self.safety.current_max),
             dtype=np.float32,
         )
+        desired_currents_pre_static = np.asarray(
+            safe.get("current_requested_pre_static_cap", desired_currents),
+            dtype=np.float32,
+        )
+        mode_exec = int(safe["mode_exec"])
+        rho_raw_decoded = float(safe["rho_raw_decoded"])
+        tau_raw_decoded = float(safe["tau_raw_decoded"])
+        if mode_exec == 0:
+            receiver_desired = np.asarray([rho_raw_decoded, 1.0], dtype=np.float32)
+        elif mode_exec == 1:
+            receiver_desired = np.asarray([0.0, tau_raw_decoded], dtype=np.float32)
+        else:
+            receiver_desired = np.asarray([rho_raw_decoded, tau_raw_decoded], dtype=np.float32)
         desired_vec = np.concatenate(
             [
                 desired_currents.astype(np.float32),
-                np.asarray([safe["rho_raw_decoded"], safe["tau_raw_decoded"]], dtype=np.float32),
+                receiver_desired,
             ]
         ).astype(np.float32)
-        projection_residual = exec_vec - desired_vec
-        projection_residual_norm = projection_residual.copy()
-        projection_residual_norm[:3] = projection_residual_norm[:3] / np.maximum(self.safety.current_max, 1.0e-6)
+        desired_total_vec = np.concatenate(
+            [
+                desired_currents_pre_static.astype(np.float32),
+                np.asarray([rho_raw_decoded, tau_raw_decoded], dtype=np.float32),
+            ]
+        ).astype(np.float32)
+        decoder_vec = np.concatenate(
+            [
+                desired_currents.astype(np.float32),
+                np.asarray([rho_raw_decoded, tau_raw_decoded], dtype=np.float32),
+            ]
+        ).astype(np.float32)
+        safety_residual = exec_vec - desired_vec
+        total_projection_residual = exec_vec - desired_total_vec
+        decoder_residual = decoder_vec - desired_total_vec
+
+        def _normalize_residual(vec: np.ndarray) -> np.ndarray:
+            out = np.asarray(vec, dtype=np.float32).copy()
+            out[:3] = out[:3] / np.maximum(self.safety.current_max, 1.0e-6)
+            return out.astype(np.float32)
+
+        projection_residual_norm = _normalize_residual(safety_residual)
+        total_projection_residual_norm = _normalize_residual(total_projection_residual)
+        decoder_residual_norm = _normalize_residual(decoder_residual)
         self.prev_projection_residual = projection_residual_norm.astype(np.float32)
         self.prev_bus_headroom = float(
             np.clip(
@@ -606,6 +682,9 @@ class HierarchicalAgent:
             "planner_selected": bool(planner_aux.get("residual_planner_replaced_policy", False)),
             "act_desired": desired_vec.astype(np.float32),
             "projection_residual": projection_residual_norm.astype(np.float32),
+            "decoder_residual": decoder_residual_norm.astype(np.float32),
+            "safety_projection_residual": projection_residual_norm.astype(np.float32),
+            "total_projection_residual": total_projection_residual_norm.astype(np.float32),
             "physical_features": physical_features.astype(np.float32),
             **planner_aux,
             "t_pred": safe["t_pred"],
@@ -623,6 +702,7 @@ class HierarchicalAgent:
             "raw_current_total": safe.get("raw_current_total"),
             "current_decoder": safe.get("current_decoder"),
             "current_requested": safe.get("current_requested"),
+            "current_requested_pre_static_cap": safe.get("current_requested_pre_static_cap"),
             "actor_total_current_requested": safe.get("actor_total_current_requested"),
             "actor_allocation_anchor": safe.get("actor_allocation_anchor"),
             "actor_allocation_ld1": safe.get("actor_allocation_ld1"),
@@ -646,7 +726,9 @@ class HierarchicalAgent:
             "thermal_headroom": safe.get("thermal_headroom"),
             "macro_new": bool(macro_new),
             "hold_left": int(self.upper_mem["hold_left"]),
+            "rollout_step": int(planner_step),
         }
+        self.rollout_step += 1
         return action, aux
 
     def observe(self, transition: Dict) -> None:
@@ -747,8 +829,14 @@ class HierarchicalAgent:
         if len(self.episode) < 3:
             return {}
 
+        items = self.episode.as_list()
+        if self.context_train_window_len > 0:
+            items = items[-int(self.context_train_window_len) :]
+        if len(items) < 3:
+            return {}
+
         rows = []
-        for tr in self.episode.as_list():
+        for tr in items:
             rows.append(
                 np.concatenate(
                     [
@@ -764,17 +852,21 @@ class HierarchicalAgent:
         task_rows = np.stack(
             [
                 np.asarray(tr.get("task_params", np.zeros(self.context_task_dim, dtype=np.float32)), dtype=np.float32)
-                for tr in self.episode.as_list()
+                for tr in items
             ],
             axis=0,
         )
-        target = (
+        target_raw = (
             torch.tensor(task_rows.mean(axis=0), dtype=torch.float32, device=self.device)
             .view(1, self.context_task_dim)
             .detach()
         )
+        target_mean = torch.tensor(self.context_target_mean, dtype=torch.float32, device=self.device).view(1, -1)
+        target_scale = torch.tensor(self.context_target_scale, dtype=torch.float32, device=self.device).view(1, -1)
+        target_mask = torch.tensor(self.context_target_mask, dtype=torch.float32, device=self.device).view(1, -1)
+        target = (target_raw - target_mean) / target_scale
         pred = self.context_predictor(z)
-        pred_loss = F.mse_loss(pred, target)
+        pred_loss = (((pred - target) ** 2) * target_mask).sum() / torch.clamp(target_mask.sum(), min=1.0)
         # Keep latent norm bounded to avoid unstable conditioning.
         latent_reg = (z.pow(2).mean())
         loss = self.kl_beta * kl + self.context_pred_w * pred_loss + 1.0e-4 * latent_reg
@@ -792,6 +884,8 @@ class HierarchicalAgent:
             "kl": float(kl.item()),
             "ctx_pred_loss": float(pred_loss.item()),
             "ctx_latent_norm": float(latent_reg.item()),
+            "ctx_target_mask_active_dim": float(target_mask.sum().detach().item()),
+            "ctx_train_window_len": float(len(items)),
         }
 
     def learn(self) -> Dict[str, float]:
@@ -802,7 +896,8 @@ class HierarchicalAgent:
         if len(self.replay) >= max(self.batch_size, self.warmup_steps):
             sac_list = []
             ctx_list = []
-            for _ in range(max(1, self.lower_updates_per_step)):
+            ctx_budget = min(max(0, self.context_updates_per_env_step), max(1, self.lower_updates_per_step))
+            for update_idx in range(max(1, self.lower_updates_per_step)):
                 lower_batch = self.replay.sample(
                     self.batch_size,
                     hard_fraction=self.hard_fraction if self.hard_mining_enabled else 0.0,
@@ -860,7 +955,8 @@ class HierarchicalAgent:
                     self.constraint_replay_enabled and constraint_batch is not None
                 )
                 sac_list.append(sac_stats)
-                ctx_list.append(self.update_context_encoder())
+                if update_idx < ctx_budget:
+                    ctx_list.append(self.update_context_encoder())
             merged.update(self._mean_metrics(sac_list))
             merged.update(self._mean_metrics(ctx_list))
 
@@ -883,6 +979,7 @@ class HierarchicalAgent:
             "context_optim": self.context_optim.state_dict(),
             "safety": self.safety.state_dict(),
             "global_step": self.global_step,
+            "rollout_step": int(self.rollout_step),
             "current_meta_iter": int(self.current_meta_iter),
             "alignment_meta": self._alignment_meta(pre_alignment=False),
         }
@@ -919,4 +1016,5 @@ class HierarchicalAgent:
         if "pre_alignment" not in self.loaded_alignment_meta:
             self.loaded_alignment_meta["pre_alignment"] = True
         self.global_step = int(ckpt.get("global_step", 0))
+        self.rollout_step = int(ckpt.get("rollout_step", 0))
         self.current_meta_iter = int(ckpt.get("current_meta_iter", self.current_meta_iter))

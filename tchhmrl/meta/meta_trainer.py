@@ -84,6 +84,7 @@ class MetaTrainer:
         self.dual_enabled = bool(meta_cfg.get("dual_enabled", True))
         self.explicit_inner_outer = bool(meta_cfg.get("explicit_inner_outer", True))
         self.outer_step_size = float(meta_cfg.get("outer_step_size", 0.15))
+        self.reset_optimizer_after_outer_update = bool(meta_cfg.get("reset_optimizer_after_outer_update", False))
         self.query_updates_enabled = bool(meta_cfg.get("query_updates_enabled", True))
         self.query_context_updates_enabled = bool(meta_cfg.get("query_context_updates_enabled", True))
         support_gate_cfg = meta_cfg.get("support_gate", {})
@@ -189,6 +190,94 @@ class MetaTrainer:
                 accumulate(ref_obj, cur_obj)
         return float(math.sqrt(max(total, 0.0)))
 
+    @staticmethod
+    def _numeric_state_delta_norm(reference, current) -> float:
+        total = 0.0
+
+        def mark_inf() -> None:
+            nonlocal total
+            total = float("inf")
+
+        def accumulate(ref_obj, cur_obj) -> None:
+            nonlocal total
+            if math.isinf(total):
+                return
+            if ref_obj is None or cur_obj is None:
+                if ref_obj is not None or cur_obj is not None:
+                    mark_inf()
+                return
+            if isinstance(ref_obj, dict) and isinstance(cur_obj, dict):
+                if set(ref_obj.keys()) != set(cur_obj.keys()):
+                    mark_inf()
+                    return
+                for key in ref_obj.keys():
+                    accumulate(ref_obj[key], cur_obj[key])
+                return
+            if isinstance(ref_obj, (list, tuple)) and isinstance(cur_obj, (list, tuple)):
+                if len(ref_obj) != len(cur_obj):
+                    mark_inf()
+                    return
+                for ref_item, cur_item in zip(ref_obj, cur_obj):
+                    accumulate(ref_item, cur_item)
+                return
+            if torch.is_tensor(ref_obj) and torch.is_tensor(cur_obj):
+                if tuple(ref_obj.shape) != tuple(cur_obj.shape):
+                    mark_inf()
+                    return
+                ref = ref_obj.detach().float().cpu().numpy()
+                cur = cur_obj.detach().float().cpu().numpy()
+            elif isinstance(ref_obj, np.ndarray) and isinstance(cur_obj, np.ndarray):
+                if ref_obj.shape != cur_obj.shape:
+                    mark_inf()
+                    return
+                if not (np.issubdtype(ref_obj.dtype, np.number) or np.issubdtype(ref_obj.dtype, np.bool_)):
+                    return
+                ref = ref_obj.astype(np.float64, copy=False)
+                cur = cur_obj.astype(np.float64, copy=False)
+            elif isinstance(ref_obj, (int, float, bool, np.number)) and isinstance(
+                cur_obj, (int, float, bool, np.number)
+            ):
+                ref = np.asarray([ref_obj], dtype=np.float64)
+                cur = np.asarray([cur_obj], dtype=np.float64)
+            else:
+                if ref_obj != cur_obj:
+                    return
+                return
+
+            ref_nan = np.isnan(ref)
+            cur_nan = np.isnan(cur)
+            if np.any(ref_nan != cur_nan):
+                mark_inf()
+                return
+            diff = np.where(ref_nan & cur_nan, 0.0, cur - ref)
+            total += float(np.sum(diff * diff))
+
+        accumulate(reference, current)
+        return float(total if math.isinf(total) else math.sqrt(max(total, 0.0)))
+
+    @classmethod
+    def _state_paths_numeric_delta_norm(cls, reference: Dict, current: Dict, paths: List[tuple[str, ...]]) -> float:
+        total = 0.0
+
+        def get_path(obj: Dict, path: tuple[str, ...]):
+            out = obj
+            for key in path:
+                if not isinstance(out, dict) or key not in out:
+                    return None
+                out = out[key]
+            return out
+
+        for path in paths:
+            ref_obj = get_path(reference, path)
+            cur_obj = get_path(current, path)
+            if ref_obj is None and cur_obj is None:
+                continue
+            delta = cls._numeric_state_delta_norm(ref_obj, cur_obj)
+            if math.isinf(delta):
+                return float("inf")
+            total += float(delta * delta)
+        return float(math.sqrt(max(total, 0.0)))
+
     @classmethod
     def _trainable_parameter_delta_norm(cls, reference: Dict, current: Dict) -> float:
         return cls._state_path_delta_norm(
@@ -211,8 +300,28 @@ class MetaTrainer:
             current,
             paths=[
                 ("upper", "q_tgt"),
+                ("upper", "q_tgt_phys"),
                 ("lower", "q1_tgt"),
                 ("lower", "q2_tgt"),
+                ("lower", "constraint_q_tgt"),
+                ("lower", "q1_tgt_phys"),
+                ("lower", "q2_tgt_phys"),
+                ("lower", "constraint_tgt_phys"),
+            ],
+        )
+
+    @classmethod
+    def _optimizer_state_delta_norm(cls, reference: Dict, current: Dict) -> float:
+        return cls._state_paths_numeric_delta_norm(
+            reference,
+            current,
+            paths=[
+                ("upper", "optim"),
+                ("lower", "actor_optim"),
+                ("lower", "critic_optim"),
+                ("lower", "constraint_optim"),
+                ("lower", "alpha_optim"),
+                ("context_optim",),
             ],
         )
 
@@ -249,7 +358,7 @@ class MetaTrainer:
         if not stats:
             return SupportGateStats()
         return SupportGateStats(
-            reward=float(np.mean([s.reward for s in stats])),
+            reward=float(np.mean([s.reward_task for s in stats])),
             cost=float(np.mean([s.cost for s in stats])),
             violation_rate=float(np.mean([s.violations for s in stats])),
         )
@@ -301,6 +410,22 @@ class MetaTrainer:
         )
         return int(seed % (2**32 - 1))
 
+    @staticmethod
+    def _mutable_state_with_train_parameters(mutable_state: Dict, train_state: Dict) -> Dict:
+        """Use mutable support context/state with an alternate trainable snapshot."""
+
+        out = copy.deepcopy(mutable_state)
+        for key in (
+            "upper",
+            "lower",
+            "context_encoder",
+            "context_predictor",
+            "context_optim",
+        ):
+            if key in train_state:
+                out[key] = copy.deepcopy(train_state[key])
+        return out
+
     def _run_gate_validation_pair(
         self,
         *,
@@ -320,31 +445,34 @@ class MetaTrainer:
             return [], [], [], 0.0
 
         validation_start = time.perf_counter()
+        pre_validation_state = self._mutable_state_with_train_parameters(candidate_state, pre_state)
         pre_stats: List[EpisodeStats] = []
-        self.agent.restore_mutable_state(pre_state)
-        self.dual.load_state_dict(copy.deepcopy(pre_dual_state))
-        for val_idx, seed in enumerate(seeds):
+        for seed in seeds:
+            self.agent.restore_mutable_state(pre_validation_state)
+            self.dual.load_state_dict(copy.deepcopy(pre_dual_state))
             val_env = MultiTxUwSliptEnv(self.cfg, overrides=task.to_env_overrides())
             pre_stats.append(
                 self._run_episode(
                     val_env,
                     train=False,
-                    clear_context=(val_idx == 0),
+                    clear_context=False,
                     reset_seed=seed,
+                    update_context=False,
                 )
             )
 
         post_stats: List[EpisodeStats] = []
-        self.agent.restore_mutable_state(candidate_state)
-        self.dual.load_state_dict(copy.deepcopy(candidate_dual_state))
-        for val_idx, seed in enumerate(seeds):
+        for seed in seeds:
+            self.agent.restore_mutable_state(candidate_state)
+            self.dual.load_state_dict(copy.deepcopy(candidate_dual_state))
             val_env = MultiTxUwSliptEnv(self.cfg, overrides=task.to_env_overrides())
             post_stats.append(
                 self._run_episode(
                     val_env,
                     train=False,
-                    clear_context=(val_idx == 0),
+                    clear_context=False,
                     reset_seed=seed,
+                    update_context=False,
                 )
             )
 
@@ -359,9 +487,12 @@ class MetaTrainer:
         train: bool,
         clear_context: bool = True,
         reset_seed: int | None = None,
+        update_context: bool | None = None,
     ) -> EpisodeStats:
         obs, _ = env.reset(seed=reset_seed)
         self.agent.reset_rollout_state(clear_context=clear_context)
+        if update_context is None:
+            update_context = bool((not train) and self.query_context_updates_enabled)
 
         ep_reward = 0.0
         ep_reward_task = 0.0
@@ -476,6 +607,12 @@ class MetaTrainer:
                 "distances_env": np.asarray(env.distances, dtype=np.float32).copy(),
                 "cost": cost,
                 "cost_vec": cost_vec.astype(np.float32),
+                "bus_utilization": float(info.get("bus_utilization", 0.0)),
+                "projected_current_total": float(
+                    aux.get("projected_current_total", info.get("current_total", 0.0))
+                ),
+                "qos_margin": float(info.get("qos_rate", 0.0) - env.qos_min_rate),
+                "burst_active": float(info.get("burst_mean", 0.0) > 1.0e-8),
                 "thermal_gain_mean": np.asarray(
                     thermal_estimator_diag.get("thermal_gain_mean", np.ones(3, dtype=np.float32)),
                     dtype=np.float32,
@@ -507,7 +644,7 @@ class MetaTrainer:
                 macro_reward = 0.0
                 macro_steps = 0
 
-                macro_reward += reward_dual_penalized
+            macro_reward += (float(self.agent.upper.gamma) ** int(macro_steps)) * reward_dual_penalized
             macro_steps += 1
             macro_done = bool(done)
             macro_end = macro_done or (int(aux.get("hold_left", 0)) <= 0)
@@ -571,7 +708,7 @@ class MetaTrainer:
                     }
                     self.agent.observe_upper(upper_transition)
                 self.agent.learn()
-            elif self.query_context_updates_enabled:
+            elif update_context:
                 self.agent.episode.add(
                     {
                         "obs": lower_transition["obs"],
@@ -744,6 +881,8 @@ class MetaTrainer:
                 rollback_performed = False
                 rollback_residual = 0.0
                 rollback_dual_residual = 0.0
+                rollback_optimizer_residual = 0.0
+                rollback_target_residual = 0.0
                 rollback_context_residual = 0
                 rollback_lower_replay_residual = 0
                 rollback_upper_replay_residual = 0
@@ -806,6 +945,14 @@ class MetaTrainer:
                             rollback_dual_state,
                             self.dual.state_dict(),
                         )
+                        rollback_optimizer_residual = self._optimizer_state_delta_norm(
+                            rollback_state,
+                            restored_state,
+                        )
+                        rollback_target_residual = self._target_parameter_delta_norm(
+                            rollback_state,
+                            restored_state,
+                        )
                         rollback_safety_residual = self._safety_state_delta_norm(
                             rollback_state.get("safety", {}),
                             self.agent.safety.state_dict(),
@@ -839,6 +986,12 @@ class MetaTrainer:
                         "support_gate_reason": gate_reason,
                         "support_gate_score": float(gate_score),
                         "support_gate_threshold": float(gate_threshold),
+                        "support_gate_budget_mode": str(
+                            self.support_gate_cfg.get(
+                                "budget_mode",
+                                "paired_support_validation" if paired_gate_validation else "support_adaptation_only",
+                            )
+                        ),
                         "support_reward_before": float(gate_reward_before),
                         "support_reward_after": float(gate_reward_after),
                         "support_reward_delta": float(gate_reward_delta),
@@ -851,6 +1004,8 @@ class MetaTrainer:
                         "support_parameter_delta_norm": float(gate_parameter_delta_norm),
                         "rollback_parameter_residual": float(rollback_residual),
                         "rollback_dual_residual": float(rollback_dual_residual),
+                        "rollback_optimizer_residual": float(rollback_optimizer_residual),
+                        "rollback_target_parameter_residual": float(rollback_target_residual),
                         "rollback_context_residual": int(rollback_context_residual),
                         "rollback_lower_replay_residual": int(rollback_lower_replay_residual),
                         "rollback_upper_replay_residual": int(rollback_upper_replay_residual),
@@ -918,6 +1073,8 @@ class MetaTrainer:
                 self.agent.upper.update_steps = shared_upper_steps
                 self.agent.lower.update_steps = shared_lower_steps
                 self.agent.apply_outer_update(adapted_states, self.outer_step_size)
+                if self.reset_optimizer_after_outer_update:
+                    self.agent.reset_optimizer_states()
                 if self.dual_enabled and base_dual_state is not None:
                     base_values = np.asarray(base_dual_state["values"], dtype=np.float32)
                     if adapted_dual_states:
@@ -964,6 +1121,14 @@ class MetaTrainer:
             )
             first_gate_reason = next(
                 (str(r.get("support_gate_reason", "")) for r in support_gate_records if str(r.get("support_gate_reason", ""))),
+                "",
+            )
+            first_gate_budget_mode = next(
+                (
+                    str(r.get("support_gate_budget_mode", ""))
+                    for r in support_gate_records
+                    if str(r.get("support_gate_budget_mode", ""))
+                ),
                 "",
             )
             row = {
@@ -1121,6 +1286,9 @@ class MetaTrainer:
                 "lambda": lambda_val,
                 "curriculum_stage": curriculum_stage,
                 "outer_step_size": float(self.outer_step_size if self.explicit_inner_outer else 0.0),
+                "reset_optimizer_after_outer_update": bool(
+                    self.explicit_inner_outer and self.reset_optimizer_after_outer_update
+                ),
                 "explicit_inner_outer": bool(self.explicit_inner_outer),
                 "query_updates_enabled": bool(self.query_updates_enabled),
                 "query_context_updates_enabled": bool(self.query_context_updates_enabled),
@@ -1130,6 +1298,7 @@ class MetaTrainer:
                 "support_gate_rule": self.support_gate_rule if gate_enabled_fraction > 0.0 else "",
                 "support_update_acceptance": "support_side_gated" if gate_enabled_fraction > 0.0 else "unconditional",
                 "support_gate_uses_query": False,
+                "support_gate_budget_mode": first_gate_budget_mode if gate_enabled_fraction > 0.0 else "",
                 "support_gate_paired_validation": bool(_gate_mean("support_gate_paired_validation") > 0.0),
                 "support_gate_same_validation_seeds": bool(
                     gate_enabled_fraction == 0.0 or _gate_mean("support_gate_same_validation_seeds") >= 1.0
@@ -1165,11 +1334,16 @@ class MetaTrainer:
                 "rollback_performed": bool(_gate_mean("rollback_performed") > 0.0),
                 "rollback_parameter_residual": _gate_mean("rollback_parameter_residual"),
                 "rollback_dual_residual": _gate_mean("rollback_dual_residual"),
+                "rollback_optimizer_residual": _gate_mean("rollback_optimizer_residual"),
+                "rollback_target_parameter_residual": _gate_mean("rollback_target_parameter_residual"),
                 "rollback_context_residual": _gate_mean("rollback_context_residual"),
                 "rollback_lower_replay_residual": _gate_mean("rollback_lower_replay_residual"),
                 "rollback_upper_replay_residual": _gate_mean("rollback_upper_replay_residual"),
                 "rollback_safety_estimator_residual": _gate_mean("rollback_safety_estimator_residual"),
-                "optimizer_state_restored": bool(gate_reject_rate == 0.0 or _gate_mean("rollback_parameter_residual") <= 1.0e-8),
+                "optimizer_state_restored": bool(gate_reject_rate == 0.0 or _gate_mean("rollback_optimizer_residual") <= 1.0e-8),
+                "target_network_state_restored": bool(
+                    gate_reject_rate == 0.0 or _gate_mean("rollback_target_parameter_residual") <= 1.0e-8
+                ),
                 "context_state_restored": bool(gate_reject_rate == 0.0 or _gate_mean("rollback_context_residual") == 0.0),
                 "dual_state_restored": bool(gate_reject_rate == 0.0 or _gate_mean("rollback_dual_residual") <= 1.0e-8),
                 "thermal_estimator_state_restored": bool(

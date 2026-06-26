@@ -8,6 +8,7 @@ import torch
 
 from scripts.meta_adaptation_diagnostics import run_meta_adaptation_diagnostics
 from tchhmrl.agents.hierarchical_agent import HierarchicalAgent
+from tchhmrl.envs.uw_slipt_env import MultiTxUwSliptEnv
 from tchhmrl.meta.support_gate import SupportGateStats, evaluate_support_gate
 from tchhmrl.meta.meta_trainer import MetaTrainer
 from tchhmrl.utils.config import load_cfg
@@ -23,14 +24,20 @@ def test_default_meta_protocol_uses_heldout_query_and_stable_checkpoint_selectio
         assert int(cfg["meta"]["support_gate_validation_episodes"]) == 2
         assert int(cfg["meta"]["query_episodes"]) == 2
         assert bool(cfg["meta"]["query_updates_enabled"]) is False
-        assert bool(cfg["meta"]["query_context_updates_enabled"]) is True
+        assert bool(cfg["meta"]["query_context_updates_enabled"]) is False
         assert str(cfg["meta"]["protocol_name"]) == "strict_support_query"
         assert bool(cfg["meta"]["support_gate"]["enabled"]) is True
         assert str(cfg["meta"]["support_gate"]["role"]) == "rollback_guard"
         assert str(cfg["meta"]["support_gate"]["rule"]) == "safety_first"
         assert cfg["meta"]["support_gate"]["query_leakage"] is False
+        assert cfg["meta"]["support_gate"]["budget_mode"] == "paired_support_validation"
         assert float(cfg["meta"]["support_gate"]["max_violation_increase"]) == 1.0e-4
         assert float(cfg["meta"]["support_gate"]["max_cost_increase"]) == 1.0e-5
+        assert bool(cfg["meta"]["reset_optimizer_after_outer_update"]) is True
+        assert bool(cfg["context"]["policy_deterministic"]) is True
+        assert int(cfg["context"]["updates_per_env_step"]) == 1
+        assert int(cfg["context"]["train_window_len"]) == 128
+        assert cfg["context"]["target_mask"] == [0, 0, 1, 0, 0, 1, 1, 1, 1]
         assert int(cfg["buffer"]["context_max_len"]) >= int(cfg["env"]["episode_len"]) * (
             int(cfg["meta"]["support_episodes"]) + int(cfg["meta"]["query_episodes"])
         )
@@ -80,6 +87,8 @@ def test_meta_trainer_one_iter_explicit_inner_outer_smoke(tmp_path):
     assert "query_updates_enabled" in rows[0]
     assert "query_context_updates_enabled" in rows[0]
     assert "heldout_query_evaluation" in rows[0]
+    assert "reset_optimizer_after_outer_update" in rows[0]
+    assert rows[0]["reset_optimizer_after_outer_update"] == "True"
     assert "support_parameter_delta_norm" in rows[0]
     assert "support_target_parameter_delta_norm" in rows[0]
     assert "upper_batch_size" in rows[0]
@@ -91,6 +100,89 @@ def test_meta_trainer_one_iter_explicit_inner_outer_smoke(tmp_path):
     assert rows[0]["support_gate_enabled"] == "True"
     assert rows[0]["support_update_acceptance"] == "support_side_gated"
     assert rows[0]["query_leakage"] == "False"
+
+
+def test_upper_macro_reward_accumulates_full_hold_horizon(tmp_path):
+    cfg = load_cfg("configs/default.yaml")
+    cfg["experiment"]["log_dir"] = str(tmp_path)
+    cfg["experiment"]["run_name"] = "macro_reward_horizon"
+    cfg["experiment"]["seed"] = 11
+    cfg["env"]["episode_len"] = 2
+    cfg["agent"]["hidden_dim"] = 32
+    cfg["agent"]["batch_size"] = 4
+    cfg["agent"]["warmup_steps"] = 999
+    cfg["agent"]["upper_batch_size"] = 4
+    cfg["agent"]["upper_hold_steps"] = 2
+    cfg["agent"]["upper_update_every"] = 1
+    cfg["upper_dqn"]["batch_size"] = 4
+    cfg["upper_dqn"]["epsilon_start"] = 0.0
+    cfg["upper_dqn"]["epsilon_final"] = 0.0
+    cfg["buffer"]["replay_size"] = 128
+    cfg["buffer"]["context_max_len"] = 64
+    cfg["meta"]["support_gate"]["enabled"] = False
+    cfg["context"]["gru_hidden"] = 16
+
+    trainer = MetaTrainer(cfg)
+    env = MultiTxUwSliptEnv(cfg)
+    stats = trainer._run_episode(env, train=True, clear_context=True, reset_seed=123)
+
+    lower_items = trainer.agent.replay.state_dict()["items"]
+    upper_items = trainer.agent.upper_replay.state_dict()["items"]
+    assert stats.length == 2
+    assert len(lower_items) == 2
+    assert len(upper_items) == 1
+    expected = float(lower_items[0]["reward"]) + float(trainer.agent.upper.gamma) * float(lower_items[1]["reward"])
+    assert np.isclose(float(upper_items[0]["reward"]), expected, atol=1e-6)
+    assert float(upper_items[0]["horizon"]) == 2.0
+
+
+def test_lower_transition_records_constraint_replay_boundary_fields(tmp_path):
+    cfg = load_cfg("configs/default.yaml")
+    cfg["experiment"]["log_dir"] = str(tmp_path)
+    cfg["experiment"]["run_name"] = "constraint_fields"
+    cfg["experiment"]["seed"] = 12
+    cfg["env"]["episode_len"] = 3
+    cfg["agent"]["hidden_dim"] = 32
+    cfg["agent"]["batch_size"] = 4
+    cfg["agent"]["warmup_steps"] = 999
+    cfg["buffer"]["replay_size"] = 128
+    cfg["buffer"]["context_max_len"] = 64
+    cfg["meta"]["support_gate"]["enabled"] = False
+    cfg["context"]["gru_hidden"] = 16
+
+    trainer = MetaTrainer(cfg)
+    trainer._run_episode(MultiTxUwSliptEnv(cfg), train=True, clear_context=True, reset_seed=123)
+    item = trainer.agent.replay.state_dict()["items"][0]
+
+    for key in ("bus_utilization", "projected_current_total", "qos_margin", "burst_active"):
+        assert key in item
+        assert np.isfinite(float(item[key]))
+
+
+def test_context_policy_inference_uses_deterministic_posterior_mean():
+    cfg = load_cfg("configs/default.yaml")
+    cfg["agent"]["hidden_dim"] = 32
+    cfg["context"]["gru_hidden"] = 16
+    agent = HierarchicalAgent(cfg, torch.device("cpu"))
+    obs = np.zeros(int(cfg["agent"]["obs_dim"]), dtype=np.float32)
+    act = np.zeros(int(cfg["agent"]["act_lower_dim"]), dtype=np.float32)
+    for idx in range(3):
+        agent.episode.add(
+            {
+                "obs": obs + float(idx),
+                "upper_idx_exec": float(idx),
+                "boost_combo_exec": float(idx % 4),
+                "mode_exec": float(idx % 3),
+                "act_exec": act + 0.01 * float(idx),
+                "reward_task": float(idx),
+                "cost_vec": np.zeros(4, dtype=np.float32),
+            }
+        )
+
+    z1 = agent.infer_z()
+    z2 = agent.infer_z()
+
+    assert np.allclose(z1, z2)
 
 
 def test_support_gate_accept_reject_and_query_independence():
@@ -195,8 +287,11 @@ def test_support_gate_reject_rolls_back_full_training_state(tmp_path):
     assert row["rollback_performed"] == "True"
     assert float(row["rollback_parameter_residual"]) == 0.0
     assert float(row["rollback_dual_residual"]) == 0.0
+    assert float(row["rollback_optimizer_residual"]) == 0.0
+    assert float(row["rollback_target_parameter_residual"]) == 0.0
     assert float(row["rollback_context_residual"]) == 0.0
     assert row["optimizer_state_restored"] == "True"
+    assert row["target_network_state_restored"] == "True"
     assert row["context_state_restored"] == "True"
     assert row["dual_state_restored"] == "True"
     assert row["thermal_estimator_state_restored"] == "True"
@@ -302,6 +397,7 @@ def test_support_gate_uses_paired_pre_post_validation_seeds(tmp_path):
 
     assert row["support_gate_enabled"] == "True"
     assert row["support_gate_paired_validation"] == "True"
+    assert row["support_gate_budget_mode"] == "paired_support_validation"
     assert row["support_gate_same_validation_seeds"] == "True"
     assert int(float(row["support_gate_pre_validation_episodes"])) == 1
     assert int(float(row["support_gate_post_validation_episodes"])) == 1
@@ -310,6 +406,56 @@ def test_support_gate_uses_paired_pre_post_validation_seeds(tmp_path):
     assert int(float(row["extra_gradient_updates"])) == 0
     assert int(float(row["extra_query_evaluations"])) == 0
     assert row["query_leakage"] == "False"
+
+
+def test_support_gate_validation_restores_candidate_context_and_rng(tmp_path):
+    cfg = load_cfg("configs/default.yaml")
+    cfg["experiment"]["log_dir"] = str(tmp_path)
+    cfg["experiment"]["run_name"] = "gate_validation_restore"
+    cfg["experiment"]["seed"] = 31
+    cfg["env"]["episode_len"] = 3
+    cfg["agent"]["hidden_dim"] = 32
+    cfg["agent"]["batch_size"] = 4
+    cfg["agent"]["warmup_steps"] = 4
+    cfg["agent"]["upper_batch_size"] = 2
+    cfg["upper_dqn"]["batch_size"] = 2
+    cfg["agent"]["upper_update_every"] = 1
+    cfg["buffer"]["replay_size"] = 128
+    cfg["buffer"]["context_max_len"] = 64
+    cfg["meta"]["meta_iters"] = 1
+    cfg["meta"]["n_tasks_per_iter"] = 1
+    cfg["meta"]["support_gate_validation_episodes"] = 1
+    cfg["meta"]["support_gate"]["enabled"] = True
+    cfg["meta"]["support_gate"]["paired_validation"] = True
+    cfg["upper_dqn"]["epsilon_decay_steps"] = 10
+    cfg["context"]["gru_hidden"] = 16
+
+    trainer = MetaTrainer(cfg)
+    task = trainer.task_sampler.sample(1)[0]
+    pre_state = trainer.agent.snapshot_mutable_state()
+
+    env = MultiTxUwSliptEnv(cfg, overrides=task.to_env_overrides())
+    trainer._run_episode(env, train=True, clear_context=True, reset_seed=123)
+    candidate_state = trainer.agent.snapshot_mutable_state()
+    candidate_dual_state = copy.deepcopy(trainer.dual.state_dict())
+    candidate_context_len = len(trainer.agent.episode)
+
+    trainer._run_gate_validation_pair(
+        task=task,
+        iteration=1,
+        task_idx=0,
+        candidate_state=candidate_state,
+        candidate_dual_state=candidate_dual_state,
+        pre_state=pre_state,
+        pre_dual_state=copy.deepcopy(candidate_dual_state),
+    )
+    restored_state = trainer.agent.snapshot_mutable_state()
+
+    assert len(trainer.agent.episode) == candidate_context_len
+    assert MetaTrainer._trainable_parameter_delta_norm(candidate_state, restored_state) == 0.0
+    assert MetaTrainer._optimizer_state_delta_norm(candidate_state, restored_state) == 0.0
+    assert MetaTrainer._target_parameter_delta_norm(candidate_state, restored_state) == 0.0
+    assert MetaTrainer._numeric_state_delta_norm(candidate_state["rng"], restored_state["rng"]) == 0.0
 
 
 def test_support_delta_norm_ignores_optimizer_state():
@@ -336,6 +482,7 @@ def test_support_delta_norm_ignores_optimizer_state():
     optimizer_only["context_optim"]["state"]["m"] = torch.ones(2)
 
     assert MetaTrainer._trainable_parameter_delta_norm(base, optimizer_only) == 0.0
+    assert MetaTrainer._optimizer_state_delta_norm(base, optimizer_only) > 0.0
 
     param_changed = copy.deepcopy(base)
     param_changed["lower"]["actor"]["w"] = torch.ones(2)
@@ -450,7 +597,7 @@ def test_meta_adaptation_diagnostics_outputs_meta_vs_wo_meta_rows(tmp_path):
     assert "query_reward_before_support" in summary["adaptation_summary"]["hybrid_meta"]
     assert "query_reward_after_support" in summary["adaptation_summary"]["hybrid_meta"]
     assert summary["adaptation_summary"]["hybrid_meta"]["query_has_support_context_fraction"] == 1.0
-    assert summary["adaptation_summary"]["hybrid_meta_no_support_adapt"]["query_has_support_context_fraction"] == 1.0
+    assert summary["adaptation_summary"]["hybrid_meta_no_support_adapt"]["query_has_support_context_fraction"] == 0.0
     assert 0.0 <= summary["adaptation_summary"]["hybrid_meta_support_gated"]["query_has_support_context_fraction"] <= 1.0
     assert "support_gate_accept_rate" in summary["adaptation_summary"]["hybrid_meta_support_gated"]
     assert "support_gate_no_support_rate" in summary["adaptation_summary"]["hybrid_meta_support_gated"]
@@ -508,7 +655,7 @@ def test_meta_adaptation_diagnostics_outputs_meta_vs_wo_meta_rows(tmp_path):
     assert context_only_support[0]["support_train_adapts"] == "False"
     assert wo_support[0]["support_train_adapts"] == "False"
     assert int(meta_support[0]["context_history_len_before_query"]) > 0
-    assert int(no_adapt_support[0]["context_history_len_before_query"]) > 0
+    assert int(no_adapt_support[0]["context_history_len_before_query"]) == 0
     assert int(gated_support[0]["context_history_len_before_query"]) >= 0
     assert int(context_only_support[0]["context_history_len_before_query"]) > 0
     assert int(wo_support[0]["context_history_len_before_query"]) == 0

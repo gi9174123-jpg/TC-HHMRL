@@ -138,7 +138,7 @@ def test_formal_metadata_reports_model_aware_lower_components():
     assert meta["reward_schema_version"] == "reward_task_plus_benchmark_and_constraint_cost_vec_v2"
     assert meta["action_contract_version"] == "policy_planner_executed_action_v1"
     assert meta["residual_planner_scoring"] == "target_critics_plus_constraint_incremental_h2_risk"
-    assert meta["residual_planner_trust_region_enabled"] is True
+    assert meta["residual_planner_trust_region_enabled"] is False
     assert meta["residual_planner_replacement_margin_mode"] == "normalized"
     assert meta["residual_planner_replacement_margin"] is None
     assert meta["residual_planner_total_current_raw_step"] == 0.10
@@ -252,10 +252,16 @@ def test_variant_fairness_only_changes_device_mapping():
     led_cfg = copy.deepcopy(base)
     apply_variant(led_cfg, "single_led")
     assert led_cfg["env"]["hybrid"]["tx_enabled"] == [1.0, 0.0, 0.0]
+    led_gain = float(base["safety"]["effective_gain_initial"][0])
+    assert np.allclose(led_cfg["safety"]["effective_gain_initial"], [led_gain, led_gain, led_gain])
+    assert np.allclose(led_cfg["adaptive_thermal"]["initial_effective_gain"], [led_gain, led_gain, led_gain])
 
     ld_cfg = copy.deepcopy(base)
     apply_variant(ld_cfg, "single_ld")
     assert ld_cfg["env"]["hybrid"]["tx_enabled"] == [1.0, 0.0, 0.0]
+    ld_gain = float(np.mean(base["safety"]["effective_gain_initial"][1:]))
+    assert np.allclose(ld_cfg["safety"]["effective_gain_initial"], [ld_gain, ld_gain, ld_gain])
+    assert np.allclose(ld_cfg["adaptive_thermal"]["initial_effective_gain"], [ld_gain, ld_gain, ld_gain])
 
 
 def test_safety_thresholds_not_later_than_env_in_key_scenarios():
@@ -313,6 +319,7 @@ def test_full_hybrid_support_gate_default_and_ungated_ablation():
     assert int(cfg["meta"]["support_adaptation_episodes"]) == 3
     assert int(cfg["meta"]["support_gate_validation_episodes"]) == 2
     assert cfg["meta"]["support_gate"]["paired_validation"] is True
+    assert cfg["meta"]["support_gate"]["budget_mode"] == "paired_support_validation"
     assert int(cfg["meta"]["support_gate"]["extra_support_rollouts"]) == 2
     assert int(cfg["meta"]["support_gate"]["extra_gradient_updates"]) == 0
 
@@ -491,6 +498,11 @@ def test_non_meta_baseline_overrides_disable_support_gate():
         assert cfg["meta"]["support_gate"]["enabled"] is False
         assert cfg["meta"]["query_updates_enabled"] is False
         assert cfg["context"]["enabled"] is False
+        if baseline == "sac_lagrangian":
+            assert cfg["constraint_critics"]["enabled"] is False
+            assert cfg["constraint_critics"]["reward_target"] == "penalized_reward"
+            assert cfg["baseline_metadata"]["constraint_critics_enabled"] is False
+            assert cfg["baseline_metadata"]["lower_reward_target"] == "penalized_reward"
 
 
 def test_shin2024_matched_action_contract_forces_hy_and_fixed_currents(tmp_path):

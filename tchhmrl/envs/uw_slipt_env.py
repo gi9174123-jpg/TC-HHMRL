@@ -37,6 +37,7 @@ class MultiTxUwSliptEnv(gym.Env):
         env_cfg = dict(cfg["env"])
         if overrides:
             env_cfg.update(overrides)
+        obs_cfg = dict(cfg.get("observation", {}) or {})
         alignment_cfg = dict(cfg.get("alignment", {}))
         self.alignment_version = str(alignment_cfg.get("alignment_version", "system_model_v1"))
         self.task_summary_version = str(alignment_cfg.get("task_summary_version", "site_v2"))
@@ -88,6 +89,7 @@ class MultiTxUwSliptEnv(gym.Env):
         self.distances = np.asarray(env_cfg["distances"], dtype=np.float32)
         self.default_distances = self.distances.copy()
         self.misalign_std = float(env_cfg["misalign_std"])
+        self.misalign_normalization_scale = float(obs_cfg.get("misalign_normalization_scale", 0.42))
         self.temporal_misalign_rho = float(env_cfg.get("temporal_misalign_rho", 0.0))
         self.attenuation_drift_rho = float(env_cfg.get("attenuation_drift_rho", 0.0))
         self.attenuation_drift_std = float(env_cfg.get("attenuation_drift_std", 0.0))
@@ -347,7 +349,7 @@ class MultiTxUwSliptEnv(gym.Env):
     def _obs(self) -> np.ndarray:
         # Normalize mixed-scale features for stabler value/policy learning.
         channel_norm = np.log1p(np.clip(self.channel, 0.0, None) * 500.0) / np.log1p(500.0)
-        misalign_scale = max(self.misalign_std * 3.0, 1.0e-3)
+        misalign_scale = max(self.misalign_normalization_scale, 1.0e-3)
         misalign_norm = np.clip(self.misalign / misalign_scale, -2.0, 2.0)
         temp_norm = np.clip((self.temps - self.amb_temp) / 20.0, -2.0, 2.0)
         amb_norm = float(np.clip((self.amb_temp - 25.0) / 15.0, -2.0, 2.0))

@@ -129,7 +129,7 @@ def test_context_site_v2_task_summary_reaches_eval_and_train_paths(tmp_path):
     assert trainer.agent.context_task_dim == 9
 
     env_eval = MultiTxUwSliptEnv(cfg, overrides=task.to_env_overrides())
-    trainer._run_episode(env_eval, train=False)
+    trainer._run_episode(env_eval, train=False, update_context=True)
     eval_episode = trainer.agent.episode.as_list()
     assert eval_episode
     assert np.asarray(eval_episode[0]["task_params"]).shape == (9,)

@@ -607,9 +607,15 @@ class SafetyLayer:
             - safe_currents.sum(dim=1, keepdim=True),
             min=0.0,
         )
-        available = torch.clamp(cap - safe_currents, min=0.0) * active
-        weights = available / torch.clamp(available.sum(dim=1, keepdim=True), min=1.0e-6)
-        safe_currents = safe_currents + weights * shortage
+        for _ in range(currents.shape[1]):
+            available = torch.clamp(cap - safe_currents, min=0.0) * active
+            idx = torch.argmax(available, dim=1, keepdim=True)
+            room = torch.gather(available, dim=1, index=idx)
+            add = torch.minimum(room, shortage)
+            add = torch.where((room > 1.0e-8) & (shortage > 1.0e-8), add, torch.zeros_like(add))
+            safe_currents = safe_currents.scatter_add(1, idx, add)
+            shortage = torch.clamp(shortage - add, min=0.0)
+        safe_currents = torch.minimum(safe_currents, cap)
         total = safe_currents.sum(dim=1, keepdim=True)
         safe_currents = safe_currents * self._hard_bus_scale_torch(total)
         scale = torch.where(
@@ -779,6 +785,10 @@ class SafetyLayer:
             "projected_current_total": projected_current_total,
             "projection_compression_ratio": projection_compression_ratio,
             "current_requested": current_requested.astype(np.float32),
+            "current_requested_pre_static_cap": np.asarray(
+                current_aux.get("current_requested_pre_static_cap", current_requested),
+                dtype=np.float32,
+            ),
             "actor_total_current_requested": float(current_aux["actor_total_current_requested"]),
             "actor_active_current_capacity": float(current_aux.get("actor_active_current_capacity", self.bus_current_max)),
             "actor_allocation_anchor": float(np.asarray(current_aux["actor_allocation"])[0]),
@@ -960,6 +970,7 @@ class SafetyLayer:
             "projected_current_total": projected_current_total,
             "projection_compression_ratio": projection_compression_ratio,
             "current_requested": current_requested,
+            "current_requested_pre_static_cap": current_aux.get("current_requested_pre_static_cap", current_requested),
             "actor_total_current_requested": current_aux["actor_total_current_requested"],
             "actor_active_current_capacity": current_aux.get(
                 "actor_active_current_capacity",

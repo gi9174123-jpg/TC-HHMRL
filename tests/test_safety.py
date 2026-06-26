@@ -400,6 +400,41 @@ def test_safety_thermal_cap_numpy_torch_consistency():
         )
 
 
+def test_qos_aware_hard_clip_numpy_torch_consistency():
+    cfg = copy.deepcopy(load_cfg("configs/default.yaml"))
+    cfg["safety"]["projection_mode"] = "qos_aware_hard_clip"
+    cfg["safety"]["thermal_cap_margin_c"] = 0.5
+    safety = SafetyLayer(cfg)
+
+    lower_raw_np = np.array([0.95, 0.8, 0.6, 0.2, -0.2], dtype=np.float32)
+    temps_np = np.array([43.0, 42.0, 41.0], dtype=np.float32)
+    np_out, _ = safety.project_np(
+        upper_raw=11,
+        lower_raw=lower_raw_np,
+        temps=temps_np,
+        amb_temp=35.0,
+        gamma=0.06,
+        delta=4.0,
+        mem={"current_boost": 3, "dwell_count": 3},
+    )
+    torch_out = safety.project_torch(
+        lower_raw=torch.tensor(lower_raw_np).unsqueeze(0),
+        boost_combo=torch.tensor([3]),
+        mode=torch.tensor([2]),
+        temps=torch.tensor(temps_np).unsqueeze(0),
+        amb_temp=torch.tensor([35.0]),
+        gamma=torch.tensor([0.06]),
+        delta=torch.tensor([4.0]),
+    )
+
+    for key in ["currents_exec", "thermal_cap_scale", "t_pred"]:
+        assert np.allclose(
+            np_out[key],
+            torch_out[key].detach().cpu().numpy().reshape(-1),
+            atol=1e-5,
+        )
+
+
 def test_adaptive_thermal_estimator_updates_only_with_valid_excitation():
     cfg = copy.deepcopy(load_cfg("configs/default.yaml"))
     cfg["adaptive_thermal"]["enabled"] = True

@@ -134,6 +134,68 @@ def test_agent_act_uses_residual_planner_after_start_iter():
     assert np.asarray(action["currents_exec"], dtype=np.float32).shape == (3,)
 
 
+def test_residual_planner_low_risk_periodic_budget_uses_rollout_step_not_global_step():
+    cfg = _cfg()
+    cfg["residual_planner"]["adaptive_budget_enabled"] = True
+    cfg["residual_planner"]["budget_low_periodic_interval"] = 2
+    cfg["residual_planner"]["budget_low_periodic_k"] = 8
+    cfg["residual_planner"]["budget_high_headroom_c"] = -1.0
+    cfg["residual_planner"]["budget_medium_headroom_c"] = -1.0
+    cfg["residual_planner"]["budget_high_gain_std"] = 1.0e9
+    cfg["residual_planner"]["budget_medium_gain_std"] = 1.0e9
+    cfg["residual_planner"]["budget_high_disagreement"] = 1.0e9
+    cfg["residual_planner"]["budget_medium_disagreement"] = 1.0e9
+    cfg["residual_planner"]["budget_high_constraint"] = 1.0e9
+    cfg["residual_planner"]["budget_medium_constraint"] = 1.0e9
+    cfg["residual_planner"]["budget_high_projection_residual"] = 1.0e9
+    cfg["residual_planner"]["budget_medium_projection_residual"] = 1.0e9
+    agent = HierarchicalAgent(cfg, torch.device("cpu"))
+    agent.set_meta_iter(1)
+    agent.global_step = 1
+
+    obs = np.zeros(int(cfg["agent"]["obs_dim"]), dtype=np.float32)
+    z = np.zeros(int(cfg["agent"]["z_dim"]), dtype=np.float32)
+    temps = np.asarray([28.0, 28.0, 28.0], dtype=np.float32)
+
+    _action0, aux0 = agent.act(
+        obs=obs,
+        temps=temps,
+        amb_temp=float(cfg["env"]["amb_temp"]),
+        gamma=float(cfg["env"]["gamma"]),
+        delta=float(cfg["env"]["delta"]),
+        z=z,
+        eval_mode=True,
+    )
+    _action1, aux1 = agent.act(
+        obs=obs,
+        temps=temps,
+        amb_temp=float(cfg["env"]["amb_temp"]),
+        gamma=float(cfg["env"]["gamma"]),
+        delta=float(cfg["env"]["delta"]),
+        z=z,
+        eval_mode=True,
+    )
+    agent.reset_rollout_state(clear_context=False)
+    _action2, aux2 = agent.act(
+        obs=obs,
+        temps=temps,
+        amb_temp=float(cfg["env"]["amb_temp"]),
+        gamma=float(cfg["env"]["gamma"]),
+        delta=float(cfg["env"]["delta"]),
+        z=z,
+        eval_mode=True,
+    )
+
+    assert int(aux0["rollout_step"]) == 0
+    assert int(aux0["residual_planner_budget"]) == 8
+    assert aux0["residual_planner_budget_reason"] == "low_risk_periodic_verification"
+    assert int(aux1["rollout_step"]) == 1
+    assert int(aux1["residual_planner_budget"]) == 0
+    assert aux1["residual_planner_budget_reason"] == "very_low_risk_policy_only"
+    assert int(aux2["rollout_step"]) == 0
+    assert int(aux2["residual_planner_budget"]) == 8
+
+
 def test_residual_planner_scores_with_target_critics_not_online_critics():
     cfg = _cfg()
     agent = HierarchicalAgent(cfg, torch.device("cpu"))

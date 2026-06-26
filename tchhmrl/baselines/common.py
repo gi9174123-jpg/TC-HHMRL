@@ -200,6 +200,23 @@ class BasePaperBaseline:
             self.safety_mem = new_mem
         return safe, new_mem
 
+    def _update_safety_estimator(self, temps_before: np.ndarray, info: Dict[str, object]) -> Dict[str, object]:
+        currents = np.asarray(info.get("currents_exec", np.zeros(3, dtype=np.float32)), dtype=np.float32)
+        temps_after = np.asarray(info.get("temps", temps_before), dtype=np.float32)
+        amb_temp = float(info.get("amb_temp", self.cfg["env"].get("amb_temp", 10.0)))
+        gamma = float(info.get("gamma", self.cfg["env"].get("gamma", 0.95)))
+        thermal_base, _ = self.safety._thermal_base_np(
+            np.asarray(temps_before, dtype=np.float32),
+            amb_temp,
+            gamma,
+        )
+        return self.safety.update_thermal_estimator(
+            currents=currents,
+            temps_before=np.asarray(temps_before, dtype=np.float32),
+            temps_after=temps_after,
+            thermal_base=thermal_base,
+        )
+
     def _action_from_safe(
         self,
         upper_raw: int,
@@ -267,6 +284,8 @@ class BasePaperBaseline:
                 "rho_raw_decoded",
                 "tau_raw_decoded",
                 "raw_current_total",
+                "current_requested",
+                "current_requested_pre_static_cap",
                 "masked_current_total",
                 "bus_projected_current_total",
                 "projected_current_total",
@@ -307,8 +326,10 @@ class BasePaperBaseline:
         ep_temp_max = ep_bus_util = ep_latency = 0.0
         ep_len = 0
         while not done:
+            temps_before = env.temps.copy().astype(np.float32)
             action, aux = self.act(obs, env, eval_mode=not train)
             next_obs, reward, terminated, truncated, info = env.step(action)
+            self._update_safety_estimator(temps_before, info)
             done = bool(terminated or truncated)
             if train:
                 self.record_transition(obs, aux, float(reward), done, next_obs, info)

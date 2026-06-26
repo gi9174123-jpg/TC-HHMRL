@@ -31,6 +31,15 @@ def test_benchmark_writes_resolved_config_and_run_summary(tmp_path: Path):
         use_curriculum=False,
     )
     assert report_path.exists()
+    report = json.loads(report_path.read_text(encoding="utf-8"))
+    manifest_path = Path(report["formal_run_manifest"])
+    assert manifest_path.exists()
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    assert manifest["manifest_version"] == "formal_run_manifest_v1"
+    assert len(manifest["config_sha256"]) == 64
+    assert manifest["seeds"] == [101]
+    assert manifest["scenarios"] == ["easy_baseline"]
+    assert "support_gate_budget_mode" in manifest
 
     scenario_dir = out_dir / "easy_baseline"
     run_summary_json = scenario_dir / "run_summary.json"
