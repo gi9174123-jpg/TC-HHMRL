@@ -706,6 +706,69 @@ def test_full_final_ungated_compat_matches_final_chain_without_gate():
     assert "five_support_three_update_two_context_only_support" in meta["final_mechanisms"]
 
 
+def test_full_final_recover_variants_restore_old_lightweight_selection_and_optimizer_state():
+    gated = load_cfg("configs/default.yaml")
+    gated = copy.deepcopy(gated)
+    apply_ablation(gated, "full_final_gated_recover")
+
+    ungated = load_cfg("configs/default.yaml")
+    ungated = copy.deepcopy(ungated)
+    apply_ablation(ungated, "full_final_ungated_recover")
+
+    for cfg in (gated, ungated):
+        assert cfg["safety"]["projection_mode"] == "thermal_cap"
+        assert float(cfg["safety"]["thermal_cap_margin_c"]) == 0.5
+        assert cfg["safety"]["current_decoder"] == "per_source"
+        assert int(cfg["meta"]["support_episodes"]) == 3
+        assert int(cfg["meta"]["support_adaptation_episodes"]) == 3
+        assert int(cfg["meta"]["support_gate_validation_episodes"]) == 0
+        assert int(cfg["meta"]["query_episodes"]) == 2
+        assert cfg["meta"]["query_updates_enabled"] is True
+        assert cfg["meta"]["query_context_updates_enabled"] is True
+        assert cfg["meta"]["reset_optimizer_after_outer_update"] is False
+        assert int(cfg["meta"]["checkpoint_selection"]["min_iter"]) == 0
+        assert int(cfg["meta"]["checkpoint_selection"]["eval_tasks"]) == 3
+        assert int(cfg["meta"]["checkpoint_selection"]["eval_eps"]) == 1
+        assert cfg["upper_safety_shield"]["enabled"] is False
+        assert cfg["residual_planner"]["enabled"] is False
+        assert cfg["execution_thermal_guard"]["enabled"] is False
+        assert int(cfg["agent"]["upper_update_every"]) == 2
+
+        meta = cfg["pilot_metadata"]
+        assert meta["final_recover_full"] is True
+        assert meta["pilot_only"] is False
+        assert meta["formal_ranking_exclude"] is False
+        assert meta["current_decoder"] == "per_source"
+        assert meta["reset_optimizer_after_outer_update"] is False
+        assert int(meta["checkpoint_selection_eval_tasks"]) == 3
+        assert int(meta["checkpoint_selection_eval_eps"]) == 1
+        assert "optimizer_state_not_reset_after_outer_update" in meta["final_recover_mechanisms"]
+        assert "checkpoint_selection_3_tasks_1_episode" in meta["final_recover_mechanisms"]
+
+    assert gated["meta"]["protocol_name"] == "final_gated_recover"
+    assert gated["meta"]["support_gate"]["enabled"] is True
+    assert gated["meta"]["support_gate"]["paired_validation"] is False
+    assert gated["meta"]["support_gate"]["budget_mode"] == "support_adaptation_only"
+    assert float(gated["meta"]["support_gate"]["max_cost_increase"]) == 5.0e-4
+    assert float(gated["meta"]["support_gate"]["max_violation_increase"]) == 1.0e-2
+    assert int(gated["meta"]["support_gate"]["extra_support_rollouts"]) == 0
+    assert int(gated["meta"]["support_gate"]["extra_gradient_updates"]) == 0
+    assert int(gated["meta"]["support_gate"]["extra_query_evaluations"]) == 0
+    assert gated["meta"]["support_update_acceptance"] == "support_side_gated"
+    assert gated["pilot_metadata"]["final_gated_recover"] is True
+    assert gated["pilot_metadata"]["support_gate"] is True
+    assert gated["pilot_metadata"]["support_gate_budget_mode"] == "support_adaptation_only"
+
+    assert ungated["meta"]["protocol_name"] == "final_ungated_recover"
+    assert ungated["meta"]["support_gate"]["enabled"] is False
+    assert ungated["meta"]["support_gate"]["paired_validation"] is False
+    assert ungated["meta"]["support_gate"]["budget_mode"] == "support_gate_disabled"
+    assert int(ungated["meta"]["support_gate"]["extra_support_rollouts"]) == 0
+    assert ungated["meta"]["support_update_acceptance"] == "unconditional"
+    assert ungated["pilot_metadata"]["final_ungated_recover"] is True
+    assert ungated["pilot_metadata"]["support_gate"] is False
+
+
 def test_full_compat_no_support_gate_probe_removes_gate_budget():
     cfg = load_cfg("configs/default.yaml")
     cfg = copy.deepcopy(cfg)
