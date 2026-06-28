@@ -598,6 +598,83 @@ def disable_support_gate_for_compat_probe(cfg: Dict) -> None:
     gate_cfg["extra_query_evaluations"] = 0
 
 
+def apply_legacy_strong_gated_full(cfg: Dict) -> None:
+    """Old high-performing Full mechanics with support-gated rollback retained."""
+    meta_cfg = cfg.setdefault("meta", {})
+    meta_cfg["n_tasks_per_iter"] = 6
+    meta_cfg["support_episodes"] = 3
+    meta_cfg["support_adaptation_episodes"] = 3
+    meta_cfg["support_gate_validation_episodes"] = 0
+    meta_cfg["query_episodes"] = 2
+    meta_cfg["query_updates_enabled"] = True
+    meta_cfg["query_context_updates_enabled"] = True
+    meta_cfg["explicit_inner_outer"] = True
+    meta_cfg["outer_step_size"] = 0.15
+    meta_cfg["protocol_name"] = "legacy_strong_online_gated"
+    gate_cfg = meta_cfg.setdefault("support_gate", {})
+    gate_cfg.setdefault("role", "rollback_guard")
+    gate_cfg["rule"] = "safety_first"
+    gate_cfg["enabled"] = True
+    gate_cfg["normalized_reward_threshold"] = 0.0
+    gate_cfg["reward_normalization_eps"] = 1.0
+    gate_cfg["max_cost_increase"] = 1.0e-5
+    gate_cfg["max_violation_increase"] = 1.0e-4
+    gate_cfg["paired_validation"] = False
+    gate_cfg["query_leakage"] = False
+    gate_cfg["budget_mode"] = "support_adaptation_only"
+    gate_cfg["extra_support_rollouts"] = 0
+    gate_cfg["extra_gradient_updates"] = 0
+    gate_cfg["extra_query_evaluations"] = 0
+
+    safety_cfg = cfg.setdefault("safety", {})
+    safety_cfg["projection_mode"] = "thermal_cap"
+    safety_cfg["thermal_cap_margin_c"] = 0.5
+    safety_cfg["current_decoder"] = "per_source"
+
+    cfg.setdefault("upper_safety_shield", {})["enabled"] = False
+    cfg.setdefault("execution_thermal_guard", {})["enabled"] = False
+    cfg.setdefault("residual_planner", {})["enabled"] = False
+    cfg.setdefault("agent", {})["upper_update_every"] = 2
+
+    cfg.setdefault("buffer", {})["context_max_len"] = max(
+        int(cfg.get("buffer", {}).get("context_max_len", 0)),
+        int(cfg.get("env", {}).get("episode_len", 80))
+        * (int(meta_cfg["support_episodes"]) + int(meta_cfg["query_episodes"])),
+    )
+    ckpt_cfg = meta_cfg.setdefault("checkpoint_selection", {})
+    ckpt_cfg["enabled"] = True
+    ckpt_cfg["mode"] = "heldout_eval"
+    ckpt_cfg["min_iter"] = 0
+
+    cfg["pilot_metadata"] = {
+        "legacy_strong_gated_full": True,
+        "pilot_only": False,
+        "formal_ranking_exclude": False,
+        "comparison_role": "final_full_candidate_legacy_mechanics_with_support_gate",
+        "projection_variant": "thermal_cap",
+        "support_gate": True,
+        "support_gate_role": "rollback_guard",
+        "support_gate_budget_mode": "support_adaptation_only",
+        "support_gate_extra_rollouts": 0,
+        "support_update_acceptance": "support_side_gated",
+        "legacy_mechanisms_restored": [
+            "per_source_current_decoder",
+            "online_query_updates",
+            "three_support_two_query",
+            "upper_shield_disabled",
+            "residual_planner_disabled",
+            "upper_update_every_2",
+        ],
+        "current_decoder": "per_source",
+        "query_updates_enabled": True,
+        "query_context_updates_enabled": True,
+        "upper_shield_enabled": False,
+        "residual_planner_enabled": False,
+        "execution_guard_enabled": False,
+        "projection_objective": "recover_old_full_hard_stress_performance_while_retaining_support_gated_rollback",
+    }
+
+
 def set_compatibility_probe_metadata(cfg: Dict, *, changed_mechanisms: List[str]) -> None:
     meta_cfg = cfg.get("meta", {}) or {}
     gate_cfg = meta_cfg.get("support_gate", {}) or {}
@@ -626,6 +703,10 @@ def set_compatibility_probe_metadata(cfg: Dict, *, changed_mechanisms: List[str]
 def apply_ablation(cfg: Dict, ablation: str) -> None:
     ablation = str(ablation)
     if ablation == "full":
+        sync_site_bank_with_cfg(cfg)
+        return
+    if ablation == "full_legacy_strong_gated":
+        apply_legacy_strong_gated_full(cfg)
         sync_site_bank_with_cfg(cfg)
         return
     if ablation == "wo_meta":
@@ -4490,6 +4571,7 @@ STRUCTURAL_VARIANT_ORDER = (
 )
 HARD_TARGETED_VARIANT_ORDER = (
     "hybrid",
+    "hybrid_full_legacy_strong_gated",
     "hybrid_meta_ungated",
     "hybrid_wo_meta",
     "hybrid_wo_lagrangian",
@@ -5421,6 +5503,12 @@ def run_one_scenario(
                     "projection_variant": str(pilot_meta.get("projection_variant", "")),
                     "pilot_only": pilot_only,
                     "formal_ranking_exclude": formal_ranking_exclude,
+                    "legacy_strong_gated_full": bool(pilot_meta.get("legacy_strong_gated_full", False)),
+                    "legacy_mechanisms_restored": pilot_meta.get("legacy_mechanisms_restored", []),
+                    "legacy_current_decoder": str(pilot_meta.get("current_decoder", "")),
+                    "legacy_upper_shield_enabled": pilot_meta.get("upper_shield_enabled"),
+                    "legacy_residual_planner_enabled": pilot_meta.get("residual_planner_enabled"),
+                    "legacy_execution_guard_enabled": pilot_meta.get("execution_guard_enabled"),
                     "compatibility_probe": bool(pilot_meta.get("compatibility_probe", False)),
                     "compatibility_changed_mechanisms": pilot_meta.get("compatibility_changed_mechanisms", []),
                     "compat_query_updates_enabled": pilot_meta.get("compat_query_updates_enabled"),
@@ -5745,6 +5833,7 @@ def run_one_scenario(
         elif variant == "hybrid":
             is_smooth_relaxed = ablation == "smooth_relaxed"
             is_thermal_cap = ablation == "thermal_cap"
+            is_legacy_strong_gated = ablation == "full_legacy_strong_gated"
             is_meta_ungated = ablation == "meta_ungated"
             is_hard_clip = ablation == "hard_clip"
             is_qos_aware_hard_clip = ablation == "qos_aware_hard_clip"
@@ -5787,6 +5876,8 @@ def run_one_scenario(
                 if is_qos_recovery_exec_guard
                 else "qos_aware_hard_clip_with_per_source_execution_rescue_guard"
                 if is_qos_recovery_exec_guard_rescue
+                else "thermal_cap_legacy_strong_gated"
+                if is_legacy_strong_gated
                 else ""
             )
             comparison_role = (
@@ -5802,6 +5893,8 @@ def run_one_scenario(
                 if is_qos_recovery_exec_guard_rescue
                 else "full_compatibility_mechanism_probe"
                 if is_full_compat
+                else "final_full_candidate_legacy_mechanics_with_support_gate"
+                if is_legacy_strong_gated
                 else "ungated_meta_ablation"
                 if is_meta_ungated
                 else "full_method"
@@ -5824,6 +5917,8 @@ def run_one_scenario(
                     or is_qos_recovery_exec_guard_rescue
                     or is_full_compat
                 )
+                else False
+                if is_legacy_strong_gated
                 else None,
                 "formal_ranking_exclude": True
                 if (
@@ -5834,9 +5929,11 @@ def run_one_scenario(
                     or is_qos_recovery_exec_guard_rescue
                     or is_full_compat
                 )
+                else False
+                if is_legacy_strong_gated
                 else None,
                 "comparison_role": comparison_role,
-                "baseline_family": "hybrid_full" if ablation == "full" else label,
+                "baseline_family": "hybrid_full" if (ablation == "full" or is_legacy_strong_gated) else label,
                 "meta_learning": bool(hybrid_meta_enabled),
                 "support_gate": bool(hybrid_gate_enabled and not (is_full_compat_no_gate or is_full_compat_combo or is_full_compat_combo_no_planner)),
                 "support_gate_role": (
@@ -5848,6 +5945,8 @@ def run_one_scenario(
                 "support_gate_budget_mode": (
                     "support_gate_disabled"
                     if (is_full_compat_no_gate or is_full_compat_combo or is_full_compat_combo_no_planner)
+                    else "support_adaptation_only"
+                    if is_legacy_strong_gated
                     else definition_gate_budget_mode
                     if hybrid_gate_enabled
                     else ""
@@ -5861,7 +5960,12 @@ def run_one_scenario(
                 ),
                 "support_gate_extra_rollouts": (
                     0
-                    if (is_full_compat_no_gate or is_full_compat_combo or is_full_compat_combo_no_planner)
+                    if (
+                        is_full_compat_no_gate
+                        or is_full_compat_combo
+                        or is_full_compat_combo_no_planner
+                        or is_legacy_strong_gated
+                    )
                     else definition_gate_extra_rollouts
                     if hybrid_gate_enabled
                     else 0
@@ -5934,6 +6038,23 @@ def run_one_scenario(
                     else ""
                 ),
                 "thermal_cap_margin_c": 0.60 if is_qos_recovery_exec_guard_rescue_m015_cap060 else None,
+                "legacy_strong_gated_full": bool(is_legacy_strong_gated),
+                "legacy_mechanisms_restored": (
+                    [
+                        "per_source_current_decoder",
+                        "online_query_updates",
+                        "three_support_two_query",
+                        "upper_shield_disabled",
+                        "residual_planner_disabled",
+                        "upper_update_every_2",
+                    ]
+                    if is_legacy_strong_gated
+                    else []
+                ),
+                "current_decoder": "per_source" if is_legacy_strong_gated else "",
+                "upper_shield_enabled": False if is_legacy_strong_gated else None,
+                "residual_planner_enabled": False if is_legacy_strong_gated else None,
+                "execution_guard_enabled": False if is_legacy_strong_gated else None,
                 "compatibility_probe": bool(is_full_compat),
                 "compatibility_changed_mechanisms": (
                     ["query_updates_enabled"]
@@ -5977,6 +6098,8 @@ def run_one_scenario(
                     if is_qos_recovery_exec_guard_rescue_m015_cap060
                     else "Pilot hard-stress performance probe: mildly tightened rescue guard for anchor and LD thermal cost."
                     if is_qos_recovery_exec_guard_rescue_m020
+                    else "Final Full candidate: old high-performing online-adaptation mechanics with support-gated rollback retained."
+                    if is_legacy_strong_gated
                     else "Pilot compatibility probe: re-enable query-side updates while keeping the other current Full mechanisms unchanged."
                     if is_full_compat_query_update
                     else "Pilot compatibility probe: disable support-gate rollback and its paired validation budget."
@@ -6482,6 +6605,7 @@ def parse_args() -> argparse.Namespace:
         default=["full"],
         choices=[
             "full",
+            "full_legacy_strong_gated",
             "meta_ungated",
             "wo_meta",
             "wo_lagrangian",

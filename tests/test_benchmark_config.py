@@ -573,6 +573,52 @@ def test_full_compat_query_update_probe_only_reenables_query_updates():
     assert meta["formal_ranking_exclude"] is True
 
 
+def test_full_legacy_strong_gated_restores_old_full_mechanics_with_gate():
+    cfg = load_cfg("configs/default.yaml")
+    cfg = copy.deepcopy(cfg)
+    apply_ablation(cfg, "full_legacy_strong_gated")
+
+    assert cfg["safety"]["projection_mode"] == "thermal_cap"
+    assert float(cfg["safety"]["thermal_cap_margin_c"]) == 0.5
+    assert cfg["safety"]["current_decoder"] == "per_source"
+    assert cfg["meta"]["protocol_name"] == "legacy_strong_online_gated"
+    assert int(cfg["meta"]["support_episodes"]) == 3
+    assert int(cfg["meta"]["support_adaptation_episodes"]) == 3
+    assert int(cfg["meta"]["support_gate_validation_episodes"]) == 0
+    assert int(cfg["meta"]["query_episodes"]) == 2
+    assert cfg["meta"]["query_updates_enabled"] is True
+    assert cfg["meta"]["query_context_updates_enabled"] is True
+    assert cfg["meta"]["support_gate"]["enabled"] is True
+    assert cfg["meta"]["support_gate"]["role"] == "rollback_guard"
+    assert cfg["meta"]["support_gate"]["rule"] == "safety_first"
+    assert cfg["meta"]["support_gate"]["paired_validation"] is False
+    assert cfg["meta"]["support_gate"]["query_leakage"] is False
+    assert cfg["meta"]["support_gate"]["budget_mode"] == "support_adaptation_only"
+    assert int(cfg["meta"]["support_gate"]["extra_support_rollouts"]) == 0
+    assert int(cfg["meta"]["support_gate"]["extra_gradient_updates"]) == 0
+    assert int(cfg["meta"]["support_gate"]["extra_query_evaluations"]) == 0
+    assert cfg["upper_safety_shield"]["enabled"] is False
+    assert cfg["residual_planner"]["enabled"] is False
+    assert cfg["execution_thermal_guard"]["enabled"] is False
+    assert int(cfg["agent"]["upper_update_every"]) == 2
+    assert int(cfg["meta"]["checkpoint_selection"]["min_iter"]) == 0
+
+    meta = cfg["pilot_metadata"]
+    assert meta["legacy_strong_gated_full"] is True
+    assert meta["pilot_only"] is False
+    assert meta["formal_ranking_exclude"] is False
+    assert meta["comparison_role"] == "final_full_candidate_legacy_mechanics_with_support_gate"
+    assert meta["support_gate"] is True
+    assert meta["support_gate_budget_mode"] == "support_adaptation_only"
+    assert int(meta["support_gate_extra_rollouts"]) == 0
+    assert "per_source_current_decoder" in meta["legacy_mechanisms_restored"]
+    assert "online_query_updates" in meta["legacy_mechanisms_restored"]
+    assert meta["current_decoder"] == "per_source"
+    assert meta["upper_shield_enabled"] is False
+    assert meta["residual_planner_enabled"] is False
+    assert meta["execution_guard_enabled"] is False
+
+
 def test_full_compat_no_support_gate_probe_removes_gate_budget():
     cfg = load_cfg("configs/default.yaml")
     cfg = copy.deepcopy(cfg)
