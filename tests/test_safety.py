@@ -697,7 +697,7 @@ def test_thermal_pred_temp_and_margin_logged():
         delta=4.0,
         mem={"current_boost": 3, "dwell_count": 3},
     )
-    for key in ["thermal_source_term", "thermal_base", "thermal_pred_temp", "thermal_pred_margin"]:
+    for key in ["thermal_source_term", "thermal_base", "thermal_pred_temp", "thermal_pred_margin", "predicted_headroom"]:
         assert key in out
         assert np.asarray(out[key]).shape == (3,)
     assert "thermal_coupling_term" not in out
@@ -705,3 +705,41 @@ def test_thermal_pred_temp_and_margin_logged():
     assert np.allclose(out["thermal_source_term"], 0.0, atol=1.0e-7)
     assert np.allclose(out["thermal_pred_temp"], out["t_pred"], atol=1.0e-7)
     assert np.allclose(out["thermal_pred_margin"], out["thermal_margin"], atol=1.0e-7)
+    assert np.allclose(out["predicted_headroom"], out["thermal_margin"], atol=1.0e-7)
+
+
+def test_execution_guard_downgrades_removable_sources_and_clamps_anchor():
+    cfg = copy.deepcopy(load_cfg("configs/default.yaml"))
+    cfg["safety"]["projection_mode"] = "qos_aware_hard_clip"
+    cfg["upper_safety_shield"]["enabled"] = False
+    cfg["execution_thermal_guard"] = {
+        "enabled": True,
+        "mode": "per_source_predictive",
+        "guard_margin_c": 0.75,
+        "emergency_margin_c": 0.0,
+        "fallback": "largest_safe_subset",
+        "clamp_anchor_current": True,
+        "reproject_after_guard": True,
+    }
+    safety = SafetyLayer(cfg)
+    out, mem = safety.project_np(
+        upper_raw=11,
+        lower_raw=np.asarray([1.0, 1.0, 1.0, 0.0, 0.0], dtype=np.float32),
+        temps=np.asarray([44.8, 44.6, 44.6], dtype=np.float32),
+        amb_temp=38.0,
+        gamma=0.06,
+        delta=4.0,
+        mem={"current_boost": 3, "dwell_count": 3},
+    )
+
+    assert out["execution_guard_enabled"] is True
+    assert out["execution_guard_applied"] is True
+    assert out["execution_guard_downgrade_applied"] is True
+    assert out["execution_guard_anchor_clamp_applied"] is True
+    assert int(out["boost_combo_exec"]) == 0
+    assert int(mem["current_boost"]) == 0
+    assert float(out["currents_exec"][1]) == 0.0
+    assert float(out["currents_exec"][2]) == 0.0
+    assert float(out["execution_guard_downgrade_ld1"]) == 1.0
+    assert float(out["execution_guard_downgrade_ld2"]) == 1.0
+    assert float(out["execution_guard_anchor_current_after"]) <= float(out["execution_guard_anchor_current_before"]) + 1.0e-7

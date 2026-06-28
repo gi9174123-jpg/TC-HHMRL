@@ -665,6 +665,37 @@ def apply_ablation(cfg: Dict, ablation: str) -> None:
         }
         sync_site_bank_with_cfg(cfg)
         return
+    if ablation == "qos_recovery_per_source_exec_guard":
+        cfg.setdefault("safety", {})["projection_mode"] = "qos_aware_hard_clip"
+        cfg.setdefault("upper_safety_shield", {})["enabled"] = False
+        guard_cfg = cfg.setdefault("execution_thermal_guard", {})
+        base_margin = float(cfg.get("safety", {}).get("thermal_cap_margin_c", 0.5) or 0.0)
+        extra_margin = 0.25
+        guard_cfg["enabled"] = True
+        guard_cfg["mode"] = "per_source_predictive"
+        guard_cfg["guard_margin_c"] = base_margin + extra_margin
+        guard_cfg["emergency_margin_c"] = 0.0
+        guard_cfg["fallback"] = "largest_safe_subset"
+        guard_cfg["clamp_anchor_current"] = True
+        guard_cfg["reproject_after_guard"] = True
+        cfg["pilot_metadata"] = {
+            "projection_variant": "qos_aware_hard_clip",
+            "upper_shield_protocol": "disabled_selection_time_mask",
+            "execution_guard_protocol": "per_source_predictive_largest_safe_subset_anchor_clamp",
+            "pilot_only": True,
+            "formal_ranking_exclude": True,
+            "comparison_role": "hard_stress_mechanism_probe",
+            "strong_safety_baseline": False,
+            "oracle_future_disturbances": False,
+            "qos_recovery_rule": "non_oracle_current_recovery_to_active_sources_with_thermal_and_bus_headroom",
+            "execution_guard_margin_c": base_margin + extra_margin,
+            "execution_guard_extra_margin_c": extra_margin,
+            "execution_guard_emergency_margin_c": 0.0,
+            "execution_guard_fallback": "largest_safe_subset",
+            "projection_objective": "test_source_specific_execution_guard_with_qos_recovery_inside_safe_feasible_set",
+        }
+        sync_site_bank_with_cfg(cfg)
+        return
     if ablation == "smooth_relaxed":
         cfg.setdefault("safety", {})["projection_mode"] = "smooth_relaxed"
         cfg.setdefault("safety", {})["smooth_relaxed_margin_c"] = float(
@@ -1869,6 +1900,7 @@ def _safe_projection_aux(safe: Dict) -> Dict[str, object]:
         "thermal_base": safe.get("thermal_base"),
         "thermal_pred_temp": safe.get("thermal_pred_temp"),
         "thermal_pred_margin": safe.get("thermal_pred_margin"),
+        "predicted_headroom": safe.get("predicted_headroom"),
         "thermal_model": safe.get("thermal_model"),
         "thermal_coupling_matrix_hash": safe.get("thermal_coupling_matrix_hash"),
         "safety_projection_version": safe.get("safety_projection_version"),
@@ -1886,6 +1918,20 @@ def _safe_projection_aux(safe: Dict) -> Dict[str, object]:
         "projection_compression_ratio": safe.get("projection_compression_ratio"),
         "projection_compression_ratio_per_source": safe.get("projection_compression_ratio_per_source"),
         "qos_recovered_current": safe.get("qos_recovered_current"),
+        "execution_guard_enabled": safe.get("execution_guard_enabled"),
+        "execution_guard_applied": safe.get("execution_guard_applied"),
+        "execution_guard_downgrade_applied": safe.get("execution_guard_downgrade_applied"),
+        "execution_guard_anchor_clamp_applied": safe.get("execution_guard_anchor_clamp_applied"),
+        "execution_guard_requested_boost": safe.get("execution_guard_requested_boost"),
+        "execution_guard_final_boost": safe.get("execution_guard_final_boost"),
+        "execution_guard_downgrade_ld1": safe.get("execution_guard_downgrade_ld1"),
+        "execution_guard_downgrade_ld2": safe.get("execution_guard_downgrade_ld2"),
+        "execution_guard_anchor_cap": safe.get("execution_guard_anchor_cap"),
+        "execution_guard_anchor_current_before": safe.get("execution_guard_anchor_current_before"),
+        "execution_guard_anchor_current_after": safe.get("execution_guard_anchor_current_after"),
+        "execution_guard_margin_c": safe.get("execution_guard_margin_c"),
+        "execution_guard_emergency_margin_c": safe.get("execution_guard_emergency_margin_c"),
+        "execution_guard_reason": safe.get("execution_guard_reason"),
         "adaptive_thermal_enabled": safe.get("adaptive_thermal_enabled"),
         "thermal_gain_mean": safe.get("thermal_gain_mean"),
         "thermal_gain_std": safe.get("thermal_gain_std"),
@@ -1941,6 +1987,20 @@ def _add_projection_diagnostics(row: Dict, aux: Dict, currents_exec: np.ndarray)
     row["projected_current_total"] = _projection_scalar(aux, "projected_current_total", projected_default)
     row["projection_compression_ratio"] = _projection_scalar(aux, "projection_compression_ratio")
     row["qos_recovered_current"] = _projection_scalar(aux, "qos_recovered_current", 0.0)
+    row["execution_guard_enabled"] = bool(aux.get("execution_guard_enabled", False))
+    row["execution_guard_applied"] = bool(aux.get("execution_guard_applied", False))
+    row["execution_guard_downgrade_applied"] = bool(aux.get("execution_guard_downgrade_applied", False))
+    row["execution_guard_anchor_clamp_applied"] = bool(aux.get("execution_guard_anchor_clamp_applied", False))
+    row["execution_guard_requested_boost"] = _projection_scalar(aux, "execution_guard_requested_boost", 0.0)
+    row["execution_guard_final_boost"] = _projection_scalar(aux, "execution_guard_final_boost", 0.0)
+    row["execution_guard_downgrade_ld1"] = _projection_scalar(aux, "execution_guard_downgrade_ld1", 0.0)
+    row["execution_guard_downgrade_ld2"] = _projection_scalar(aux, "execution_guard_downgrade_ld2", 0.0)
+    row["execution_guard_anchor_cap"] = _projection_scalar(aux, "execution_guard_anchor_cap")
+    row["execution_guard_anchor_current_before"] = _projection_scalar(aux, "execution_guard_anchor_current_before")
+    row["execution_guard_anchor_current_after"] = _projection_scalar(aux, "execution_guard_anchor_current_after")
+    row["execution_guard_margin_c"] = _projection_scalar(aux, "execution_guard_margin_c")
+    row["execution_guard_emergency_margin_c"] = _projection_scalar(aux, "execution_guard_emergency_margin_c")
+    row["execution_guard_reason"] = str(aux.get("execution_guard_reason", ""))
     row["thermal_margin_min"] = _projection_scalar(aux, "thermal_margin_min")
     row["thermal_cap_margin_c"] = _projection_scalar(aux, "thermal_cap_margin_c")
     row["adaptive_thermal_enabled"] = bool(aux.get("adaptive_thermal_enabled", row.get("adaptive_thermal_enabled", False)))
@@ -1979,6 +2039,7 @@ def _add_projection_diagnostics(row: Dict, aux: Dict, currents_exec: np.ndarray)
         ("thermal_base", "thermal_base"),
         ("thermal_pred_temp", "thermal_pred_temp"),
         ("thermal_pred_margin", "thermal_pred_margin"),
+        ("predicted_headroom", "predicted_headroom"),
         ("thermal_gain_mean", "thermal_gain_mean"),
         ("thermal_gain_std", "thermal_gain_std"),
         ("thermal_gain_safe_scale", "thermal_gain_safe_scale"),
@@ -4209,6 +4270,7 @@ HARD_TARGETED_VARIANT_ORDER = (
     "hybrid_hard_clip",
     "hybrid_qos_aware_hard_clip",
     "hybrid_qos_recovery_relaxed_shield",
+    "hybrid_qos_recovery_per_source_exec_guard",
     "heuristic_safe",
     "sac_lagrangian",
     "shin2024_adapted_codebook",
@@ -5126,9 +5188,14 @@ def run_one_scenario(
                     "pilot_only": pilot_only,
                     "formal_ranking_exclude": formal_ranking_exclude,
                     "upper_shield_protocol": str(pilot_meta.get("upper_shield_protocol", "")),
+                    "execution_guard_protocol": str(pilot_meta.get("execution_guard_protocol", "")),
                     "shield_disable_c": pilot_meta.get("shield_disable_c"),
                     "shield_reenable_c": pilot_meta.get("shield_reenable_c"),
                     "critical_headroom_c": pilot_meta.get("critical_headroom_c"),
+                    "execution_guard_margin_c": pilot_meta.get("execution_guard_margin_c"),
+                    "execution_guard_extra_margin_c": pilot_meta.get("execution_guard_extra_margin_c"),
+                    "execution_guard_emergency_margin_c": pilot_meta.get("execution_guard_emergency_margin_c"),
+                    "execution_guard_fallback": str(pilot_meta.get("execution_guard_fallback", "")),
                     "projection_objective": str(pilot_meta.get("projection_objective", "")),
                     "smooth_relaxed_margin_c": pilot_meta.get("smooth_relaxed_margin_c"),
                     "thermal_cap_margin_c": pilot_meta.get("thermal_cap_margin_c"),
@@ -5285,6 +5352,11 @@ def run_one_scenario(
     definition_gate_budget_mode = (
         "support_adaptation_only" if fast_mode else str(definition_gate_cfg.get("budget_mode", ""))
     )
+    definition_exec_guard_extra_margin = 0.25
+    definition_exec_guard_margin = (
+        float(base_cfg.get("safety", {}).get("thermal_cap_margin_c", 0.5) or 0.0)
+        + definition_exec_guard_extra_margin
+    )
     variant_definitions = {}
     for spec in exp_specs:
         label = str(spec["label"])
@@ -5426,6 +5498,7 @@ def run_one_scenario(
             is_hard_clip = ablation == "hard_clip"
             is_qos_aware_hard_clip = ablation == "qos_aware_hard_clip"
             is_qos_recovery_relaxed = ablation == "qos_recovery_relaxed_shield"
+            is_qos_recovery_exec_guard = ablation == "qos_recovery_per_source_exec_guard"
             hybrid_meta_enabled = ablation != "wo_meta"
             hybrid_gate_enabled = bool(hybrid_meta_enabled and not is_meta_ungated)
             projection_variant = (
@@ -5439,6 +5512,8 @@ def run_one_scenario(
                 if is_qos_aware_hard_clip
                 else "qos_aware_hard_clip_with_relaxed_upper_shield"
                 if is_qos_recovery_relaxed
+                else "qos_aware_hard_clip_with_per_source_execution_guard"
+                if is_qos_recovery_exec_guard
                 else ""
             )
             comparison_role = (
@@ -5449,7 +5524,7 @@ def run_one_scenario(
                 else "fair_hard_projection_baseline"
                 if is_qos_aware_hard_clip
                 else "hard_stress_mechanism_probe"
-                if is_qos_recovery_relaxed
+                if (is_qos_recovery_relaxed or is_qos_recovery_exec_guard)
                 else "ungated_meta_ablation"
                 if is_meta_ungated
                 else "full_method"
@@ -5463,8 +5538,8 @@ def run_one_scenario(
                 "tx_device": ["LED", "LD", "LD"],
                 "tx_enabled": [1.0, 1.0, 1.0],
                 "projection_variant": projection_variant,
-                "pilot_only": True if (is_smooth_relaxed or is_thermal_cap or is_qos_recovery_relaxed) else None,
-                "formal_ranking_exclude": True if (is_smooth_relaxed or is_thermal_cap or is_qos_recovery_relaxed) else None,
+                "pilot_only": True if (is_smooth_relaxed or is_thermal_cap or is_qos_recovery_relaxed or is_qos_recovery_exec_guard) else None,
+                "formal_ranking_exclude": True if (is_smooth_relaxed or is_thermal_cap or is_qos_recovery_relaxed or is_qos_recovery_exec_guard) else None,
                 "comparison_role": comparison_role,
                 "baseline_family": "hybrid_full" if ablation == "full" else label,
                 "meta_learning": bool(hybrid_meta_enabled),
@@ -5476,10 +5551,10 @@ def run_one_scenario(
                 "support_gate_extra_rollouts": definition_gate_extra_rollouts if hybrid_gate_enabled else 0,
                 "support_gate_extra_gradient_updates": 0,
                 "support_gate_extra_query_evaluations": 0,
-                "strong_safety_baseline": True if is_qos_aware_hard_clip else False if (is_hard_clip or is_qos_recovery_relaxed) else None,
+                "strong_safety_baseline": True if is_qos_aware_hard_clip else False if (is_hard_clip or is_qos_recovery_relaxed or is_qos_recovery_exec_guard) else None,
                 "qos_recovery_rule": (
                     "non_oracle_current_recovery_to_active_sources_with_thermal_and_bus_headroom"
-                    if (is_qos_aware_hard_clip or is_qos_recovery_relaxed)
+                    if (is_qos_aware_hard_clip or is_qos_recovery_relaxed or is_qos_recovery_exec_guard)
                     else "none_componentwise_zero_if_thermal_infeasible"
                     if is_hard_clip
                     else ""
@@ -5487,11 +5562,22 @@ def run_one_scenario(
                 "upper_shield_protocol": (
                     "relaxed_per_source_headroom_hysteresis"
                     if is_qos_recovery_relaxed
+                    else "disabled_selection_time_mask"
+                    if is_qos_recovery_exec_guard
+                    else ""
+                ),
+                "execution_guard_protocol": (
+                    "per_source_predictive_largest_safe_subset_anchor_clamp"
+                    if is_qos_recovery_exec_guard
                     else ""
                 ),
                 "shield_disable_c": 0.5 if is_qos_recovery_relaxed else None,
                 "shield_reenable_c": 1.0 if is_qos_recovery_relaxed else None,
                 "critical_headroom_c": 0.10 if is_qos_recovery_relaxed else None,
+                "execution_guard_margin_c": definition_exec_guard_margin if is_qos_recovery_exec_guard else None,
+                "execution_guard_extra_margin_c": definition_exec_guard_extra_margin if is_qos_recovery_exec_guard else None,
+                "execution_guard_emergency_margin_c": 0.0 if is_qos_recovery_exec_guard else None,
+                "execution_guard_fallback": "largest_safe_subset" if is_qos_recovery_exec_guard else "",
                 "description": (
                     "Pilot-only projection sensitivity: full Hybrid with thermal-cap current projection."
                     if is_thermal_cap
@@ -5503,6 +5589,8 @@ def run_one_scenario(
                     if is_qos_aware_hard_clip
                     else "Pilot hard-stress mechanism probe: relaxed upper shield plus QoS-aware hard clipping to test recovery inside the safe feasible set."
                     if is_qos_recovery_relaxed
+                    else "Pilot hard-stress mechanism probe: execution-only per-source thermal guard with QoS-aware hard clipping."
+                    if is_qos_recovery_exec_guard
                     else "Ungated meta ablation: support update is always accepted without rollback."
                     if is_meta_ungated
                     else "Full hierarchical method on the fixed heterogeneous hybrid structure"
@@ -6004,6 +6092,7 @@ def parse_args() -> argparse.Namespace:
             "hard_clip",
             "qos_aware_hard_clip",
             "qos_recovery_relaxed_shield",
+            "qos_recovery_per_source_exec_guard",
             "smooth_relaxed",
             "thermal_cap",
         ],

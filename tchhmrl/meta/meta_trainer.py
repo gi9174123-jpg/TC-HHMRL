@@ -112,6 +112,11 @@ class EpisodeStats:
     compression_ratio1_mean: float = 0.0
     compression_ratio2_mean: float = 0.0
     qos_recovered_current_mean: float = 0.0
+    execution_guard_applied_rate: float = 0.0
+    execution_guard_downgrade_rate: float = 0.0
+    execution_guard_anchor_clamp_rate: float = 0.0
+    execution_guard_downgrade_ld1_rate: float = 0.0
+    execution_guard_downgrade_ld2_rate: float = 0.0
 
 
 class MetaTrainer:
@@ -620,6 +625,11 @@ class MetaTrainer:
         ep_predicted_headroom = np.zeros(3, dtype=np.float32)
         ep_compression_ratio = np.zeros(3, dtype=np.float32)
         ep_qos_recovered_current = 0.0
+        ep_execution_guard_applied = 0.0
+        ep_execution_guard_downgrade = 0.0
+        ep_execution_guard_anchor_clamp = 0.0
+        ep_execution_guard_downgrade_ld1 = 0.0
+        ep_execution_guard_downgrade_ld2 = 0.0
 
         macro_start_obs = None
         macro_start_z = None
@@ -942,6 +952,11 @@ class MetaTrainer:
             if compression_ratio.size == 3:
                 ep_compression_ratio += compression_ratio
             ep_qos_recovered_current += float(aux.get("qos_recovered_current", 0.0))
+            ep_execution_guard_applied += float(bool(aux.get("execution_guard_applied", False)))
+            ep_execution_guard_downgrade += float(bool(aux.get("execution_guard_downgrade_applied", False)))
+            ep_execution_guard_anchor_clamp += float(bool(aux.get("execution_guard_anchor_clamp_applied", False)))
+            ep_execution_guard_downgrade_ld1 += float(float(aux.get("execution_guard_downgrade_ld1", 0.0)) > 0.5)
+            ep_execution_guard_downgrade_ld2 += float(float(aux.get("execution_guard_downgrade_ld2", 0.0)) > 0.5)
 
             obs = next_obs
 
@@ -1038,6 +1053,11 @@ class MetaTrainer:
             compression_ratio1_mean=float(ep_compression_ratio[1]) / ep_len_safe,
             compression_ratio2_mean=float(ep_compression_ratio[2]) / ep_len_safe,
             qos_recovered_current_mean=ep_qos_recovered_current / ep_len_safe,
+            execution_guard_applied_rate=ep_execution_guard_applied / ep_len_safe,
+            execution_guard_downgrade_rate=ep_execution_guard_downgrade / ep_len_safe,
+            execution_guard_anchor_clamp_rate=ep_execution_guard_anchor_clamp / ep_len_safe,
+            execution_guard_downgrade_ld1_rate=ep_execution_guard_downgrade_ld1 / ep_len_safe,
+            execution_guard_downgrade_ld2_rate=ep_execution_guard_downgrade_ld2 / ep_len_safe,
         )
 
     def train(self, meta_iters: int | None = None) -> Path:
@@ -1677,6 +1697,11 @@ class MetaTrainer:
                 "compression_ratio1_mean",
                 "compression_ratio2_mean",
                 "qos_recovered_current_mean",
+                "execution_guard_applied_rate",
+                "execution_guard_downgrade_rate",
+                "execution_guard_anchor_clamp_rate",
+                "execution_guard_downgrade_ld1_rate",
+                "execution_guard_downgrade_ld2_rate",
             ]
             for prefix, stats_group in (("support", support_stats), ("query", query_stats)):
                 for name in diagnostic_names:

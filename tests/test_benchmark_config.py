@@ -448,6 +448,27 @@ def test_ablation_qos_recovery_relaxed_shield_sets_pilot_metadata():
     assert "non_oracle_current_recovery" in cfg["pilot_metadata"]["qos_recovery_rule"]
 
 
+def test_ablation_qos_recovery_per_source_exec_guard_sets_pilot_metadata():
+    cfg = load_cfg("configs/default.yaml")
+    cfg = copy.deepcopy(cfg)
+    base_margin = float(cfg["safety"]["thermal_cap_margin_c"])
+    apply_ablation(cfg, "qos_recovery_per_source_exec_guard")
+
+    guard = cfg["execution_thermal_guard"]
+    assert cfg["safety"]["projection_mode"] == "qos_aware_hard_clip"
+    assert cfg["upper_safety_shield"]["enabled"] is False
+    assert guard["enabled"] is True
+    assert guard["mode"] == "per_source_predictive"
+    assert float(guard["guard_margin_c"]) == base_margin + 0.25
+    assert guard["fallback"] == "largest_safe_subset"
+    assert guard["clamp_anchor_current"] is True
+    assert guard["reproject_after_guard"] is True
+    assert cfg["pilot_metadata"]["comparison_role"] == "hard_stress_mechanism_probe"
+    assert cfg["pilot_metadata"]["pilot_only"] is True
+    assert cfg["pilot_metadata"]["upper_shield_protocol"] == "disabled_selection_time_mask"
+    assert cfg["pilot_metadata"]["execution_guard_protocol"] == "per_source_predictive_largest_safe_subset_anchor_clamp"
+
+
 def test_ablation_smooth_relaxed_sets_pilot_metadata():
     cfg = load_cfg("configs/default.yaml")
     cfg = copy.deepcopy(cfg)

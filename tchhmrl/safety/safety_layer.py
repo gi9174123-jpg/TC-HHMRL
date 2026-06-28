@@ -133,6 +133,14 @@ class SafetyLayer:
         )
         self.upper_shield_emergency_bypass_dwell = bool(shield_cfg.get("emergency_bypass_dwell", True))
         self.upper_shield_hot_locked = np.zeros(3, dtype=bool)
+        exec_guard_cfg = cfg.get("execution_thermal_guard", {}) or {}
+        self.execution_guard_enabled = bool(exec_guard_cfg.get("enabled", False))
+        self.execution_guard_mode = str(exec_guard_cfg.get("mode", "per_source_predictive")).lower()
+        self.execution_guard_margin_c = float(exec_guard_cfg.get("guard_margin_c", 0.25))
+        self.execution_guard_emergency_margin_c = float(exec_guard_cfg.get("emergency_margin_c", 0.0))
+        self.execution_guard_fallback = str(exec_guard_cfg.get("fallback", "largest_safe_subset")).lower()
+        self.execution_guard_clamp_anchor_current = bool(exec_guard_cfg.get("clamp_anchor_current", True))
+        self.execution_guard_reproject_after_guard = bool(exec_guard_cfg.get("reproject_after_guard", True))
 
     def state_dict(self) -> Dict:
         return {
@@ -866,102 +874,250 @@ class SafetyLayer:
         exec_boost, mem = self._apply_dwell(shielded_boost, mem, temps=temps, headroom=None)
 
         lower_raw = np.asarray(lower_raw, dtype=np.float32)
-        currents, current_frac, decoded, current_aux = self._decode_current_request_np(lower_raw, exec_boost=exec_boost)
-        current_requested = np.asarray(current_aux["current_requested"], dtype=np.float32)
-        raw_current_total = float(np.sum(currents))
+        temps = np.asarray(temps, dtype=np.float32)
+        thermal_coeff_safe_np = self._safe_thermal_coeff_np()
 
-        mask = self._boost_mask(exec_boost)
-        if (
-            self.inactive_source_mask_mode == "soft_floor"
-            and self.projection_mode in {"smooth", "smooth_relaxed", "thermal_cap", "dalal_safe"}
-        ):
-            mask = self.mask_floor + (1.0 - self.mask_floor) * mask
-        mask = self.tx_enabled * mask
-        currents *= mask.astype(np.float32)
-        masked_current_total = float(np.sum(currents))
-        active_mask = mask.astype(np.float32)
-
-        total = float(np.sum(currents))
-        if self.projection_mode in {"smooth", "smooth_relaxed", "thermal_cap"}:
-            currents *= self._smooth_bus_scale_np(total)
-        elif self.projection_mode == "dalal_safe":
-            currents = self._dalal_correct_currents_np(
-                currents=currents,
-                temps=np.asarray(temps, dtype=np.float32),
-                amb_temp=float(amb_temp),
+        def _project_for_boost(boost_combo: int) -> Dict[str, object]:
+            boost_combo = int(np.clip(boost_combo, 0, 3))
+            currents_p, current_frac_p, decoded_p, current_aux_p = self._decode_current_request_np(
+                lower_raw,
+                exec_boost=boost_combo,
             )
-        else:
-            currents *= self._hard_bus_scale_np(total)
-        bus_projected_current_total = float(np.sum(currents))
+            current_requested_p = np.asarray(current_aux_p["current_requested"], dtype=np.float32)
+            raw_current_total_p = float(np.sum(currents_p))
+            mask_p = self._boost_mask(boost_combo)
+            if (
+                self.inactive_source_mask_mode == "soft_floor"
+                and self.projection_mode in {"smooth", "smooth_relaxed", "thermal_cap", "dalal_safe"}
+            ):
+                mask_p = self.mask_floor + (1.0 - self.mask_floor) * mask_p
+            mask_p = self.tx_enabled * mask_p
+            currents_p = (currents_p * mask_p.astype(np.float32)).astype(np.float32)
+            active_mask_p = mask_p.astype(np.float32)
+            masked_current_total_p = float(np.sum(currents_p))
+
+            total_p = float(np.sum(currents_p))
+            if self.projection_mode in {"smooth", "smooth_relaxed", "thermal_cap"}:
+                currents_p *= self._smooth_bus_scale_np(total_p)
+            elif self.projection_mode == "dalal_safe":
+                currents_p = self._dalal_correct_currents_np(
+                    currents=currents_p,
+                    temps=temps,
+                    amb_temp=float(amb_temp),
+                )
+            else:
+                currents_p *= self._hard_bus_scale_np(total_p)
+            bus_projected_current_total_p = float(np.sum(currents_p))
+
+            thermal_base_p, thermal_source_term_p = self._thermal_base_np(temps, float(amb_temp))
+            t_pred_p = thermal_base_p + thermal_coeff_safe_np * (currents_p**2)
+            thermal_cap_current_p = self.current_max.astype(np.float32)
+            thermal_cap_scale_p = np.ones_like(currents_p, dtype=np.float32)
+            qos_recovered_current_p = 0.0
+
+            if self.projection_mode in {"smooth", "smooth_relaxed"}:
+                gap_p = self.thermal_safe - t_pred_p
+                soft_scale_p = _sigmoid_np(self.soft_alpha * gap_p)
+                if self.projection_mode == "smooth_relaxed":
+                    soft_scale_p = self._relaxed_soft_scale_np(gap_p, soft_scale_p)
+                cutoff_scale_p = _sigmoid_np(self.cutoff_alpha * (self.thermal_cutoff - t_pred_p))
+                thermal_scale_p = (soft_scale_p * cutoff_scale_p).astype(np.float32)
+            elif self.projection_mode == "thermal_cap":
+                (
+                    currents_p,
+                    thermal_cap_current_p,
+                    thermal_scale_p,
+                    thermal_base_p,
+                    thermal_source_term_p,
+                ) = self._thermal_cap_np(
+                    currents=currents_p,
+                    temps=temps,
+                    amb_temp=float(amb_temp),
+                )
+                t_pred_p = thermal_base_p + thermal_coeff_safe_np * (currents_p**2)
+                thermal_cap_scale_p = thermal_scale_p.astype(np.float32)
+                soft_scale_p = thermal_scale_p.astype(np.float32)
+                cutoff_scale_p = np.ones_like(currents_p, dtype=np.float32)
+            elif self.projection_mode == "qos_aware_hard_clip":
+                (
+                    currents_p,
+                    thermal_cap_current_p,
+                    thermal_scale_p,
+                    thermal_base_p,
+                    thermal_source_term_p,
+                    qos_recovered_current_p,
+                ) = self._qos_aware_hard_clip_np(
+                    currents=currents_p,
+                    target_total=bus_projected_current_total_p,
+                    active_mask=active_mask_p,
+                    temps=temps,
+                    amb_temp=float(amb_temp),
+                )
+                t_pred_p = thermal_base_p + thermal_coeff_safe_np * (currents_p**2)
+                thermal_cap_scale_p = thermal_scale_p.astype(np.float32)
+                soft_scale_p = thermal_scale_p.astype(np.float32)
+                cutoff_scale_p = np.ones_like(currents_p, dtype=np.float32)
+            elif self.projection_mode == "dalal_safe":
+                soft_scale_p = np.ones_like(currents_p, dtype=np.float32)
+                cutoff_scale_p = np.ones_like(currents_p, dtype=np.float32)
+                thermal_scale_p = np.clip(currents_p / np.maximum(self.current_max, 1.0e-6), 0.0, 1.0).astype(np.float32)
+            else:
+                soft_scale_p = (t_pred_p <= self.thermal_safe).astype(np.float32)
+                cutoff_scale_p = np.ones_like(currents_p, dtype=np.float32)
+                thermal_scale_p = (t_pred_p <= self.thermal_safe).astype(np.float32)
+            if self.projection_mode not in {"dalal_safe", "thermal_cap", "qos_aware_hard_clip"}:
+                currents_p = (currents_p * thermal_scale_p).astype(np.float32)
+                t_pred_p = thermal_base_p + thermal_coeff_safe_np * (currents_p**2)
+            projected_current_total_p = float(np.sum(currents_p))
+            compression_total_p = float(projected_current_total_p / max(raw_current_total_p, 1.0e-6))
+            compression_per_source_p = np.where(
+                current_requested_p > 1.0e-6,
+                currents_p / np.maximum(current_requested_p, 1.0e-6),
+                np.where(currents_p > 1.0e-6, 1.0, 0.0),
+            ).astype(np.float32)
+            thermal_margin_p = (self.thermal_safe - t_pred_p).astype(np.float32)
+            return {
+                "currents": currents_p.astype(np.float32),
+                "current_frac": current_frac_p.astype(np.float32),
+                "decoded": decoded_p.astype(np.float32),
+                "current_aux": current_aux_p,
+                "current_requested": current_requested_p.astype(np.float32),
+                "raw_current_total": raw_current_total_p,
+                "masked_current_total": masked_current_total_p,
+                "active_mask": active_mask_p,
+                "bus_projected_current_total": bus_projected_current_total_p,
+                "thermal_base": thermal_base_p.astype(np.float32),
+                "thermal_source_term": thermal_source_term_p.astype(np.float32),
+                "T_pred": t_pred_p.astype(np.float32),
+                "thermal_cap_current": thermal_cap_current_p.astype(np.float32),
+                "thermal_cap_scale": thermal_cap_scale_p.astype(np.float32),
+                "qos_recovered_current": float(qos_recovered_current_p),
+                "soft_scale": soft_scale_p.astype(np.float32),
+                "cutoff_scale": cutoff_scale_p.astype(np.float32),
+                "thermal_scale": thermal_scale_p.astype(np.float32),
+                "projected_current_total": projected_current_total_p,
+                "projection_compression_ratio": compression_total_p,
+                "projection_compression_ratio_per_source": compression_per_source_p,
+                "thermal_margin": thermal_margin_p,
+            }
+
+        proj = _project_for_boost(exec_boost)
+        guard_requested_boost = int(exec_boost)
+        guard_final_boost = int(exec_boost)
+        guard_applied = False
+        guard_downgrade_applied = False
+        guard_anchor_clamp_applied = False
+        guard_downgrade_ld1 = False
+        guard_downgrade_ld2 = False
+        guard_anchor_cap = float("nan")
+        guard_anchor_current_before = float("nan")
+        guard_anchor_current_after = float("nan")
+        guard_reason = "disabled"
+
+        if bool(self.execution_guard_enabled and self.execution_guard_mode == "per_source_predictive"):
+            guard_reason = "no_guard_needed"
+            margin = np.asarray(proj["thermal_margin"], dtype=np.float32).reshape(-1)[:3]
+            unsafe = margin < float(self.execution_guard_margin_c)
+            requested_mask = self._boost_mask(exec_boost) > 0.0
+            guarded_mask = requested_mask.copy()
+            if bool(unsafe[1] and requested_mask[1]):
+                guarded_mask[1] = False
+                guard_downgrade_ld1 = True
+            if bool(unsafe[2] and requested_mask[2]):
+                guarded_mask[2] = False
+                guard_downgrade_ld2 = True
+            if bool(guard_downgrade_ld1 or guard_downgrade_ld2):
+                # All valid subsets keep the anchor. This implements the
+                # largest safe subset for removable LD boost sources only.
+                if bool(guarded_mask[1] and guarded_mask[2]):
+                    guard_final_boost = 3
+                elif bool(guarded_mask[1]):
+                    guard_final_boost = 1
+                elif bool(guarded_mask[2]):
+                    guard_final_boost = 2
+                else:
+                    guard_final_boost = 0
+                guard_downgrade_applied = int(guard_final_boost) != int(exec_boost)
+                if guard_downgrade_applied and bool(self.execution_guard_reproject_after_guard):
+                    proj = _project_for_boost(guard_final_boost)
+                    exec_boost = int(guard_final_boost)
+                    mem["current_boost"] = int(exec_boost)
+                    mem["dwell_count"] = 1
+                    guard_reason = "largest_safe_subset"
+
+            if bool(self.execution_guard_clamp_anchor_current):
+                margin = np.asarray(proj["thermal_margin"], dtype=np.float32).reshape(-1)[:3]
+                actual_anchor_headroom = float(self.thermal_safe - float(temps[0]))
+                if bool(margin[0] < float(self.execution_guard_margin_c)):
+                    currents_tmp = np.asarray(proj["currents"], dtype=np.float32).copy()
+                    base_tmp = np.asarray(proj["thermal_base"], dtype=np.float32).reshape(-1)[:3]
+                    cap_tmp = np.asarray(proj["thermal_cap_current"], dtype=np.float32).copy()
+                    cap_margin = float(self.execution_guard_margin_c)
+                    if actual_anchor_headroom < float(self.execution_guard_emergency_margin_c):
+                        anchor_cap = 0.0
+                        guard_reason = "anchor_emergency_clamp"
+                    else:
+                        allowed_rise = float(self.thermal_safe - cap_margin - base_tmp[0])
+                        denom = float(max(thermal_coeff_safe_np[0], 1.0e-6))
+                        anchor_cap = float(np.sqrt(max(allowed_rise / denom, 0.0)))
+                        anchor_cap = float(min(anchor_cap, float(self.current_max[0])))
+                        guard_reason = "anchor_predictive_clamp" if guard_reason == "no_guard_needed" else f"{guard_reason}+anchor_clamp"
+                    guard_anchor_cap = anchor_cap
+                    guard_anchor_current_before = float(currents_tmp[0])
+                    if currents_tmp[0] > anchor_cap + 1.0e-8:
+                        currents_tmp[0] = anchor_cap
+                        cap_tmp[0] = min(float(cap_tmp[0]), anchor_cap)
+                        guard_anchor_clamp_applied = True
+                        proj["currents"] = currents_tmp.astype(np.float32)
+                        proj["thermal_cap_current"] = cap_tmp.astype(np.float32)
+                        proj["thermal_cap_scale"] = np.where(
+                            np.asarray(proj["current_requested"], dtype=np.float32) > 1.0e-6,
+                            cap_tmp / np.maximum(np.asarray(proj["current_requested"], dtype=np.float32), 1.0e-6),
+                            np.ones_like(cap_tmp, dtype=np.float32),
+                        ).astype(np.float32)
+                        t_pred_tmp = np.asarray(proj["thermal_base"], dtype=np.float32) + thermal_coeff_safe_np * (currents_tmp**2)
+                        proj["T_pred"] = t_pred_tmp.astype(np.float32)
+                        proj["thermal_margin"] = (self.thermal_safe - t_pred_tmp).astype(np.float32)
+                        proj["projected_current_total"] = float(np.sum(currents_tmp))
+                        proj["projection_compression_ratio"] = float(
+                            proj["projected_current_total"] / max(float(proj["raw_current_total"]), 1.0e-6)
+                        )
+                        proj["projection_compression_ratio_per_source"] = np.where(
+                            np.asarray(proj["current_requested"], dtype=np.float32) > 1.0e-6,
+                            currents_tmp / np.maximum(np.asarray(proj["current_requested"], dtype=np.float32), 1.0e-6),
+                            np.where(currents_tmp > 1.0e-6, 1.0, 0.0),
+                        ).astype(np.float32)
+                    guard_anchor_current_after = float(np.asarray(proj["currents"], dtype=np.float32)[0])
+            guard_applied = bool(guard_downgrade_applied or guard_anchor_clamp_applied)
+
+        currents = np.asarray(proj["currents"], dtype=np.float32)
+        current_frac = np.asarray(proj["current_frac"], dtype=np.float32)
+        decoded = np.asarray(proj["decoded"], dtype=np.float32)
+        current_aux = dict(proj["current_aux"])
+        current_requested = np.asarray(proj["current_requested"], dtype=np.float32)
+        raw_current_total = float(proj["raw_current_total"])
+        masked_current_total = float(proj["masked_current_total"])
+        bus_projected_current_total = float(proj["bus_projected_current_total"])
+        thermal_base = np.asarray(proj["thermal_base"], dtype=np.float32)
+        thermal_source_term = np.asarray(proj["thermal_source_term"], dtype=np.float32)
+        T_pred = np.asarray(proj["T_pred"], dtype=np.float32)
+        thermal_cap_current = np.asarray(proj["thermal_cap_current"], dtype=np.float32)
+        thermal_cap_scale = np.asarray(proj["thermal_cap_scale"], dtype=np.float32)
+        qos_recovered_current = float(proj["qos_recovered_current"])
+        soft_scale = np.asarray(proj["soft_scale"], dtype=np.float32)
+        cutoff_scale = np.asarray(proj["cutoff_scale"], dtype=np.float32)
+        thermal_scale = np.asarray(proj["thermal_scale"], dtype=np.float32)
+        projected_current_total = float(proj["projected_current_total"])
+        projection_compression_ratio = float(proj["projection_compression_ratio"])
+        projection_compression_ratio_per_source = np.asarray(
+            proj["projection_compression_ratio_per_source"],
+            dtype=np.float32,
+        )
+        thermal_margin = np.asarray(proj["thermal_margin"], dtype=np.float32)
 
         rho_raw = float(decoded[3])
         tau_raw = float(decoded[4])
         rho, tau = self._project_mode_params_np(mode, rho_raw, tau_raw)
-
-        temps = np.asarray(temps, dtype=np.float32)
-        thermal_base, thermal_source_term = self._thermal_base_np(temps, float(amb_temp))
-        thermal_coeff_safe_np = self._safe_thermal_coeff_np()
-        T_pred = thermal_base + thermal_coeff_safe_np * (currents**2)
-        thermal_cap_current = self.current_max.astype(np.float32)
-        thermal_cap_scale = np.ones_like(currents, dtype=np.float32)
-        qos_recovered_current = 0.0
-
-        if self.projection_mode in {"smooth", "smooth_relaxed"}:
-            gap = self.thermal_safe - T_pred
-            soft_scale = _sigmoid_np(self.soft_alpha * gap)
-            if self.projection_mode == "smooth_relaxed":
-                soft_scale = self._relaxed_soft_scale_np(gap, soft_scale)
-            cutoff_scale = _sigmoid_np(self.cutoff_alpha * (self.thermal_cutoff - T_pred))
-            thermal_scale = (soft_scale * cutoff_scale).astype(np.float32)
-        elif self.projection_mode == "thermal_cap":
-            currents, thermal_cap_current, thermal_scale, thermal_base, thermal_source_term = self._thermal_cap_np(
-                currents=currents,
-                temps=temps,
-                amb_temp=float(amb_temp),
-            )
-            thermal_coeff_safe_np = self._safe_thermal_coeff_np()
-            T_pred = thermal_base + thermal_coeff_safe_np * (currents**2)
-            thermal_cap_scale = thermal_scale.astype(np.float32)
-            soft_scale = thermal_scale.astype(np.float32)
-            cutoff_scale = np.ones_like(currents, dtype=np.float32)
-        elif self.projection_mode == "qos_aware_hard_clip":
-            (
-                currents,
-                thermal_cap_current,
-                thermal_scale,
-                thermal_base,
-                thermal_source_term,
-                qos_recovered_current,
-            ) = self._qos_aware_hard_clip_np(
-                currents=currents,
-                target_total=bus_projected_current_total,
-                active_mask=active_mask,
-                temps=temps,
-                amb_temp=float(amb_temp),
-            )
-            thermal_coeff_safe_np = self._safe_thermal_coeff_np()
-            T_pred = thermal_base + thermal_coeff_safe_np * (currents**2)
-            thermal_cap_scale = thermal_scale.astype(np.float32)
-            soft_scale = thermal_scale.astype(np.float32)
-            cutoff_scale = np.ones_like(currents, dtype=np.float32)
-        elif self.projection_mode == "dalal_safe":
-            soft_scale = np.ones_like(currents, dtype=np.float32)
-            cutoff_scale = np.ones_like(currents, dtype=np.float32)
-            thermal_scale = np.clip(currents / np.maximum(self.current_max, 1.0e-6), 0.0, 1.0).astype(np.float32)
-        else:
-            soft_scale = (T_pred <= self.thermal_safe).astype(np.float32)
-            cutoff_scale = np.ones_like(currents, dtype=np.float32)
-            thermal_scale = (T_pred <= self.thermal_safe).astype(np.float32)
-        if self.projection_mode not in {"dalal_safe", "thermal_cap", "qos_aware_hard_clip"}:
-            currents *= thermal_scale
-        projected_current_total = float(np.sum(currents))
-        projection_compression_ratio = float(projected_current_total / max(raw_current_total, 1.0e-6))
-        projection_compression_ratio_per_source = np.where(
-            current_requested > 1.0e-6,
-            currents / np.maximum(current_requested, 1.0e-6),
-            np.where(currents > 1.0e-6, 1.0, 0.0),
-        ).astype(np.float32)
-        thermal_margin = (self.thermal_safe - T_pred).astype(np.float32)
 
         out = {
             "boost_combo_exec": int(exec_boost),
@@ -992,6 +1148,7 @@ class SafetyLayer:
             "thermal_base": thermal_base.astype(np.float32),
             "thermal_pred_temp": T_pred.astype(np.float32),
             "thermal_pred_margin": thermal_margin.astype(np.float32),
+            "predicted_headroom": thermal_margin.astype(np.float32),
             "thermal_model": self.thermal_model,
             "thermal_parameter_source": self.thermal_parameter_source,
             "gamma_nominal": float(self.gamma_nominal),
@@ -1012,6 +1169,20 @@ class SafetyLayer:
             "projection_compression_ratio": projection_compression_ratio,
             "projection_compression_ratio_per_source": projection_compression_ratio_per_source,
             "qos_recovered_current": float(qos_recovered_current),
+            "execution_guard_enabled": bool(self.execution_guard_enabled),
+            "execution_guard_applied": bool(guard_applied),
+            "execution_guard_downgrade_applied": bool(guard_downgrade_applied),
+            "execution_guard_anchor_clamp_applied": bool(guard_anchor_clamp_applied),
+            "execution_guard_requested_boost": int(guard_requested_boost),
+            "execution_guard_final_boost": int(exec_boost),
+            "execution_guard_downgrade_ld1": float(bool(guard_downgrade_ld1)),
+            "execution_guard_downgrade_ld2": float(bool(guard_downgrade_ld2)),
+            "execution_guard_anchor_cap": float(guard_anchor_cap),
+            "execution_guard_anchor_current_before": float(guard_anchor_current_before),
+            "execution_guard_anchor_current_after": float(guard_anchor_current_after),
+            "execution_guard_margin_c": float(self.execution_guard_margin_c),
+            "execution_guard_emergency_margin_c": float(self.execution_guard_emergency_margin_c),
+            "execution_guard_reason": str(guard_reason),
             "current_requested": current_requested.astype(np.float32),
             "current_requested_pre_static_cap": np.asarray(
                 current_aux.get("current_requested_pre_static_cap", current_requested),
@@ -1194,6 +1365,7 @@ class SafetyLayer:
             "thermal_base": thermal_base,
             "thermal_pred_temp": T_pred,
             "thermal_pred_margin": thermal_margin,
+            "predicted_headroom": thermal_margin,
             "thermal_model": self.thermal_model,
             "thermal_parameter_source": self.thermal_parameter_source,
             "gamma_nominal": torch.full((lower_raw.shape[0],), float(self.gamma_nominal), dtype=lower_raw.dtype, device=device),
