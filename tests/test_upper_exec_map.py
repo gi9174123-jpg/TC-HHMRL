@@ -31,6 +31,22 @@ def test_upper_dqn_select_action_uses_exec_map():
     assert picked == 0
 
 
+def test_upper_dqn_random_selection_respects_action_mask():
+    cfg = load_cfg("configs/default.yaml")
+    upper = UpperDQN(cfg, torch.device("cpu"))
+    upper.epsilon_start = 1.0
+    upper.epsilon_final = 1.0
+
+    obs = np.zeros(cfg["agent"]["obs_dim"], dtype=np.float32)
+    z = np.zeros(cfg["agent"]["z_dim"], dtype=np.float32)
+    action_mask = np.zeros(12, dtype=bool)
+    action_mask[[0, 1, 2]] = True
+
+    for _ in range(20):
+        picked = upper.select_action(obs, z, t=0, eval_mode=False, action_mask=action_mask)
+        assert picked in {0, 1, 2}
+
+
 def test_upper_dqn_uses_dueling_double_dqn_and_updates_with_exec_map():
     cfg = load_cfg("configs/default.yaml")
     cfg["agent"]["hidden_dim"] = 64

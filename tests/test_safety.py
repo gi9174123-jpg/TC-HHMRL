@@ -33,6 +33,22 @@ def test_safety_projection_bounds():
     assert 0.0 <= out["tau_exec"] <= 1.0
 
 
+def test_upper_safety_shield_masks_only_thermally_unsafe_boosts():
+    cfg = load_cfg("configs/default.yaml")
+    safety = SafetyLayer(cfg)
+
+    # LD1 is close to the thermal boundary, while source 0 and LD2 remain cool.
+    temps = np.array([30.0, float(safety.thermal_safe) - 0.5, 30.0], dtype=np.float32)
+    boost_mask = safety.upper_boost_allowed_mask(temps=temps)
+    raw_mask = safety.upper_raw_allowed_mask(temps=temps)
+
+    assert np.array_equal(boost_mask, np.array([True, False, True, False]))
+    assert np.all(raw_mask[0:3])
+    assert not np.any(raw_mask[3:6])
+    assert np.all(raw_mask[6:9])
+    assert not np.any(raw_mask[9:12])
+
+
 def test_action_decode_tanh_affine_maps_tanh_outputs_to_fractions():
     cfg = copy.deepcopy(load_cfg("configs/default.yaml"))
     cfg["safety"]["action_decode_mode"] = "tanh_affine"

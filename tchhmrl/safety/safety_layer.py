@@ -122,6 +122,16 @@ class SafetyLayer:
         )
         self._dalal_eps = 1.0e-6
         self._dalal_iters = 4
+        shield_cfg = cfg.get("upper_safety_shield", {}) or {}
+        self.upper_shield_enabled = bool(shield_cfg.get("enabled", False))
+        self.upper_shield_ld_headroom_disable_c = float(shield_cfg.get("ld_headroom_disable_c", 1.0))
+        self.upper_shield_ld_headroom_reenable_c = float(shield_cfg.get("ld_headroom_reenable_c", 2.0))
+        self.upper_shield_led_headroom_disable_c = float(shield_cfg.get("led_headroom_disable_c", 0.5))
+        self.upper_shield_critical_headroom_c = float(shield_cfg.get("critical_headroom_c", 0.25))
+        self.upper_shield_always_allow_minimal_combo = bool(
+            shield_cfg.get("always_allow_minimal_combo", shield_cfg.get("always_allow_anchor_only", True))
+        )
+        self.upper_shield_emergency_bypass_dwell = bool(shield_cfg.get("emergency_bypass_dwell", True))
 
     def state_dict(self) -> Dict:
         return {"thermal_estimator": self.thermal_estimator.state_dict()}
@@ -190,7 +200,130 @@ class SafetyLayer:
         combo = int(np.clip(combo, 0, len(table) - 1))
         return table[combo]
 
-    def _apply_dwell(self, desired_boost: int, mem: Dict[str, int]) -> Tuple[int, Dict[str, int]]:
+    def _upper_headroom(self, temps: Optional[np.ndarray] = None, headroom: Optional[np.ndarray] = None) -> np.ndarray | None:
+        if headroom is not None:
+            arr = np.asarray(headroom, dtype=np.float32).reshape(-1)
+        elif temps is not None:
+            arr = (float(self.thermal_safe) - np.asarray(temps, dtype=np.float32)).reshape(-1)
+        else:
+            return None
+        if arr.size < 3:
+            out = np.full(3, np.inf, dtype=np.float32)
+            out[: arr.size] = arr
+            return out
+        return arr[:3].astype(np.float32)
+
+    def upper_boost_allowed_mask(
+        self,
+        *,
+        temps: Optional[np.ndarray] = None,
+        headroom: Optional[np.ndarray] = None,
+    ) -> np.ndarray:
+        """Return a boost-combo mask from current thermal headroom.
+
+        The shield is conservative and only removes LD-containing upper
+        actions when the corresponding source is near the thermal boundary.
+        The minimal active-source combo remains available as the emergency
+        fallback because all valid upper combos contain source 0 by contract.
+        """
+        allowed = np.ones(4, dtype=bool)
+        if not self.upper_shield_enabled:
+            return allowed
+        hr = self._upper_headroom(temps=temps, headroom=headroom)
+        if hr is None:
+            return allowed
+
+        disable_ld1 = bool(hr[1] < self.upper_shield_ld_headroom_disable_c)
+        disable_ld2 = bool(hr[2] < self.upper_shield_ld_headroom_disable_c)
+        if float(np.nanmin(hr[1:3])) < self.upper_shield_critical_headroom_c:
+            disable_ld1 = True
+            disable_ld2 = True
+        if disable_ld1:
+            allowed[[1, 3]] = False
+        if disable_ld2:
+            allowed[[2, 3]] = False
+        if bool(hr[0] < self.upper_shield_led_headroom_disable_c) and not self.upper_shield_always_allow_minimal_combo:
+            allowed[[0, 1, 2, 3]] = False
+        if self.upper_shield_always_allow_minimal_combo:
+            allowed[0] = True
+        if not np.any(allowed):
+            allowed[0] = True
+        return allowed
+
+    def upper_raw_allowed_mask(
+        self,
+        *,
+        temps: Optional[np.ndarray] = None,
+        headroom: Optional[np.ndarray] = None,
+    ) -> np.ndarray:
+        allowed_boost = self.upper_boost_allowed_mask(temps=temps, headroom=headroom)
+        mask = np.zeros(12, dtype=bool)
+        for raw_idx in range(12):
+            boost, _mode = self.decode_upper(raw_idx)
+            mask[raw_idx] = bool(allowed_boost[boost])
+        if not np.any(mask):
+            mask[:3] = True
+        return mask
+
+    def _shield_boost_combo(
+        self,
+        desired_boost: int,
+        *,
+        temps: Optional[np.ndarray] = None,
+        headroom: Optional[np.ndarray] = None,
+    ) -> Tuple[int, np.ndarray, bool]:
+        desired_boost = int(np.clip(desired_boost, 0, 3))
+        allowed = self.upper_boost_allowed_mask(temps=temps, headroom=headroom)
+        if bool(allowed[desired_boost]):
+            return desired_boost, allowed, False
+
+        desired_mask = self._boost_mask(desired_boost) > 0.0
+        candidates = [idx for idx in range(4) if bool(allowed[idx])]
+        if not candidates:
+            return 0, allowed, desired_boost != 0
+        # This is only the execution fallback for an already requested unsafe
+        # combo. Normal selection receives the same mask and still chooses by Q.
+        subset_candidates = [
+            idx
+            for idx in candidates
+            if np.all((self._boost_mask(idx) > 0.0) <= desired_mask)
+        ]
+        if subset_candidates:
+            best = max(subset_candidates, key=lambda idx: int(np.sum(self._boost_mask(idx) > 0.0)))
+        else:
+            best = 0 if 0 in candidates else candidates[0]
+        return int(best), allowed, int(best) != desired_boost
+
+    def _is_emergency_downshift(
+        self,
+        *,
+        current_boost: int,
+        desired_boost: int,
+        temps: Optional[np.ndarray] = None,
+        headroom: Optional[np.ndarray] = None,
+    ) -> bool:
+        if not self.upper_shield_emergency_bypass_dwell or not self.upper_shield_enabled:
+            return False
+        current_mask = self._boost_mask(current_boost) > 0.0
+        desired_mask = self._boost_mask(desired_boost) > 0.0
+        if not np.all(desired_mask <= current_mask) or np.array_equal(current_mask, desired_mask):
+            return False
+        hr = self._upper_headroom(temps=temps, headroom=headroom)
+        if hr is None:
+            return False
+        removed = current_mask & (~desired_mask)
+        hot_removed_ld = bool((removed[1] and hr[1] < self.upper_shield_ld_headroom_disable_c) or (removed[2] and hr[2] < self.upper_shield_ld_headroom_disable_c))
+        critical = bool(float(np.nanmin(hr[1:3])) < self.upper_shield_critical_headroom_c)
+        return bool(hot_removed_ld or critical)
+
+    def _apply_dwell(
+        self,
+        desired_boost: int,
+        mem: Dict[str, int],
+        *,
+        temps: Optional[np.ndarray] = None,
+        headroom: Optional[np.ndarray] = None,
+    ) -> Tuple[int, Dict[str, int]]:
         current = int(mem.get("current_boost", 0))
         dwell = int(mem.get("dwell_count", 0))
 
@@ -198,6 +331,16 @@ class SafetyLayer:
             dwell += 1
             mem["dwell_count"] = dwell
             return current, mem
+
+        if self._is_emergency_downshift(
+            current_boost=current,
+            desired_boost=desired_boost,
+            temps=temps,
+            headroom=headroom,
+        ):
+            mem["current_boost"] = desired_boost
+            mem["dwell_count"] = 1
+            return desired_boost, mem
 
         if dwell < self.min_dwell_steps:
             mem["dwell_count"] = dwell + 1
@@ -207,17 +350,31 @@ class SafetyLayer:
         mem["dwell_count"] = 1
         return desired_boost, mem
 
-    def preview_exec(self, upper_raw: int | np.ndarray, mem: Optional[Dict[str, int]] = None) -> Tuple[int, int]:
+    def preview_exec(
+        self,
+        upper_raw: int | np.ndarray,
+        mem: Optional[Dict[str, int]] = None,
+        *,
+        temps: Optional[np.ndarray] = None,
+        headroom: Optional[np.ndarray] = None,
+    ) -> Tuple[int, int]:
         """Preview next executed (boost, mode) without mutating agent memory."""
         mem_preview = dict(mem or {"current_boost": 0, "dwell_count": self.min_dwell_steps})
         desired_boost, mode = self.decode_upper(upper_raw)
-        exec_boost, _ = self._apply_dwell(desired_boost, mem_preview)
+        desired_boost, _allowed, _shielded = self._shield_boost_combo(desired_boost, temps=temps, headroom=headroom)
+        exec_boost, _ = self._apply_dwell(desired_boost, mem_preview, temps=temps, headroom=headroom)
         return int(exec_boost), int(mode)
 
-    def raw_to_exec_map(self, mem: Optional[Dict[str, int]] = None) -> np.ndarray:
+    def raw_to_exec_map(
+        self,
+        mem: Optional[Dict[str, int]] = None,
+        *,
+        temps: Optional[np.ndarray] = None,
+        headroom: Optional[np.ndarray] = None,
+    ) -> np.ndarray:
         exec_map = np.zeros(12, dtype=np.int64)
         for raw_idx in range(12):
-            boost_exec, mode_exec = self.preview_exec(raw_idx, mem=mem)
+            boost_exec, mode_exec = self.preview_exec(raw_idx, mem=mem, temps=temps, headroom=headroom)
             exec_map[raw_idx] = self.encode_exec(boost_exec, mode_exec)
         return exec_map
 
@@ -660,7 +817,12 @@ class SafetyLayer:
     ) -> Tuple[Dict[str, np.ndarray | int | float], Dict[str, int]]:
         mem = dict(mem or {"current_boost": 0, "dwell_count": self.min_dwell_steps})
         desired_boost, mode = self.decode_upper(upper_raw)
-        exec_boost, mem = self._apply_dwell(desired_boost, mem)
+        shielded_boost, shield_allowed, shield_changed = self._shield_boost_combo(
+            desired_boost,
+            temps=temps,
+            headroom=None,
+        )
+        exec_boost, mem = self._apply_dwell(shielded_boost, mem, temps=temps, headroom=None)
 
         lower_raw = np.asarray(lower_raw, dtype=np.float32)
         currents, current_frac, decoded, current_aux = self._decode_current_request_np(lower_raw, exec_boost=exec_boost)
@@ -751,6 +913,14 @@ class SafetyLayer:
             "boost_combo_exec": int(exec_boost),
             "mode_exec": int(mode),
             "upper_idx_exec": int(self.encode_exec(exec_boost, mode)),
+            "upper_shield_enabled": bool(self.upper_shield_enabled),
+            "upper_shield_applied": bool(shield_changed or exec_boost != desired_boost),
+            "upper_shield_requested_boost": int(desired_boost),
+            "upper_shield_selected_boost": int(shielded_boost),
+            "upper_shield_allowed_anchor": float(bool(shield_allowed[0])),
+            "upper_shield_allowed_ld1": float(bool(shield_allowed[1])),
+            "upper_shield_allowed_ld2": float(bool(shield_allowed[2])),
+            "upper_shield_allowed_all": float(bool(shield_allowed[3])),
             "currents_exec": currents.astype(np.float32),
             "rho_exec": float(rho),
             "tau_exec": float(tau),

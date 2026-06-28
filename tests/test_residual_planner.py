@@ -231,6 +231,9 @@ def test_residual_planner_trust_region_rejects_non_policy_candidates():
     cfg["residual_planner"]["trust_region_enabled"] = True
     cfg["residual_planner"]["trust_region_raw_l2"] = 0.0
     cfg["residual_planner"]["trust_region_exec_l2"] = 0.0
+    cfg["residual_planner"]["emergency_h1_risk_threshold"] = 1.0e9
+    cfg["residual_planner"]["emergency_h2_risk_threshold"] = 1.0e9
+    cfg["residual_planner"]["h2_veto_enabled"] = False
     agent = HierarchicalAgent(cfg, torch.device("cpu"))
     agent.set_meta_iter(1)
 
@@ -257,6 +260,9 @@ def test_residual_planner_positive_margin_can_force_policy_fallback():
     cfg = _cfg()
     cfg["residual_planner"]["replacement_margin_mode"] = "absolute"
     cfg["residual_planner"]["replacement_margin"] = 1.0e6
+    cfg["residual_planner"]["emergency_h1_risk_threshold"] = 1.0e9
+    cfg["residual_planner"]["emergency_h2_risk_threshold"] = 1.0e9
+    cfg["residual_planner"]["h2_veto_enabled"] = False
     agent = HierarchicalAgent(cfg, torch.device("cpu"))
     agent.set_meta_iter(1)
 
@@ -309,6 +315,10 @@ def test_adaptive_planner_budget_selects_zero_for_very_low_risk_and_full_for_hig
     cfg = _cfg()
     cfg["residual_planner"]["adaptive_budget_enabled"] = True
     cfg["residual_planner"]["budget_low_periodic_interval"] = 0
+    cfg["residual_planner"]["budget_high_constraint"] = 1.0e9
+    cfg["residual_planner"]["budget_medium_constraint"] = 1.0e9
+    cfg["residual_planner"]["budget_high_disagreement"] = 1.0e9
+    cfg["residual_planner"]["budget_medium_disagreement"] = 1.0e9
     cfg["adaptive_thermal"]["initial_std"] = 0.0
     agent = HierarchicalAgent(cfg, torch.device("cpu"))
     agent.set_meta_iter(1)

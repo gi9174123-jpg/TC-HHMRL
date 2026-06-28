@@ -106,9 +106,22 @@ class UpperDQN:
         t: int,
         eval_mode: bool = False,
         exec_map: np.ndarray | None = None,
+        action_mask: np.ndarray | None = None,
         physical_features: np.ndarray | None = None,
     ) -> int:
+        allowed = None
+        if action_mask is not None:
+            allowed = np.asarray(action_mask, dtype=bool).reshape(-1)
+            if allowed.size != self.n_actions:
+                padded = np.zeros(self.n_actions, dtype=bool)
+                padded[: min(self.n_actions, allowed.size)] = allowed[: self.n_actions]
+                allowed = padded
+            if not np.any(allowed):
+                allowed = np.ones(self.n_actions, dtype=bool)
         if (not eval_mode) and np.random.rand() < self.epsilon(t):
+            if allowed is not None:
+                choices = np.flatnonzero(allowed)
+                return int(np.random.choice(choices))
             return int(np.random.randint(0, self.n_actions))
 
         with torch.no_grad():
@@ -116,10 +129,16 @@ class UpperDQN:
             z_t = torch.tensor(z, dtype=torch.float32, device=self.device).unsqueeze(0)
             q = self.q(obs_t, z_t)
             if exec_map is None:
+                if allowed is not None:
+                    mask_t = torch.as_tensor(allowed, dtype=torch.bool, device=self.device).view(1, -1)
+                    q = torch.where(mask_t, q, torch.full_like(q, -torch.inf))
                 return int(torch.argmax(q, dim=1).item())
             exec_idx = torch.as_tensor(np.asarray(exec_map, dtype=np.int64), device=self.device).view(1, -1)
             exec_idx = torch.clamp(exec_idx, 0, self.n_actions - 1)
             q_raw = torch.gather(q, 1, exec_idx)
+            if allowed is not None:
+                mask_t = torch.as_tensor(allowed, dtype=torch.bool, device=self.device).view(1, -1)
+                q_raw = torch.where(mask_t, q_raw, torch.full_like(q_raw, -torch.inf))
             return int(torch.argmax(q_raw, dim=1).item())
 
     def update(self, batch: Dict[str, np.ndarray]) -> Dict[str, float]:
@@ -157,14 +176,37 @@ class UpperDQN:
             if "next_exec_map" in batch:
                 next_exec_map = torch.tensor(batch["next_exec_map"], dtype=torch.long, device=self.device)
                 next_exec_map = torch.clamp(next_exec_map, 0, self.n_actions - 1)
+                next_mask = None
+                if "next_action_mask" in batch:
+                    next_mask = torch.tensor(batch["next_action_mask"], dtype=torch.bool, device=self.device)
+                    if next_mask.dim() == 1:
+                        next_mask = next_mask.view(1, -1).expand(next_exec_map.shape[0], -1)
+                    if next_mask.shape != next_exec_map.shape:
+                        fixed = torch.ones_like(next_exec_map, dtype=torch.bool)
+                        n = min(fixed.shape[1], next_mask.shape[1])
+                        fixed[:, :n] = next_mask[:, :n]
+                        next_mask = fixed
+                    empty_rows = ~next_mask.any(dim=1, keepdim=True)
+                    if bool(empty_rows.any().item()):
+                        next_mask = torch.where(empty_rows.expand_as(next_mask), torch.ones_like(next_mask), next_mask)
                 if self.double_dqn:
                     q_next_online = torch.gather(self.q(next_obs_aug_online, z_next), 1, next_exec_map)
+                    if next_mask is not None:
+                        q_next_online = torch.where(next_mask, q_next_online, torch.full_like(q_next_online, -torch.inf))
                     next_raw_action = torch.argmax(q_next_online, dim=1, keepdim=True)
                     q_next_target_raw = torch.gather(self.q_tgt(next_obs_aug_tgt, z_next), 1, next_exec_map)
+                    if next_mask is not None:
+                        q_next_target_raw = torch.where(
+                            next_mask,
+                            q_next_target_raw,
+                            torch.full_like(q_next_target_raw, -torch.inf),
+                        )
                     q_next = torch.gather(q_next_target_raw, 1, next_raw_action)
                 else:
                     q_next_all = self.q_tgt(next_obs_aug_tgt, z_next)
                     q_next_raw = torch.gather(q_next_all, 1, next_exec_map)
+                    if next_mask is not None:
+                        q_next_raw = torch.where(next_mask, q_next_raw, torch.full_like(q_next_raw, -torch.inf))
                     q_next = q_next_raw.max(dim=1, keepdim=True)[0]
             else:
                 if self.double_dqn:

@@ -132,6 +132,9 @@ residual_planner:
   projection_penalty: 0.10
   constraint_beta: 1.0
   thermal_risk_beta: 0.05
+  thermal_risk_agg: max
+  h1_risk_beta: 0.5
+  h2_risk_beta: 1.0
   thermal_margin_target_c: 1.0
   thermal_horizon: 2
   start_meta_iter: 60
@@ -163,7 +166,18 @@ residual_planner:
   projection_residual_limit: null
   h2_veto_enabled: true
   h2_margin: 0.0
-  h2_increment_beta: 0.05
+  h2_increment_beta: 0.5
+  emergency_h1_risk_threshold: 0.0
+  emergency_h2_risk_threshold: 0.0
+
+upper_safety_shield:
+  enabled: true
+  ld_headroom_disable_c: 1.0
+  ld_headroom_reenable_c: 2.0
+  led_headroom_disable_c: 0.5
+  critical_headroom_c: 0.25
+  always_allow_minimal_combo: true
+  emergency_bypass_dwell: true
 
 agent:
   obs_dim: 20

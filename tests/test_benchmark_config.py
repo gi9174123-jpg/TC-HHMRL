@@ -137,7 +137,10 @@ def test_formal_metadata_reports_model_aware_lower_components():
     assert meta["transition_schema_version"] == "transition_schema_v2_fail_fast"
     assert meta["reward_schema_version"] == "reward_task_plus_benchmark_and_constraint_cost_vec_v2"
     assert meta["action_contract_version"] == "policy_planner_executed_action_v1"
-    assert meta["residual_planner_scoring"] == "target_critics_plus_constraint_incremental_h2_risk"
+    assert meta["residual_planner_scoring"] == "target_critics_plus_constraint_worst_source_h1_h2_risk"
+    assert meta["residual_planner_thermal_risk_agg"] == "max"
+    assert meta["upper_safety_shield_enabled"] is True
+    assert meta["upper_safety_shield_rule"] == "thermal_headroom_action_mask_no_source_preference"
     assert meta["residual_planner_trust_region_enabled"] is False
     assert meta["residual_planner_replacement_margin_mode"] == "normalized"
     assert meta["residual_planner_replacement_margin"] is None

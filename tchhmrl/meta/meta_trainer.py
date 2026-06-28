@@ -54,6 +54,46 @@ class EpisodeStats:
     residual_planner_budget_k8_rate: float = 0.0
     residual_planner_budget_k16_rate: float = 0.0
     residual_planner_budget_k24_rate: float = 0.0
+    cost_qos: float = 0.0
+    cost_temp_anchor: float = 0.0
+    cost_temp_boost1: float = 0.0
+    cost_temp_boost2: float = 0.0
+    temp0_max: float = 0.0
+    temp1_max: float = 0.0
+    temp2_max: float = 0.0
+    thermal_headroom_min: float = 0.0
+    mode_ps_rate: float = 0.0
+    mode_ts_rate: float = 0.0
+    mode_hy_rate: float = 0.0
+    boost_anchor_rate: float = 0.0
+    boost_ld1_rate: float = 0.0
+    boost_ld2_rate: float = 0.0
+    boost_all_rate: float = 0.0
+    projected_current_total_mean: float = 0.0
+    bus_utilization_mean: float = 0.0
+    projection_residual_mean: float = 0.0
+    thermal_gain_mean0: float = 0.0
+    thermal_gain_mean1: float = 0.0
+    thermal_gain_mean2: float = 0.0
+    thermal_gain_std0: float = 0.0
+    thermal_gain_std1: float = 0.0
+    thermal_gain_std2: float = 0.0
+    thermal_gain_safe_scale0: float = 0.0
+    thermal_gain_safe_scale1: float = 0.0
+    thermal_gain_safe_scale2: float = 0.0
+    thermal_valid_count0: float = 0.0
+    thermal_valid_count1: float = 0.0
+    thermal_valid_count2: float = 0.0
+    planner_h2_veto_rate: float = 0.0
+    planner_constraint_rejection_rate: float = 0.0
+    planner_h1_thermal_risk: float = 0.0
+    planner_h2_thermal_risk: float = 0.0
+    planner_h2_max_temperature: float = 0.0
+    planner_target_constraint_value: float = 0.0
+    upper_shield_applied_rate: float = 0.0
+    upper_shield_ld1_disabled_rate: float = 0.0
+    upper_shield_ld2_disabled_rate: float = 0.0
+    upper_shield_all_disabled_rate: float = 0.0
 
 
 class MetaTrainer:
@@ -525,6 +565,29 @@ class MetaTrainer:
         ep_planner_budget_k8 = 0.0
         ep_planner_budget_k16 = 0.0
         ep_planner_budget_k24 = 0.0
+        ep_cost_qos = 0.0
+        ep_cost_temp = np.zeros(3, dtype=np.float32)
+        ep_temp_max = np.full(3, -np.inf, dtype=np.float32)
+        ep_headroom_min = float("inf")
+        ep_mode_counts = np.zeros(3, dtype=np.float32)
+        ep_boost_counts = np.zeros(4, dtype=np.float32)
+        ep_projected_current_total = 0.0
+        ep_bus_utilization = 0.0
+        ep_projection_residual = 0.0
+        ep_thermal_gain_mean = np.zeros(3, dtype=np.float32)
+        ep_thermal_gain_std = np.zeros(3, dtype=np.float32)
+        ep_thermal_gain_safe_scale = np.zeros(3, dtype=np.float32)
+        ep_thermal_valid_count = np.zeros(3, dtype=np.float32)
+        ep_planner_h2_veto = 0.0
+        ep_planner_constraint_rejection = 0.0
+        ep_planner_h1_risk = 0.0
+        ep_planner_h2_risk = 0.0
+        ep_planner_h2_max_temp = 0.0
+        ep_planner_target_constraint = 0.0
+        ep_upper_shield_applied = 0.0
+        ep_upper_shield_ld1_disabled = 0.0
+        ep_upper_shield_ld2_disabled = 0.0
+        ep_upper_shield_all_disabled = 0.0
 
         macro_start_obs = None
         macro_start_z = None
@@ -589,6 +652,10 @@ class MetaTrainer:
                 "planner_selected": float(bool(aux.get("planner_selected", False))),
                 "act_desired": aux.get("act_desired", aux["act_exec"]).astype(np.float32),
                 "projection_residual": aux.get("projection_residual", np.zeros(5, dtype=np.float32)).astype(np.float32),
+                "upper_action_mask": aux.get(
+                    "upper_action_mask",
+                    np.ones(int(self.cfg["agent"]["n_upper_actions"]), dtype=np.float32),
+                ).astype(np.float32),
                 "residual_planner_score_improvement": float(aux.get("residual_planner_score_improvement", 0.0)),
                 "physical_features": aux.get("physical_features", np.zeros(18, dtype=np.float32)).astype(np.float32),
                 "physical_features_next": physical_features_next.astype(np.float32),
@@ -661,12 +728,14 @@ class MetaTrainer:
                             "boost_combo_exec_next": float(aux["boost_combo_exec"]),
                             "mode_exec_next": float(aux["mode_exec"]),
                             "next_exec_map": np.arange(int(self.cfg["agent"]["n_upper_actions"]), dtype=np.float32),
+                            "next_action_mask": np.ones(int(self.cfg["agent"]["n_upper_actions"]), dtype=np.float32),
                         }
                     else:
                         nxt = self.agent.preview_next_macro(
                             next_obs=next_obs.astype(np.float32),
                             z_next=z_next_val.astype(np.float32),
                             physical_features_next=physical_features_next.astype(np.float32),
+                            temps_next=np.asarray(info["temps"], dtype=np.float32),
                             eval_mode=False,
                             commit_plan=True,
                         )
@@ -676,6 +745,7 @@ class MetaTrainer:
                             "boost_combo_exec_next": float(nxt["boost_combo_exec_next"]),
                             "mode_exec_next": float(nxt["mode_exec_next"]),
                             "next_exec_map": np.asarray(nxt["next_exec_map"], dtype=np.float32),
+                            "next_action_mask": np.asarray(nxt["next_action_mask"], dtype=np.float32),
                         }
                     next_macro_info = payload
                     return payload
@@ -702,6 +772,13 @@ class MetaTrainer:
                             next_macro_info.get(
                                 "next_exec_map",
                                 np.arange(int(self.cfg["agent"]["n_upper_actions"]), dtype=np.float32),
+                            ),
+                            dtype=np.float32,
+                        ),
+                        "next_action_mask": np.asarray(
+                            next_macro_info.get(
+                                "next_action_mask",
+                                np.ones(int(self.cfg["agent"]["n_upper_actions"]), dtype=np.float32),
                             ),
                             dtype=np.float32,
                         ),
@@ -761,9 +838,63 @@ class MetaTrainer:
             ep_planner_budget_k8 += float(planner_budget == 8)
             ep_planner_budget_k16 += float(planner_budget == 16)
             ep_planner_budget_k24 += float(planner_budget == 24)
+            ep_cost_qos += float(info.get("cost_qos", cost_vec[0] if cost_vec.size > 0 else 0.0))
+            ep_cost_temp[0] += float(info.get("cost_temp_anchor", cost_vec[1] if cost_vec.size > 1 else 0.0))
+            ep_cost_temp[1] += float(info.get("cost_temp_boost1", cost_vec[2] if cost_vec.size > 2 else 0.0))
+            ep_cost_temp[2] += float(info.get("cost_temp_boost2", cost_vec[3] if cost_vec.size > 3 else 0.0))
+            temps_after = np.asarray(info.get("temps", temps_before), dtype=np.float32).reshape(-1)[:3]
+            if temps_after.size == 3:
+                ep_temp_max = np.maximum(ep_temp_max, temps_after)
+                ep_headroom_min = min(ep_headroom_min, float(np.min(float(env.thermal_safe) - temps_after)))
+            mode_i = int(np.clip(int(aux.get("mode_exec", 0)), 0, 2))
+            boost_i = int(np.clip(int(aux.get("boost_combo_exec", 0)), 0, 3))
+            ep_mode_counts[mode_i] += 1.0
+            ep_boost_counts[boost_i] += 1.0
+            ep_projected_current_total += float(aux.get("projected_current_total", info.get("current_total", 0.0)))
+            ep_bus_utilization += float(info.get("bus_utilization", 0.0))
+            ep_projection_residual += float(
+                np.linalg.norm(np.asarray(aux.get("projection_residual", np.zeros(5, dtype=np.float32)), dtype=np.float32))
+            )
+            gain_mean = np.asarray(
+                thermal_estimator_diag.get("thermal_gain_mean", np.zeros(3, dtype=np.float32)),
+                dtype=np.float32,
+            ).reshape(-1)[:3]
+            gain_std = np.asarray(
+                thermal_estimator_diag.get("thermal_gain_std", np.zeros(3, dtype=np.float32)),
+                dtype=np.float32,
+            ).reshape(-1)[:3]
+            gain_scale = np.asarray(
+                thermal_estimator_diag.get("thermal_gain_safe_scale", np.zeros(3, dtype=np.float32)),
+                dtype=np.float32,
+            ).reshape(-1)[:3]
+            valid_count = np.asarray(
+                thermal_estimator_diag.get("thermal_gain_valid_count", np.zeros(3, dtype=np.float32)),
+                dtype=np.float32,
+            ).reshape(-1)[:3]
+            if gain_mean.size == 3:
+                ep_thermal_gain_mean += gain_mean
+            if gain_std.size == 3:
+                ep_thermal_gain_std += gain_std
+            if gain_scale.size == 3:
+                ep_thermal_gain_safe_scale += gain_scale
+            if valid_count.size == 3:
+                ep_thermal_valid_count += valid_count
+            ep_planner_h2_veto += float(bool(aux.get("residual_planner_h2_veto", False)))
+            ep_planner_constraint_rejection += float(aux.get("residual_planner_constraint_rejection_rate", 0.0))
+            ep_planner_h1_risk += float(aux.get("residual_planner_h1_thermal_risk", 0.0))
+            ep_planner_h2_risk += float(aux.get("residual_planner_h2_thermal_risk", 0.0))
+            ep_planner_h2_max_temp += float(aux.get("residual_planner_h2_max_temperature", 0.0))
+            ep_planner_target_constraint += float(aux.get("residual_planner_target_constraint_value", 0.0))
+            ep_upper_shield_applied += float(bool(aux.get("upper_shield_applied", False)))
+            ep_upper_shield_ld1_disabled += float(float(aux.get("upper_shield_allowed_ld1", 1.0)) < 0.5)
+            ep_upper_shield_ld2_disabled += float(float(aux.get("upper_shield_allowed_ld2", 1.0)) < 0.5)
+            ep_upper_shield_all_disabled += float(float(aux.get("upper_shield_allowed_all", 1.0)) < 0.5)
 
             obs = next_obs
 
+        ep_len_safe = max(ep_len, 1)
+        ep_temp_max = np.where(np.isfinite(ep_temp_max), ep_temp_max, 0.0).astype(np.float32)
+        headroom_min = float(ep_headroom_min if math.isfinite(ep_headroom_min) else 0.0)
         return EpisodeStats(
             reward=ep_reward,
             reward_task=ep_reward_task,
@@ -796,6 +927,46 @@ class MetaTrainer:
             residual_planner_budget_k8_rate=ep_planner_budget_k8 / max(ep_len, 1),
             residual_planner_budget_k16_rate=ep_planner_budget_k16 / max(ep_len, 1),
             residual_planner_budget_k24_rate=ep_planner_budget_k24 / max(ep_len, 1),
+            cost_qos=ep_cost_qos / ep_len_safe,
+            cost_temp_anchor=float(ep_cost_temp[0]) / ep_len_safe,
+            cost_temp_boost1=float(ep_cost_temp[1]) / ep_len_safe,
+            cost_temp_boost2=float(ep_cost_temp[2]) / ep_len_safe,
+            temp0_max=float(ep_temp_max[0]),
+            temp1_max=float(ep_temp_max[1]),
+            temp2_max=float(ep_temp_max[2]),
+            thermal_headroom_min=headroom_min,
+            mode_ps_rate=float(ep_mode_counts[0]) / ep_len_safe,
+            mode_ts_rate=float(ep_mode_counts[1]) / ep_len_safe,
+            mode_hy_rate=float(ep_mode_counts[2]) / ep_len_safe,
+            boost_anchor_rate=float(ep_boost_counts[0]) / ep_len_safe,
+            boost_ld1_rate=float(ep_boost_counts[1]) / ep_len_safe,
+            boost_ld2_rate=float(ep_boost_counts[2]) / ep_len_safe,
+            boost_all_rate=float(ep_boost_counts[3]) / ep_len_safe,
+            projected_current_total_mean=ep_projected_current_total / ep_len_safe,
+            bus_utilization_mean=ep_bus_utilization / ep_len_safe,
+            projection_residual_mean=ep_projection_residual / ep_len_safe,
+            thermal_gain_mean0=float(ep_thermal_gain_mean[0]) / ep_len_safe,
+            thermal_gain_mean1=float(ep_thermal_gain_mean[1]) / ep_len_safe,
+            thermal_gain_mean2=float(ep_thermal_gain_mean[2]) / ep_len_safe,
+            thermal_gain_std0=float(ep_thermal_gain_std[0]) / ep_len_safe,
+            thermal_gain_std1=float(ep_thermal_gain_std[1]) / ep_len_safe,
+            thermal_gain_std2=float(ep_thermal_gain_std[2]) / ep_len_safe,
+            thermal_gain_safe_scale0=float(ep_thermal_gain_safe_scale[0]) / ep_len_safe,
+            thermal_gain_safe_scale1=float(ep_thermal_gain_safe_scale[1]) / ep_len_safe,
+            thermal_gain_safe_scale2=float(ep_thermal_gain_safe_scale[2]) / ep_len_safe,
+            thermal_valid_count0=float(ep_thermal_valid_count[0]) / ep_len_safe,
+            thermal_valid_count1=float(ep_thermal_valid_count[1]) / ep_len_safe,
+            thermal_valid_count2=float(ep_thermal_valid_count[2]) / ep_len_safe,
+            planner_h2_veto_rate=ep_planner_h2_veto / ep_len_safe,
+            planner_constraint_rejection_rate=ep_planner_constraint_rejection / ep_len_safe,
+            planner_h1_thermal_risk=ep_planner_h1_risk / ep_len_safe,
+            planner_h2_thermal_risk=ep_planner_h2_risk / ep_len_safe,
+            planner_h2_max_temperature=ep_planner_h2_max_temp / ep_len_safe,
+            planner_target_constraint_value=ep_planner_target_constraint / ep_len_safe,
+            upper_shield_applied_rate=ep_upper_shield_applied / ep_len_safe,
+            upper_shield_ld1_disabled_rate=ep_upper_shield_ld1_disabled / ep_len_safe,
+            upper_shield_ld2_disabled_rate=ep_upper_shield_ld2_disabled / ep_len_safe,
+            upper_shield_all_disabled_rate=ep_upper_shield_all_disabled / ep_len_safe,
         )
 
     def train(self, meta_iters: int | None = None) -> Path:
@@ -1376,6 +1547,53 @@ class MetaTrainer:
                 "iter_upper_update_step_delta": int(self.agent.upper.update_steps - iter_upper_steps_start),
                 "iter_lower_update_step_delta": int(self.agent.lower.update_steps - iter_lower_steps_start),
             }
+            diagnostic_names = [
+                "cost_qos",
+                "cost_temp_anchor",
+                "cost_temp_boost1",
+                "cost_temp_boost2",
+                "temp0_max",
+                "temp1_max",
+                "temp2_max",
+                "thermal_headroom_min",
+                "mode_ps_rate",
+                "mode_ts_rate",
+                "mode_hy_rate",
+                "boost_anchor_rate",
+                "boost_ld1_rate",
+                "boost_ld2_rate",
+                "boost_all_rate",
+                "projected_current_total_mean",
+                "bus_utilization_mean",
+                "projection_residual_mean",
+                "thermal_gain_mean0",
+                "thermal_gain_mean1",
+                "thermal_gain_mean2",
+                "thermal_gain_std0",
+                "thermal_gain_std1",
+                "thermal_gain_std2",
+                "thermal_gain_safe_scale0",
+                "thermal_gain_safe_scale1",
+                "thermal_gain_safe_scale2",
+                "thermal_valid_count0",
+                "thermal_valid_count1",
+                "thermal_valid_count2",
+                "planner_h2_veto_rate",
+                "planner_constraint_rejection_rate",
+                "planner_h1_thermal_risk",
+                "planner_h2_thermal_risk",
+                "planner_h2_max_temperature",
+                "planner_target_constraint_value",
+                "upper_shield_applied_rate",
+                "upper_shield_ld1_disabled_rate",
+                "upper_shield_ld2_disabled_rate",
+                "upper_shield_all_disabled_rate",
+            ]
+            for prefix, stats_group in (("support", support_stats), ("query", query_stats)):
+                for name in diagnostic_names:
+                    row[f"{prefix}_{name}"] = (
+                        float(np.mean([float(getattr(s, name)) for s in stats_group])) if stats_group else 0.0
+                    )
             cost_component_names = list(self.dual.names)
             support_vec_mean = mean_support_cost_vec
             query_vec_mean = (

@@ -531,7 +531,8 @@ class HierarchicalAgent:
         z = np.zeros(self.z_dim, dtype=np.float32) if z is None else z.astype(np.float32)
 
         macro_new = self.upper_mem["hold_left"] <= 0
-        exec_map = self.safety.raw_to_exec_map(self.safety_mem)
+        exec_map = self.safety.raw_to_exec_map(self.safety_mem, temps=temps)
+        action_mask = self.safety.upper_raw_allowed_mask(temps=temps)
         physical_features = self.current_physical_features(temps=temps)
         if macro_new:
             if self.upper_plan is not None:
@@ -544,6 +545,7 @@ class HierarchicalAgent:
                     t=self.global_step,
                     eval_mode=eval_mode,
                     exec_map=exec_map,
+                    action_mask=action_mask,
                     physical_features=physical_features,
                 )
             self.upper_mem["upper_idx"] = int(upper_idx_raw)
@@ -552,7 +554,7 @@ class HierarchicalAgent:
             upper_idx_raw = int(self.upper_mem["upper_idx"])
         self.upper_mem["hold_left"] = max(0, int(self.upper_mem["hold_left"]) - 1)
 
-        boost_preview, mode_preview = self.safety.preview_exec(upper_idx_raw, self.safety_mem)
+        boost_preview, mode_preview = self.safety.preview_exec(upper_idx_raw, self.safety_mem, temps=temps)
         upper_idx_exec = self.safety.encode_exec(boost_preview, mode_preview)
         lower_raw = self.lower.select_action(
             obs,
@@ -686,6 +688,7 @@ class HierarchicalAgent:
             "safety_projection_residual": projection_residual_norm.astype(np.float32),
             "total_projection_residual": total_projection_residual_norm.astype(np.float32),
             "physical_features": physical_features.astype(np.float32),
+            "upper_action_mask": action_mask.astype(np.float32),
             **planner_aux,
             "t_pred": safe["t_pred"],
             "thermal_scale": safe["thermal_scale"],
@@ -724,6 +727,14 @@ class HierarchicalAgent:
             "thermal_gain_valid_count": safe.get("thermal_gain_valid_count"),
             "temperature_slope": safe.get("temperature_slope"),
             "thermal_headroom": safe.get("thermal_headroom"),
+            "upper_shield_enabled": safe.get("upper_shield_enabled", False),
+            "upper_shield_applied": safe.get("upper_shield_applied", False),
+            "upper_shield_requested_boost": safe.get("upper_shield_requested_boost", safe.get("boost_combo_exec", 0)),
+            "upper_shield_selected_boost": safe.get("upper_shield_selected_boost", safe.get("boost_combo_exec", 0)),
+            "upper_shield_allowed_anchor": safe.get("upper_shield_allowed_anchor", 1.0),
+            "upper_shield_allowed_ld1": safe.get("upper_shield_allowed_ld1", 1.0),
+            "upper_shield_allowed_ld2": safe.get("upper_shield_allowed_ld2", 1.0),
+            "upper_shield_allowed_all": safe.get("upper_shield_allowed_all", 1.0),
             "macro_new": bool(macro_new),
             "hold_left": int(self.upper_mem["hold_left"]),
             "rollout_step": int(planner_step),
@@ -739,11 +750,13 @@ class HierarchicalAgent:
         next_obs: np.ndarray,
         z_next: np.ndarray,
         physical_features_next: np.ndarray | None = None,
+        temps_next: np.ndarray | None = None,
         eval_mode: bool = False,
         commit_plan: bool = False,
     ) -> Dict[str, int]:
         macro_new_next = self.upper_mem["hold_left"] <= 0
-        next_exec_map = self.safety.raw_to_exec_map(self.safety_mem)
+        next_exec_map = self.safety.raw_to_exec_map(self.safety_mem, temps=temps_next)
+        next_action_mask = self.safety.upper_raw_allowed_mask(temps=temps_next)
         if macro_new_next:
             upper_idx_next_raw = int(
                 self.upper.select_action(
@@ -752,6 +765,7 @@ class HierarchicalAgent:
                     t=self.global_step + 1,
                     eval_mode=eval_mode,
                     exec_map=next_exec_map,
+                    action_mask=next_action_mask,
                     physical_features=physical_features_next,
                 )
             )
@@ -760,13 +774,14 @@ class HierarchicalAgent:
         else:
             upper_idx_next_raw = int(self.upper_mem["upper_idx"])
 
-        boost_next, mode_next = self.safety.preview_exec(upper_idx_next_raw, self.safety_mem)
+        boost_next, mode_next = self.safety.preview_exec(upper_idx_next_raw, self.safety_mem, temps=temps_next)
         return {
             "upper_idx_raw_next": int(upper_idx_next_raw),
             "upper_idx_exec_next": int(self.safety.encode_exec(boost_next, mode_next)),
             "boost_combo_exec_next": int(boost_next),
             "mode_exec_next": int(mode_next),
             "next_exec_map": next_exec_map.astype(np.float32),
+            "next_action_mask": next_action_mask.astype(np.float32),
         }
 
     def observe_lower(
@@ -815,8 +830,9 @@ class HierarchicalAgent:
             tr.setdefault("mode_exec_next", tr.get("mode_exec", 0.0))
             tr.setdefault(
                 "next_exec_map",
-                np.tile(np.arange(12, dtype=np.float32).reshape(1, -1), (1, 1)).squeeze(0),
+                self.safety.raw_to_exec_map(self.safety_mem).astype(np.float32),
             )
+            tr.setdefault("next_action_mask", self.safety.upper_raw_allowed_mask().astype(np.float32))
         self.replay.add(tr)
         return z_next
 

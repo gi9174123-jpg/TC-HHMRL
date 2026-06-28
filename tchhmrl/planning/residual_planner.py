@@ -31,7 +31,14 @@ class ResidualPlanner:
         self.projection_penalty = float(planner_cfg.get("projection_penalty", 0.10))
         self.constraint_beta = float(planner_cfg.get("constraint_beta", 1.0))
         self.thermal_risk_beta = float(planner_cfg.get("thermal_risk_beta", 0.05))
+        self.thermal_risk_agg = str(planner_cfg.get("thermal_risk_agg", "max")).lower()
+        if self.thermal_risk_agg not in {"max", "mean"}:
+            raise ValueError(f"unsupported residual_planner.thermal_risk_agg={self.thermal_risk_agg!r}")
+        self.h1_risk_beta = float(planner_cfg.get("h1_risk_beta", 0.0))
+        self.h2_risk_beta = float(planner_cfg.get("h2_risk_beta", 0.0))
         self.h2_increment_beta = float(planner_cfg.get("h2_increment_beta", self.thermal_risk_beta))
+        self.emergency_h1_risk_threshold = float(planner_cfg.get("emergency_h1_risk_threshold", 0.0))
+        self.emergency_h2_risk_threshold = float(planner_cfg.get("emergency_h2_risk_threshold", 0.0))
         self.thermal_margin_target_c = float(planner_cfg.get("thermal_margin_target_c", 1.0))
         self.thermal_horizon = int(planner_cfg.get("thermal_horizon", 2))
         self.start_meta_iter = int(planner_cfg.get("start_meta_iter", 60))
@@ -97,6 +104,13 @@ class ResidualPlanner:
             thermal_headroom=thermal_headroom,
         )
         candidates = raw.reshape(1, -1) + basis
+        if candidates.shape[0] >= 4:
+            # Add neutral cooling candidates that only lower total requested
+            # current. Source allocation remains whatever the policy selected.
+            candidates[-2] = raw
+            candidates[-2, 0] = min(float(candidates[-2, 0]), -0.75)
+            candidates[-1] = raw
+            candidates[-1, 0] = -1.0
         return np.clip(candidates, -1.0, 1.0).astype(np.float32)
 
     def _nearest_budget(self, requested: int) -> int:
@@ -247,7 +261,11 @@ class ResidualPlanner:
         thermal_horizon: int,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
         margin1 = safe["thermal_margin"]
-        risk1 = torch.relu(self.thermal_margin_target_c - margin1).mean(dim=1, keepdim=True)
+        excess1 = torch.relu(self.thermal_margin_target_c - margin1)
+        if self.thermal_risk_agg == "mean":
+            risk1 = excess1.mean(dim=1, keepdim=True)
+        else:
+            risk1 = excess1.max(dim=1, keepdim=True).values
         if int(thermal_horizon) < 2:
             zeros = torch.zeros_like(risk1)
             max_t1 = safe["t_pred"].max(dim=1, keepdim=True).values
@@ -260,7 +278,11 @@ class ResidualPlanner:
         currents = safe["currents_exec"]
         t2 = base2 + effective_gain * (currents**2)
         margin2 = safety.thermal_safe - t2
-        risk2 = torch.relu(self.thermal_margin_target_c - margin2).mean(dim=1, keepdim=True)
+        excess2 = torch.relu(self.thermal_margin_target_c - margin2)
+        if self.thermal_risk_agg == "mean":
+            risk2 = excess2.mean(dim=1, keepdim=True)
+        else:
+            risk2 = excess2.max(dim=1, keepdim=True).values
         incremental = torch.relu(risk2 - risk1)
         max_t2 = t2.max(dim=1, keepdim=True).values
         veto = max_t2 > float(safety.thermal_safe - self.h2_margin)
@@ -457,20 +479,41 @@ class ResidualPlanner:
             if self.h2_veto_enabled and int(effective_thermal_horizon) >= 2:
                 h2_valid = ~h2_veto
             valid = trust_valid & constraint_valid & projection_valid & h2_valid
-            valid[0] = True
+            policy_emergency = bool(
+                (h1_risk[0] > float(self.emergency_h1_risk_threshold)).detach().cpu().item()
+                or (h2_risk[0] > float(self.emergency_h2_risk_threshold)).detach().cpu().item()
+                or bool(self.h2_veto_enabled and int(effective_thermal_horizon) >= 2 and h2_veto[0].detach().cpu().item())
+            )
+            if not policy_emergency:
+                valid[0] = True
 
+            thermal_penalty = (
+                self.h1_risk_beta * h1_risk
+                + self.h2_risk_beta * h2_risk
+                + self.h2_increment_beta * incremental_h2_risk
+            )
             score = (
                 reward_value
                 - self.constraint_beta * constraint_penalty
                 - self.disagreement_beta * disagreement
                 - self.projection_penalty * projection_residual
-                - self.h2_increment_beta * incremental_h2_risk
+                - thermal_penalty
             )
             valid_score = torch.where(valid, score, torch.full_like(score, -torch.inf))
             margin = self._replacement_margin(valid_score.view(-1))
-            best_idx = int(torch.argmax(valid_score.view(-1)).item())
+            any_valid = bool(torch.isfinite(valid_score).any().detach().cpu().item())
+            emergency_selected = False
+            if any_valid:
+                best_idx = int(torch.argmax(valid_score.view(-1)).item())
+            else:
+                emergency_score = h1_risk + h2_risk + constraint_penalty + projection_residual
+                best_idx = int(torch.argmin(emergency_score.view(-1)).item())
+                emergency_selected = True
             best_improvement = float((score[best_idx] - score[0]).detach().cpu().item())
-            selected_idx = best_idx if best_idx != 0 and best_improvement >= margin else 0
+            if emergency_selected or policy_emergency:
+                selected_idx = best_idx
+            else:
+                selected_idx = best_idx if best_idx != 0 and best_improvement >= margin else 0
             score_improvement = float((score[selected_idx] - score[0]).detach().cpu().item())
             margin_rejected = bool(best_idx != 0 and best_improvement < margin)
             trust_rejected = (
@@ -545,6 +588,9 @@ class ResidualPlanner:
             "residual_planner_incremental_h2_risk": float(incremental_h2_risk[selected_idx].detach().cpu().item()),
             "residual_planner_h2_max_temperature": float(h2_max_temperature[selected_idx].detach().cpu().item()),
             "residual_planner_h2_veto": bool(h2_veto[selected_idx].detach().cpu().item()),
+            "residual_planner_policy_emergency": bool(policy_emergency),
+            "residual_planner_emergency_selected": bool(emergency_selected),
+            "residual_planner_thermal_risk_agg_is_max": float(self.thermal_risk_agg == "max"),
             "residual_planner_trust_region_rejected": bool(trust_rejected),
             "residual_planner_min_thermal_headroom": risk["min_thermal_headroom"],
             "residual_planner_effective_gain_uncertainty": risk["effective_gain_uncertainty"],

@@ -372,7 +372,10 @@ def formal_metadata_snapshot(cfg: Dict, *, pre_alignment: bool | None = None, ta
         "residual_planner_thermal_horizon_start_meta_iter": int(
             planner_cfg.get("thermal_horizon_start_meta_iter", 0) or 0
         ),
-        "residual_planner_scoring": "target_critics_plus_constraint_incremental_h2_risk",
+        "residual_planner_scoring": "target_critics_plus_constraint_worst_source_h1_h2_risk",
+        "residual_planner_thermal_risk_agg": str(planner_cfg.get("thermal_risk_agg", "mean")),
+        "residual_planner_h1_risk_beta": float(planner_cfg.get("h1_risk_beta", 0.0) or 0.0),
+        "residual_planner_h2_risk_beta": float(planner_cfg.get("h2_risk_beta", 0.0) or 0.0),
         "residual_planner_trust_region_enabled": bool(planner_cfg.get("trust_region_enabled", False)),
         "residual_planner_trust_region_mode": str(planner_cfg.get("trust_region_mode", "")),
         "residual_planner_replacement_margin_mode": str(planner_cfg.get("replacement_margin_mode", "")),
@@ -386,11 +389,18 @@ def formal_metadata_snapshot(cfg: Dict, *, pre_alignment: bool | None = None, ta
         "residual_planner_h2_increment_beta": float(
             planner_cfg.get("h2_increment_beta", planner_cfg.get("thermal_risk_beta", 0.0)) or 0.0
         ),
+        "residual_planner_emergency_policy_fallback": "disabled_when_policy_violates_thermal_horizon",
         "residual_planner_uses_env_reward_model": False,
         "residual_planner_trust_region_effective": bool(planner_cfg.get("trust_region_enabled", False))
         and (
             planner_cfg.get("trust_region_raw_l2", None) is not None
             or planner_cfg.get("trust_region_exec_l2", None) is not None
+        ),
+        "upper_safety_shield_enabled": bool(cfg.get("upper_safety_shield", {}).get("enabled", False)),
+        "upper_safety_shield_rule": "thermal_headroom_action_mask_no_source_preference",
+        "upper_safety_shield_uses_query": False,
+        "upper_safety_shield_ld_headroom_disable_c": float(
+            cfg.get("upper_safety_shield", {}).get("ld_headroom_disable_c", 0.0) or 0.0
         ),
         "upper_double_dqn": bool(upper_cfg.get("double_dqn", False)),
         "upper_dueling_dqn": bool(upper_cfg.get("dueling", False)),
@@ -2028,6 +2038,9 @@ def _add_baseline_aux_diagnostics(row: Dict, aux: Dict) -> None:
         "residual_planner_incremental_h2_risk",
         "residual_planner_h2_max_temperature",
         "residual_planner_h2_veto",
+        "residual_planner_policy_emergency",
+        "residual_planner_emergency_selected",
+        "residual_planner_thermal_risk_agg_is_max",
         "residual_planner_trust_region_rejected",
         "residual_planner_min_thermal_headroom",
         "residual_planner_effective_gain_uncertainty",
@@ -2044,6 +2057,14 @@ def _add_baseline_aux_diagnostics(row: Dict, aux: Dict) -> None:
         "structured_actor_per_source_clip_rate",
         "structured_actor_bus_clip_rate",
         "mode_effective_latent_dim",
+        "upper_shield_enabled",
+        "upper_shield_applied",
+        "upper_shield_requested_boost",
+        "upper_shield_selected_boost",
+        "upper_shield_allowed_anchor",
+        "upper_shield_allowed_ld1",
+        "upper_shield_allowed_ld2",
+        "upper_shield_allowed_all",
     ]
     string_keys = [
         "selected_template",
