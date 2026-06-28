@@ -47,6 +47,25 @@ def test_upper_dqn_random_selection_respects_action_mask():
         assert picked in {0, 1, 2}
 
 
+def test_upper_dqn_greedy_selection_respects_action_mask():
+    cfg = load_cfg("configs/default.yaml")
+    upper = UpperDQN(cfg, torch.device("cpu"))
+    q_vals = torch.arange(12, dtype=torch.float32).view(1, -1)
+
+    def fake_forward(self, obs, z):
+        return q_vals.expand(obs.shape[0], -1)
+
+    upper.q.forward = types.MethodType(fake_forward, upper.q)
+
+    obs = np.zeros(cfg["agent"]["obs_dim"], dtype=np.float32)
+    z = np.zeros(cfg["agent"]["z_dim"], dtype=np.float32)
+    action_mask = np.zeros(12, dtype=bool)
+    action_mask[[0, 1, 2]] = True
+
+    picked = upper.select_action(obs, z, t=10_000, eval_mode=True, action_mask=action_mask)
+    assert picked == 2
+
+
 def test_upper_dqn_uses_dueling_double_dqn_and_updates_with_exec_map():
     cfg = load_cfg("configs/default.yaml")
     cfg["agent"]["hidden_dim"] = 64
@@ -72,6 +91,10 @@ def test_upper_dqn_uses_dueling_double_dqn_and_updates_with_exec_map():
         "physical_features": np.random.randn(b, int(cfg["physical_context"]["input_dim"])).astype(np.float32),
         "physical_features_next": np.random.randn(b, int(cfg["physical_context"]["input_dim"])).astype(np.float32),
         "next_exec_map": np.tile(np.arange(int(cfg["agent"]["n_upper_actions"]), dtype=np.float32), (b, 1)),
+        "next_action_mask": np.tile(
+            np.asarray([1, 1, 1, 0, 0, 0, 1, 1, 1, 0, 0, 0], dtype=np.float32),
+            (b, 1),
+        ),
     }
 
     stats = upper.update(batch)

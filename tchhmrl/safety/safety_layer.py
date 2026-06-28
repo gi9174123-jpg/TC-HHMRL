@@ -132,15 +132,26 @@ class SafetyLayer:
             shield_cfg.get("always_allow_minimal_combo", shield_cfg.get("always_allow_anchor_only", True))
         )
         self.upper_shield_emergency_bypass_dwell = bool(shield_cfg.get("emergency_bypass_dwell", True))
+        self.upper_shield_hot_locked = np.zeros(3, dtype=bool)
 
     def state_dict(self) -> Dict:
-        return {"thermal_estimator": self.thermal_estimator.state_dict()}
+        return {
+            "thermal_estimator": self.thermal_estimator.state_dict(),
+            "upper_shield_hot_locked": self.upper_shield_hot_locked.astype(bool).copy(),
+        }
 
     def load_state_dict(self, state: Dict) -> None:
         if not state:
             return
         if "thermal_estimator" in state:
             self.thermal_estimator.load_state_dict(state["thermal_estimator"])
+        if "upper_shield_hot_locked" in state:
+            locked = np.asarray(state["upper_shield_hot_locked"], dtype=bool).reshape(-1)
+            self.upper_shield_hot_locked[:] = False
+            self.upper_shield_hot_locked[: min(3, locked.size)] = locked[:3]
+
+    def reset_runtime_state(self) -> None:
+        self.upper_shield_hot_locked[:] = False
 
     def update_thermal_estimator(
         self,
@@ -218,6 +229,7 @@ class SafetyLayer:
         *,
         temps: Optional[np.ndarray] = None,
         headroom: Optional[np.ndarray] = None,
+        update_latch: bool = True,
     ) -> np.ndarray:
         """Return a boost-combo mask from current thermal headroom.
 
@@ -233,11 +245,16 @@ class SafetyLayer:
         if hr is None:
             return allowed
 
-        disable_ld1 = bool(hr[1] < self.upper_shield_ld_headroom_disable_c)
-        disable_ld2 = bool(hr[2] < self.upper_shield_ld_headroom_disable_c)
-        if float(np.nanmin(hr[1:3])) < self.upper_shield_critical_headroom_c:
-            disable_ld1 = True
-            disable_ld2 = True
+        locked = self.upper_shield_hot_locked.copy()
+        for src in (1, 2):
+            if bool(hr[src] < self.upper_shield_ld_headroom_disable_c):
+                locked[src] = True
+            elif bool(hr[src] > self.upper_shield_ld_headroom_reenable_c):
+                locked[src] = False
+        if update_latch:
+            self.upper_shield_hot_locked[:] = locked
+        disable_ld1 = bool(locked[1] or hr[1] < self.upper_shield_critical_headroom_c)
+        disable_ld2 = bool(locked[2] or hr[2] < self.upper_shield_critical_headroom_c)
         if disable_ld1:
             allowed[[1, 3]] = False
         if disable_ld2:
@@ -255,8 +272,9 @@ class SafetyLayer:
         *,
         temps: Optional[np.ndarray] = None,
         headroom: Optional[np.ndarray] = None,
+        update_latch: bool = True,
     ) -> np.ndarray:
-        allowed_boost = self.upper_boost_allowed_mask(temps=temps, headroom=headroom)
+        allowed_boost = self.upper_boost_allowed_mask(temps=temps, headroom=headroom, update_latch=update_latch)
         mask = np.zeros(12, dtype=bool)
         for raw_idx in range(12):
             boost, _mode = self.decode_upper(raw_idx)
@@ -271,9 +289,10 @@ class SafetyLayer:
         *,
         temps: Optional[np.ndarray] = None,
         headroom: Optional[np.ndarray] = None,
+        update_latch: bool = True,
     ) -> Tuple[int, np.ndarray, bool]:
         desired_boost = int(np.clip(desired_boost, 0, 3))
-        allowed = self.upper_boost_allowed_mask(temps=temps, headroom=headroom)
+        allowed = self.upper_boost_allowed_mask(temps=temps, headroom=headroom, update_latch=update_latch)
         if bool(allowed[desired_boost]):
             return desired_boost, allowed, False
 
@@ -357,11 +376,17 @@ class SafetyLayer:
         *,
         temps: Optional[np.ndarray] = None,
         headroom: Optional[np.ndarray] = None,
+        update_latch: bool = True,
     ) -> Tuple[int, int]:
         """Preview next executed (boost, mode) without mutating agent memory."""
         mem_preview = dict(mem or {"current_boost": 0, "dwell_count": self.min_dwell_steps})
         desired_boost, mode = self.decode_upper(upper_raw)
-        desired_boost, _allowed, _shielded = self._shield_boost_combo(desired_boost, temps=temps, headroom=headroom)
+        desired_boost, _allowed, _shielded = self._shield_boost_combo(
+            desired_boost,
+            temps=temps,
+            headroom=headroom,
+            update_latch=update_latch,
+        )
         exec_boost, _ = self._apply_dwell(desired_boost, mem_preview, temps=temps, headroom=headroom)
         return int(exec_boost), int(mode)
 
@@ -371,10 +396,21 @@ class SafetyLayer:
         *,
         temps: Optional[np.ndarray] = None,
         headroom: Optional[np.ndarray] = None,
+        update_latch: bool = True,
     ) -> np.ndarray:
         exec_map = np.zeros(12, dtype=np.int64)
+        if update_latch:
+            # Update the hysteresis latch once for this state, then reuse the
+            # resulting mask for each raw-action preview below.
+            self.upper_boost_allowed_mask(temps=temps, headroom=headroom, update_latch=True)
         for raw_idx in range(12):
-            boost_exec, mode_exec = self.preview_exec(raw_idx, mem=mem, temps=temps, headroom=headroom)
+            boost_exec, mode_exec = self.preview_exec(
+                raw_idx,
+                mem=mem,
+                temps=temps,
+                headroom=headroom,
+                update_latch=False,
+            )
             exec_map[raw_idx] = self.encode_exec(boost_exec, mode_exec)
         return exec_map
 
@@ -921,6 +957,8 @@ class SafetyLayer:
             "upper_shield_allowed_ld1": float(bool(shield_allowed[1])),
             "upper_shield_allowed_ld2": float(bool(shield_allowed[2])),
             "upper_shield_allowed_all": float(bool(shield_allowed[3])),
+            "upper_shield_locked_ld1": float(bool(self.upper_shield_hot_locked[1])),
+            "upper_shield_locked_ld2": float(bool(self.upper_shield_hot_locked[2])),
             "currents_exec": currents.astype(np.float32),
             "rho_exec": float(rho),
             "tau_exec": float(tau),

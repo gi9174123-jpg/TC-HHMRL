@@ -277,6 +277,7 @@ class HierarchicalAgent:
         self.rollout_step = 0
         self.prev_projection_residual = np.zeros(5, dtype=np.float32)
         self.prev_bus_headroom = 1.0
+        self.safety.reset_runtime_state()
 
     def reset_episode_state(self) -> None:
         self.reset_rollout_state(clear_context=True)
@@ -735,6 +736,8 @@ class HierarchicalAgent:
             "upper_shield_allowed_ld1": safe.get("upper_shield_allowed_ld1", 1.0),
             "upper_shield_allowed_ld2": safe.get("upper_shield_allowed_ld2", 1.0),
             "upper_shield_allowed_all": safe.get("upper_shield_allowed_all", 1.0),
+            "upper_shield_locked_ld1": safe.get("upper_shield_locked_ld1", 0.0),
+            "upper_shield_locked_ld2": safe.get("upper_shield_locked_ld2", 0.0),
             "macro_new": bool(macro_new),
             "hold_left": int(self.upper_mem["hold_left"]),
             "rollout_step": int(planner_step),

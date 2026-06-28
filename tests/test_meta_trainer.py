@@ -301,7 +301,7 @@ def test_support_gate_reject_rolls_back_full_training_state(tmp_path):
     assert int(float(row["extra_query_evaluations"])) == 0
 
 
-def test_agent_mutable_snapshot_restores_thermal_estimator_state():
+def test_agent_mutable_snapshot_restores_safety_runtime_state():
     cfg = copy.deepcopy(load_cfg("configs/default.yaml"))
     cfg["experiment"]["device"] = "cpu"
     agent = HierarchicalAgent(cfg, torch.device("cpu"))
@@ -313,7 +313,11 @@ def test_agent_mutable_snapshot_restores_thermal_estimator_state():
         temps_after=np.array([35.0, 36.0, 37.0], dtype=np.float32),
         thermal_base=np.array([30.0, 30.0, 30.0], dtype=np.float32),
     )
+    agent.safety.upper_boost_allowed_mask(
+        temps=np.array([30.0, float(agent.safety.thermal_safe) - 0.5, 30.0], dtype=np.float32)
+    )
     assert np.any(agent.safety.thermal_diagnostics()["thermal_gain_valid_count"] > 0.0)
+    assert bool(agent.safety.upper_shield_hot_locked[1])
 
     agent.restore_mutable_state(snap)
     restored = agent.safety.thermal_diagnostics()
@@ -322,6 +326,7 @@ def test_agent_mutable_snapshot_restores_thermal_estimator_state():
         restored["thermal_gain_mean"],
         np.asarray(cfg["safety"]["effective_gain_initial"], dtype=np.float32),
     )
+    assert not bool(agent.safety.upper_shield_hot_locked[1])
 
 
 def test_support_gate_accept_keeps_adapted_parameters_without_extra_budget(tmp_path):

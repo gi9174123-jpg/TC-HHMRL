@@ -49,6 +49,31 @@ def test_upper_safety_shield_masks_only_thermally_unsafe_boosts():
     assert not np.any(raw_mask[9:12])
 
 
+def test_upper_safety_shield_uses_ld_hysteresis_reenable_threshold():
+    cfg = load_cfg("configs/default.yaml")
+    safety = SafetyLayer(cfg)
+
+    hot_ld1 = np.array([30.0, float(safety.thermal_safe) - 0.5, 30.0], dtype=np.float32)
+    mid_ld1 = np.array([30.0, float(safety.thermal_safe) - 1.5, 30.0], dtype=np.float32)
+    cool_ld1 = np.array([30.0, float(safety.thermal_safe) - 2.5, 30.0], dtype=np.float32)
+
+    assert not bool(safety.upper_boost_allowed_mask(temps=hot_ld1)[1])
+    assert bool(safety.upper_shield_hot_locked[1])
+    # Headroom above disable but below re-enable stays locked to avoid mask chatter.
+    assert not bool(safety.upper_boost_allowed_mask(temps=mid_ld1)[1])
+    assert bool(safety.upper_shield_hot_locked[1])
+    assert bool(safety.upper_boost_allowed_mask(temps=cool_ld1)[1])
+    assert not bool(safety.upper_shield_hot_locked[1])
+
+    safety.upper_boost_allowed_mask(temps=hot_ld1)
+    state = safety.state_dict()
+    restored = SafetyLayer(cfg)
+    restored.load_state_dict(state)
+    assert bool(restored.upper_shield_hot_locked[1])
+    restored.reset_runtime_state()
+    assert not bool(restored.upper_shield_hot_locked[1])
+
+
 def test_action_decode_tanh_affine_maps_tanh_outputs_to_fractions():
     cfg = copy.deepcopy(load_cfg("configs/default.yaml"))
     cfg["safety"]["action_decode_mode"] = "tanh_affine"

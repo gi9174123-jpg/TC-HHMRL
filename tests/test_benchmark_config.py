@@ -140,7 +140,9 @@ def test_formal_metadata_reports_model_aware_lower_components():
     assert meta["residual_planner_scoring"] == "target_critics_plus_constraint_worst_source_h1_h2_risk"
     assert meta["residual_planner_thermal_risk_agg"] == "max"
     assert meta["upper_safety_shield_enabled"] is True
-    assert meta["upper_safety_shield_rule"] == "thermal_headroom_action_mask_no_source_preference"
+    assert meta["upper_safety_shield_rule"] == "per_source_thermal_headroom_hysteresis_action_mask_no_source_preference"
+    assert meta["upper_safety_shield_ld_headroom_reenable_c"] == 2.0
+    assert meta["upper_safety_shield_minimal_combo_fallback"] is True
     assert meta["residual_planner_trust_region_enabled"] is False
     assert meta["residual_planner_replacement_margin_mode"] == "normalized"
     assert meta["residual_planner_replacement_margin"] is None

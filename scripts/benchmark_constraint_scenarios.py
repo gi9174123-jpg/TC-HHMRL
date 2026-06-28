@@ -397,10 +397,16 @@ def formal_metadata_snapshot(cfg: Dict, *, pre_alignment: bool | None = None, ta
             or planner_cfg.get("trust_region_exec_l2", None) is not None
         ),
         "upper_safety_shield_enabled": bool(cfg.get("upper_safety_shield", {}).get("enabled", False)),
-        "upper_safety_shield_rule": "thermal_headroom_action_mask_no_source_preference",
+        "upper_safety_shield_rule": "per_source_thermal_headroom_hysteresis_action_mask_no_source_preference",
         "upper_safety_shield_uses_query": False,
         "upper_safety_shield_ld_headroom_disable_c": float(
             cfg.get("upper_safety_shield", {}).get("ld_headroom_disable_c", 0.0) or 0.0
+        ),
+        "upper_safety_shield_ld_headroom_reenable_c": float(
+            cfg.get("upper_safety_shield", {}).get("ld_headroom_reenable_c", 0.0) or 0.0
+        ),
+        "upper_safety_shield_minimal_combo_fallback": bool(
+            cfg.get("upper_safety_shield", {}).get("always_allow_minimal_combo", True)
         ),
         "upper_double_dqn": bool(upper_cfg.get("double_dqn", False)),
         "upper_dueling_dqn": bool(upper_cfg.get("dueling", False)),
@@ -2065,6 +2071,8 @@ def _add_baseline_aux_diagnostics(row: Dict, aux: Dict) -> None:
         "upper_shield_allowed_ld1",
         "upper_shield_allowed_ld2",
         "upper_shield_allowed_all",
+        "upper_shield_locked_ld1",
+        "upper_shield_locked_ld2",
     ]
     string_keys = [
         "selected_template",

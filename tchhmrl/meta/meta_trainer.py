@@ -94,6 +94,8 @@ class EpisodeStats:
     upper_shield_ld1_disabled_rate: float = 0.0
     upper_shield_ld2_disabled_rate: float = 0.0
     upper_shield_all_disabled_rate: float = 0.0
+    upper_shield_ld1_locked_rate: float = 0.0
+    upper_shield_ld2_locked_rate: float = 0.0
 
 
 class MetaTrainer:
@@ -391,6 +393,12 @@ class MetaTrainer:
                 return float("inf")
             diff = np.where(ref_nan & cur_nan, 0.0, cur - ref)
             total += float(np.sum(diff * diff))
+        ref_locked = np.asarray((reference or {}).get("upper_shield_hot_locked", []), dtype=np.float32).reshape(-1)
+        cur_locked = np.asarray((current or {}).get("upper_shield_hot_locked", []), dtype=np.float32).reshape(-1)
+        if ref_locked.shape != cur_locked.shape:
+            return float("inf")
+        lock_diff = cur_locked - ref_locked
+        total += float(np.sum(lock_diff * lock_diff))
         return float(np.sqrt(total))
 
     @staticmethod
@@ -588,6 +596,8 @@ class MetaTrainer:
         ep_upper_shield_ld1_disabled = 0.0
         ep_upper_shield_ld2_disabled = 0.0
         ep_upper_shield_all_disabled = 0.0
+        ep_upper_shield_ld1_locked = 0.0
+        ep_upper_shield_ld2_locked = 0.0
 
         macro_start_obs = None
         macro_start_z = None
@@ -889,6 +899,8 @@ class MetaTrainer:
             ep_upper_shield_ld1_disabled += float(float(aux.get("upper_shield_allowed_ld1", 1.0)) < 0.5)
             ep_upper_shield_ld2_disabled += float(float(aux.get("upper_shield_allowed_ld2", 1.0)) < 0.5)
             ep_upper_shield_all_disabled += float(float(aux.get("upper_shield_allowed_all", 1.0)) < 0.5)
+            ep_upper_shield_ld1_locked += float(float(aux.get("upper_shield_locked_ld1", 0.0)) > 0.5)
+            ep_upper_shield_ld2_locked += float(float(aux.get("upper_shield_locked_ld2", 0.0)) > 0.5)
 
             obs = next_obs
 
@@ -967,6 +979,8 @@ class MetaTrainer:
             upper_shield_ld1_disabled_rate=ep_upper_shield_ld1_disabled / ep_len_safe,
             upper_shield_ld2_disabled_rate=ep_upper_shield_ld2_disabled / ep_len_safe,
             upper_shield_all_disabled_rate=ep_upper_shield_all_disabled / ep_len_safe,
+            upper_shield_ld1_locked_rate=ep_upper_shield_ld1_locked / ep_len_safe,
+            upper_shield_ld2_locked_rate=ep_upper_shield_ld2_locked / ep_len_safe,
         )
 
     def train(self, meta_iters: int | None = None) -> Path:
@@ -1588,6 +1602,8 @@ class MetaTrainer:
                 "upper_shield_ld1_disabled_rate",
                 "upper_shield_ld2_disabled_rate",
                 "upper_shield_all_disabled_rate",
+                "upper_shield_ld1_locked_rate",
+                "upper_shield_ld2_locked_rate",
             ]
             for prefix, stats_group in (("support", support_stats), ("query", query_stats)):
                 for name in diagnostic_names:
