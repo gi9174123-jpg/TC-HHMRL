@@ -682,7 +682,7 @@ class SafetyLayer:
         amb_temp: float,
         gamma: float | None = None,
         delta: float | None = None,
-    ) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+    ) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray, float]:
         base, coupling = self._thermal_base_np(temps, amb_temp, gamma)
         allowed_rise = self.thermal_safe - self.thermal_cap_margin_c - base
         denom = self._safe_thermal_coeff_np() + 1.0e-6
@@ -723,6 +723,7 @@ class SafetyLayer:
         active = (np.asarray(active_mask, dtype=np.float32) > 0.5).astype(np.float32)
         cap = np.minimum(cap, self.current_max * active).astype(np.float32)
         safe_currents = np.minimum(safe_currents, cap).astype(np.float32)
+        clipped_total = float(np.sum(safe_currents))
         shortage = float(max(0.0, min(float(target_total), self.bus_current_max) - float(np.sum(safe_currents))))
         if shortage > 1.0e-8:
             available = np.maximum(cap - safe_currents, 0.0).astype(np.float32) * active
@@ -739,12 +740,14 @@ class SafetyLayer:
         recovered_total = float(np.sum(safe_currents))
         if recovered_total > self.bus_current_max:
             safe_currents *= self._hard_bus_scale_np(recovered_total)
+            recovered_total = float(np.sum(safe_currents))
+        recovered_added = float(max(0.0, recovered_total - clipped_total))
         scale = np.where(
             currents > 1.0e-6,
             safe_currents / np.maximum(currents, 1.0e-6),
             np.where(safe_currents > 1.0e-6, 1.0, 0.0),
         ).astype(np.float32)
-        return safe_currents.astype(np.float32), cap.astype(np.float32), scale, base, coupling
+        return safe_currents.astype(np.float32), cap.astype(np.float32), scale, base, coupling, recovered_added
 
     def _thermal_cap_torch(
         self,
@@ -756,7 +759,7 @@ class SafetyLayer:
         delta: torch.Tensor | None = None,
         current_max: torch.Tensor,
         thermal_coeff: torch.Tensor,
-    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
         base, coupling = self._thermal_base_torch(temps, amb_temp, gamma)
         allowed_rise = self.thermal_safe - self.thermal_cap_margin_c - base
         denom = thermal_coeff + 1.0e-6
@@ -795,6 +798,7 @@ class SafetyLayer:
         active = (active_mask > 0.5).to(currents.dtype)
         cap = torch.minimum(cap, current_max * active)
         safe_currents = torch.minimum(safe_currents, cap)
+        clipped_total = safe_currents.sum(dim=1)
         shortage = torch.clamp(
             torch.minimum(target_total, torch.full_like(target_total, self.bus_current_max))
             - safe_currents.sum(dim=1, keepdim=True),
@@ -811,12 +815,13 @@ class SafetyLayer:
         safe_currents = torch.minimum(safe_currents, cap)
         total = safe_currents.sum(dim=1, keepdim=True)
         safe_currents = safe_currents * self._hard_bus_scale_torch(total)
+        recovered_added = torch.clamp(safe_currents.sum(dim=1) - clipped_total, min=0.0)
         scale = torch.where(
             currents > 1.0e-6,
             safe_currents / torch.clamp(currents, min=1.0e-6),
             torch.where(safe_currents > 1.0e-6, torch.ones_like(currents), torch.zeros_like(currents)),
         )
-        return safe_currents, cap, scale, base, coupling
+        return safe_currents, cap, scale, base, coupling, recovered_added
 
     @staticmethod
     def _project_mode_params_np(mode: int, rho_raw: float, tau_raw: float) -> Tuple[float, float]:
@@ -899,6 +904,7 @@ class SafetyLayer:
         T_pred = thermal_base + thermal_coeff_safe_np * (currents**2)
         thermal_cap_current = self.current_max.astype(np.float32)
         thermal_cap_scale = np.ones_like(currents, dtype=np.float32)
+        qos_recovered_current = 0.0
 
         if self.projection_mode in {"smooth", "smooth_relaxed"}:
             gap = self.thermal_safe - T_pred
@@ -919,7 +925,14 @@ class SafetyLayer:
             soft_scale = thermal_scale.astype(np.float32)
             cutoff_scale = np.ones_like(currents, dtype=np.float32)
         elif self.projection_mode == "qos_aware_hard_clip":
-            currents, thermal_cap_current, thermal_scale, thermal_base, thermal_source_term = self._qos_aware_hard_clip_np(
+            (
+                currents,
+                thermal_cap_current,
+                thermal_scale,
+                thermal_base,
+                thermal_source_term,
+                qos_recovered_current,
+            ) = self._qos_aware_hard_clip_np(
                 currents=currents,
                 target_total=bus_projected_current_total,
                 active_mask=active_mask,
@@ -943,6 +956,11 @@ class SafetyLayer:
             currents *= thermal_scale
         projected_current_total = float(np.sum(currents))
         projection_compression_ratio = float(projected_current_total / max(raw_current_total, 1.0e-6))
+        projection_compression_ratio_per_source = np.where(
+            current_requested > 1.0e-6,
+            currents / np.maximum(current_requested, 1.0e-6),
+            np.where(currents > 1.0e-6, 1.0, 0.0),
+        ).astype(np.float32)
         thermal_margin = (self.thermal_safe - T_pred).astype(np.float32)
 
         out = {
@@ -992,6 +1010,8 @@ class SafetyLayer:
             "bus_projected_current_total": bus_projected_current_total,
             "projected_current_total": projected_current_total,
             "projection_compression_ratio": projection_compression_ratio,
+            "projection_compression_ratio_per_source": projection_compression_ratio_per_source,
+            "qos_recovered_current": float(qos_recovered_current),
             "current_requested": current_requested.astype(np.float32),
             "current_requested_pre_static_cap": np.asarray(
                 current_aux.get("current_requested_pre_static_cap", current_requested),
@@ -1086,6 +1106,7 @@ class SafetyLayer:
         T_pred = thermal_base + thermal_coeff * (currents**2)
         thermal_cap_current = current_max.expand_as(currents)
         thermal_cap_scale = torch.ones_like(currents)
+        qos_recovered_current = torch.zeros((lower_raw.shape[0],), dtype=lower_raw.dtype, device=device)
         if self.projection_mode in {"smooth", "smooth_relaxed"}:
             gap = self.thermal_safe - T_pred
             soft_scale = torch.sigmoid(self.soft_alpha * gap)
@@ -1106,7 +1127,14 @@ class SafetyLayer:
             soft_scale = thermal_scale
             cutoff_scale = torch.ones_like(currents)
         elif self.projection_mode == "qos_aware_hard_clip":
-            currents, thermal_cap_current, thermal_scale, thermal_base, thermal_source_term = self._qos_aware_hard_clip_torch(
+            (
+                currents,
+                thermal_cap_current,
+                thermal_scale,
+                thermal_base,
+                thermal_source_term,
+                qos_recovered_current,
+            ) = self._qos_aware_hard_clip_torch(
                 currents=currents,
                 target_total=bus_projected_current_total.view(-1, 1),
                 active_mask=active_mask,
@@ -1135,6 +1163,11 @@ class SafetyLayer:
             currents = currents * thermal_scale
         projected_current_total = currents.sum(dim=1)
         projection_compression_ratio = projected_current_total / torch.clamp(raw_current_total, min=1.0e-6)
+        projection_compression_ratio_per_source = torch.where(
+            current_requested > 1.0e-6,
+            currents / torch.clamp(current_requested, min=1.0e-6),
+            torch.where(currents > 1.0e-6, torch.ones_like(currents), torch.zeros_like(currents)),
+        )
         thermal_margin = self.thermal_safe - T_pred
 
         out = {
@@ -1177,6 +1210,8 @@ class SafetyLayer:
             "bus_projected_current_total": bus_projected_current_total,
             "projected_current_total": projected_current_total,
             "projection_compression_ratio": projection_compression_ratio,
+            "projection_compression_ratio_per_source": projection_compression_ratio_per_source,
+            "qos_recovered_current": qos_recovered_current,
             "current_requested": current_requested,
             "current_requested_pre_static_cap": current_aux.get("current_requested_pre_static_cap", current_requested),
             "actor_total_current_requested": current_aux["actor_total_current_requested"],

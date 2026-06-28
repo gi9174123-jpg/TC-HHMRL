@@ -96,6 +96,22 @@ class EpisodeStats:
     upper_shield_all_disabled_rate: float = 0.0
     upper_shield_ld1_locked_rate: float = 0.0
     upper_shield_ld2_locked_rate: float = 0.0
+    current_requested0_mean: float = 0.0
+    current_requested1_mean: float = 0.0
+    current_requested2_mean: float = 0.0
+    current_exec0_mean: float = 0.0
+    current_exec1_mean: float = 0.0
+    current_exec2_mean: float = 0.0
+    thermal_cap_current0_mean: float = 0.0
+    thermal_cap_current1_mean: float = 0.0
+    thermal_cap_current2_mean: float = 0.0
+    predicted_headroom0_mean: float = 0.0
+    predicted_headroom1_mean: float = 0.0
+    predicted_headroom2_mean: float = 0.0
+    compression_ratio0_mean: float = 0.0
+    compression_ratio1_mean: float = 0.0
+    compression_ratio2_mean: float = 0.0
+    qos_recovered_current_mean: float = 0.0
 
 
 class MetaTrainer:
@@ -598,6 +614,12 @@ class MetaTrainer:
         ep_upper_shield_all_disabled = 0.0
         ep_upper_shield_ld1_locked = 0.0
         ep_upper_shield_ld2_locked = 0.0
+        ep_current_requested = np.zeros(3, dtype=np.float32)
+        ep_current_exec = np.zeros(3, dtype=np.float32)
+        ep_thermal_cap_current = np.zeros(3, dtype=np.float32)
+        ep_predicted_headroom = np.zeros(3, dtype=np.float32)
+        ep_compression_ratio = np.zeros(3, dtype=np.float32)
+        ep_qos_recovered_current = 0.0
 
         macro_start_obs = None
         macro_start_z = None
@@ -901,6 +923,25 @@ class MetaTrainer:
             ep_upper_shield_all_disabled += float(float(aux.get("upper_shield_allowed_all", 1.0)) < 0.5)
             ep_upper_shield_ld1_locked += float(float(aux.get("upper_shield_locked_ld1", 0.0)) > 0.5)
             ep_upper_shield_ld2_locked += float(float(aux.get("upper_shield_locked_ld2", 0.0)) > 0.5)
+            current_requested = np.asarray(aux.get("current_requested", np.zeros(3, dtype=np.float32)), dtype=np.float32).reshape(-1)[:3]
+            current_exec = np.asarray(aux.get("currents_exec", aux.get("act_exec", np.zeros(5, dtype=np.float32))[:3]), dtype=np.float32).reshape(-1)[:3]
+            thermal_cap_current = np.asarray(aux.get("thermal_cap_current", np.zeros(3, dtype=np.float32)), dtype=np.float32).reshape(-1)[:3]
+            predicted_headroom = np.asarray(aux.get("thermal_pred_margin", np.zeros(3, dtype=np.float32)), dtype=np.float32).reshape(-1)[:3]
+            compression_ratio = np.asarray(
+                aux.get("projection_compression_ratio_per_source", np.zeros(3, dtype=np.float32)),
+                dtype=np.float32,
+            ).reshape(-1)[:3]
+            if current_requested.size == 3:
+                ep_current_requested += current_requested
+            if current_exec.size == 3:
+                ep_current_exec += current_exec
+            if thermal_cap_current.size == 3:
+                ep_thermal_cap_current += thermal_cap_current
+            if predicted_headroom.size == 3:
+                ep_predicted_headroom += predicted_headroom
+            if compression_ratio.size == 3:
+                ep_compression_ratio += compression_ratio
+            ep_qos_recovered_current += float(aux.get("qos_recovered_current", 0.0))
 
             obs = next_obs
 
@@ -981,6 +1022,22 @@ class MetaTrainer:
             upper_shield_all_disabled_rate=ep_upper_shield_all_disabled / ep_len_safe,
             upper_shield_ld1_locked_rate=ep_upper_shield_ld1_locked / ep_len_safe,
             upper_shield_ld2_locked_rate=ep_upper_shield_ld2_locked / ep_len_safe,
+            current_requested0_mean=float(ep_current_requested[0]) / ep_len_safe,
+            current_requested1_mean=float(ep_current_requested[1]) / ep_len_safe,
+            current_requested2_mean=float(ep_current_requested[2]) / ep_len_safe,
+            current_exec0_mean=float(ep_current_exec[0]) / ep_len_safe,
+            current_exec1_mean=float(ep_current_exec[1]) / ep_len_safe,
+            current_exec2_mean=float(ep_current_exec[2]) / ep_len_safe,
+            thermal_cap_current0_mean=float(ep_thermal_cap_current[0]) / ep_len_safe,
+            thermal_cap_current1_mean=float(ep_thermal_cap_current[1]) / ep_len_safe,
+            thermal_cap_current2_mean=float(ep_thermal_cap_current[2]) / ep_len_safe,
+            predicted_headroom0_mean=float(ep_predicted_headroom[0]) / ep_len_safe,
+            predicted_headroom1_mean=float(ep_predicted_headroom[1]) / ep_len_safe,
+            predicted_headroom2_mean=float(ep_predicted_headroom[2]) / ep_len_safe,
+            compression_ratio0_mean=float(ep_compression_ratio[0]) / ep_len_safe,
+            compression_ratio1_mean=float(ep_compression_ratio[1]) / ep_len_safe,
+            compression_ratio2_mean=float(ep_compression_ratio[2]) / ep_len_safe,
+            qos_recovered_current_mean=ep_qos_recovered_current / ep_len_safe,
         )
 
     def train(self, meta_iters: int | None = None) -> Path:
@@ -1604,6 +1661,22 @@ class MetaTrainer:
                 "upper_shield_all_disabled_rate",
                 "upper_shield_ld1_locked_rate",
                 "upper_shield_ld2_locked_rate",
+                "current_requested0_mean",
+                "current_requested1_mean",
+                "current_requested2_mean",
+                "current_exec0_mean",
+                "current_exec1_mean",
+                "current_exec2_mean",
+                "thermal_cap_current0_mean",
+                "thermal_cap_current1_mean",
+                "thermal_cap_current2_mean",
+                "predicted_headroom0_mean",
+                "predicted_headroom1_mean",
+                "predicted_headroom2_mean",
+                "compression_ratio0_mean",
+                "compression_ratio1_mean",
+                "compression_ratio2_mean",
+                "qos_recovered_current_mean",
             ]
             for prefix, stats_group in (("support", support_stats), ("query", query_stats)):
                 for name in diagnostic_names:

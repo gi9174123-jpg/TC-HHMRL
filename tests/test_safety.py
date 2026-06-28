@@ -433,12 +433,19 @@ def test_safety_thermal_cap_numpy_torch_consistency():
         delta=torch.tensor([4.0]),
     )
 
-    for key in ["currents_exec", "thermal_cap_scale", "t_pred"]:
+    for key in ["currents_exec", "thermal_cap_scale", "t_pred", "projection_compression_ratio_per_source"]:
         assert np.allclose(
             np_out[key],
             torch_out[key].detach().cpu().numpy().reshape(-1),
             atol=1e-5,
         )
+    assert np.isfinite(float(np_out["qos_recovered_current"]))
+    assert np.all(np.isfinite(np.asarray(np_out["projection_compression_ratio_per_source"], dtype=np.float32)))
+    assert np.allclose(
+        float(np_out["qos_recovered_current"]),
+        float(torch_out["qos_recovered_current"].detach().cpu().numpy().reshape(-1)[0]),
+        atol=1e-5,
+    )
 
 
 def test_qos_aware_hard_clip_numpy_torch_consistency():

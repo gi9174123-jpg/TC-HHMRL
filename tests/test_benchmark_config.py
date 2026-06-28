@@ -428,6 +428,26 @@ def test_ablation_qos_aware_hard_clip_sets_fair_projection_metadata():
     assert "non_oracle_current_recovery" in cfg["pilot_metadata"]["qos_recovery_rule"]
 
 
+def test_ablation_qos_recovery_relaxed_shield_sets_pilot_metadata():
+    cfg = load_cfg("configs/default.yaml")
+    cfg = copy.deepcopy(cfg)
+    apply_ablation(cfg, "qos_recovery_relaxed_shield")
+
+    shield = cfg["upper_safety_shield"]
+    assert cfg["safety"]["projection_mode"] == "qos_aware_hard_clip"
+    assert shield["enabled"] is True
+    assert float(shield["ld_headroom_disable_c"]) == 0.5
+    assert float(shield["ld_headroom_reenable_c"]) == 1.0
+    assert float(shield["critical_headroom_c"]) == 0.10
+    assert shield["always_allow_minimal_combo"] is True
+    assert shield["emergency_bypass_dwell"] is True
+    assert cfg["pilot_metadata"]["comparison_role"] == "hard_stress_mechanism_probe"
+    assert cfg["pilot_metadata"]["pilot_only"] is True
+    assert cfg["pilot_metadata"]["formal_ranking_exclude"] is True
+    assert cfg["pilot_metadata"]["upper_shield_protocol"] == "relaxed_per_source_headroom_hysteresis"
+    assert "non_oracle_current_recovery" in cfg["pilot_metadata"]["qos_recovery_rule"]
+
+
 def test_ablation_smooth_relaxed_sets_pilot_metadata():
     cfg = load_cfg("configs/default.yaml")
     cfg = copy.deepcopy(cfg)

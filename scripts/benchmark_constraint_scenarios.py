@@ -640,6 +640,31 @@ def apply_ablation(cfg: Dict, ablation: str) -> None:
             "projection_objective": "preserve feasible executed current after hard thermal and bus clipping",
         }
         return
+    if ablation == "qos_recovery_relaxed_shield":
+        cfg.setdefault("safety", {})["projection_mode"] = "qos_aware_hard_clip"
+        shield_cfg = cfg.setdefault("upper_safety_shield", {})
+        shield_cfg["enabled"] = True
+        shield_cfg["ld_headroom_disable_c"] = 0.5
+        shield_cfg["ld_headroom_reenable_c"] = 1.0
+        shield_cfg["critical_headroom_c"] = 0.10
+        shield_cfg["always_allow_minimal_combo"] = True
+        shield_cfg["emergency_bypass_dwell"] = True
+        cfg["pilot_metadata"] = {
+            "projection_variant": "qos_aware_hard_clip",
+            "upper_shield_protocol": "relaxed_per_source_headroom_hysteresis",
+            "pilot_only": True,
+            "formal_ranking_exclude": True,
+            "comparison_role": "hard_stress_mechanism_probe",
+            "strong_safety_baseline": False,
+            "oracle_future_disturbances": False,
+            "qos_recovery_rule": "non_oracle_current_recovery_to_active_sources_with_thermal_and_bus_headroom",
+            "shield_disable_c": 0.5,
+            "shield_reenable_c": 1.0,
+            "critical_headroom_c": 0.10,
+            "projection_objective": "test_qos_recovery_inside_safe_feasible_set_with_relaxed_upper_shield",
+        }
+        sync_site_bank_with_cfg(cfg)
+        return
     if ablation == "smooth_relaxed":
         cfg.setdefault("safety", {})["projection_mode"] = "smooth_relaxed"
         cfg.setdefault("safety", {})["smooth_relaxed_margin_c"] = float(
@@ -1859,6 +1884,8 @@ def _safe_projection_aux(safe: Dict) -> Dict[str, object]:
         "bus_projected_current_total": safe.get("bus_projected_current_total"),
         "projected_current_total": safe.get("projected_current_total"),
         "projection_compression_ratio": safe.get("projection_compression_ratio"),
+        "projection_compression_ratio_per_source": safe.get("projection_compression_ratio_per_source"),
+        "qos_recovered_current": safe.get("qos_recovered_current"),
         "adaptive_thermal_enabled": safe.get("adaptive_thermal_enabled"),
         "thermal_gain_mean": safe.get("thermal_gain_mean"),
         "thermal_gain_std": safe.get("thermal_gain_std"),
@@ -1913,6 +1940,7 @@ def _add_projection_diagnostics(row: Dict, aux: Dict, currents_exec: np.ndarray)
     row["bus_projected_current_total"] = _projection_scalar(aux, "bus_projected_current_total")
     row["projected_current_total"] = _projection_scalar(aux, "projected_current_total", projected_default)
     row["projection_compression_ratio"] = _projection_scalar(aux, "projection_compression_ratio")
+    row["qos_recovered_current"] = _projection_scalar(aux, "qos_recovered_current", 0.0)
     row["thermal_margin_min"] = _projection_scalar(aux, "thermal_margin_min")
     row["thermal_cap_margin_c"] = _projection_scalar(aux, "thermal_cap_margin_c")
     row["adaptive_thermal_enabled"] = bool(aux.get("adaptive_thermal_enabled", row.get("adaptive_thermal_enabled", False)))
@@ -1925,6 +1953,7 @@ def _add_projection_diagnostics(row: Dict, aux: Dict, currents_exec: np.ndarray)
     for prefix, key in [
         ("current_requested", "current_requested"),
         ("current_requested_pre_static_cap", "current_requested_pre_static_cap"),
+        ("projection_compression_ratio_per_source", "projection_compression_ratio_per_source"),
     ]:
         arr = _projection_vector(aux, key)
         for tx_idx, val in enumerate(arr.tolist()):
@@ -4179,6 +4208,7 @@ HARD_TARGETED_VARIANT_ORDER = (
     "hybrid_wo_lagrangian",
     "hybrid_hard_clip",
     "hybrid_qos_aware_hard_clip",
+    "hybrid_qos_recovery_relaxed_shield",
     "heuristic_safe",
     "sac_lagrangian",
     "shin2024_adapted_codebook",
@@ -5095,6 +5125,11 @@ def run_one_scenario(
                     "projection_variant": str(pilot_meta.get("projection_variant", "")),
                     "pilot_only": pilot_only,
                     "formal_ranking_exclude": formal_ranking_exclude,
+                    "upper_shield_protocol": str(pilot_meta.get("upper_shield_protocol", "")),
+                    "shield_disable_c": pilot_meta.get("shield_disable_c"),
+                    "shield_reenable_c": pilot_meta.get("shield_reenable_c"),
+                    "critical_headroom_c": pilot_meta.get("critical_headroom_c"),
+                    "projection_objective": str(pilot_meta.get("projection_objective", "")),
                     "smooth_relaxed_margin_c": pilot_meta.get("smooth_relaxed_margin_c"),
                     "thermal_cap_margin_c": pilot_meta.get("thermal_cap_margin_c"),
                     "formally_comparable": formally_comparable,
@@ -5390,6 +5425,7 @@ def run_one_scenario(
             is_meta_ungated = ablation == "meta_ungated"
             is_hard_clip = ablation == "hard_clip"
             is_qos_aware_hard_clip = ablation == "qos_aware_hard_clip"
+            is_qos_recovery_relaxed = ablation == "qos_recovery_relaxed_shield"
             hybrid_meta_enabled = ablation != "wo_meta"
             hybrid_gate_enabled = bool(hybrid_meta_enabled and not is_meta_ungated)
             projection_variant = (
@@ -5401,6 +5437,8 @@ def run_one_scenario(
                 if is_hard_clip
                 else "qos_aware_feasible_hard_projection"
                 if is_qos_aware_hard_clip
+                else "qos_aware_hard_clip_with_relaxed_upper_shield"
+                if is_qos_recovery_relaxed
                 else ""
             )
             comparison_role = (
@@ -5410,6 +5448,8 @@ def run_one_scenario(
                 if is_hard_clip
                 else "fair_hard_projection_baseline"
                 if is_qos_aware_hard_clip
+                else "hard_stress_mechanism_probe"
+                if is_qos_recovery_relaxed
                 else "ungated_meta_ablation"
                 if is_meta_ungated
                 else "full_method"
@@ -5423,8 +5463,8 @@ def run_one_scenario(
                 "tx_device": ["LED", "LD", "LD"],
                 "tx_enabled": [1.0, 1.0, 1.0],
                 "projection_variant": projection_variant,
-                "pilot_only": True if (is_smooth_relaxed or is_thermal_cap) else None,
-                "formal_ranking_exclude": True if (is_smooth_relaxed or is_thermal_cap) else None,
+                "pilot_only": True if (is_smooth_relaxed or is_thermal_cap or is_qos_recovery_relaxed) else None,
+                "formal_ranking_exclude": True if (is_smooth_relaxed or is_thermal_cap or is_qos_recovery_relaxed) else None,
                 "comparison_role": comparison_role,
                 "baseline_family": "hybrid_full" if ablation == "full" else label,
                 "meta_learning": bool(hybrid_meta_enabled),
@@ -5436,14 +5476,22 @@ def run_one_scenario(
                 "support_gate_extra_rollouts": definition_gate_extra_rollouts if hybrid_gate_enabled else 0,
                 "support_gate_extra_gradient_updates": 0,
                 "support_gate_extra_query_evaluations": 0,
-                "strong_safety_baseline": True if is_qos_aware_hard_clip else False if is_hard_clip else None,
+                "strong_safety_baseline": True if is_qos_aware_hard_clip else False if (is_hard_clip or is_qos_recovery_relaxed) else None,
                 "qos_recovery_rule": (
                     "non_oracle_current_recovery_to_active_sources_with_thermal_and_bus_headroom"
-                    if is_qos_aware_hard_clip
+                    if (is_qos_aware_hard_clip or is_qos_recovery_relaxed)
                     else "none_componentwise_zero_if_thermal_infeasible"
                     if is_hard_clip
                     else ""
                 ),
+                "upper_shield_protocol": (
+                    "relaxed_per_source_headroom_hysteresis"
+                    if is_qos_recovery_relaxed
+                    else ""
+                ),
+                "shield_disable_c": 0.5 if is_qos_recovery_relaxed else None,
+                "shield_reenable_c": 1.0 if is_qos_recovery_relaxed else None,
+                "critical_headroom_c": 0.10 if is_qos_recovery_relaxed else None,
                 "description": (
                     "Pilot-only projection sensitivity: full Hybrid with thermal-cap current projection."
                     if is_thermal_cap
@@ -5453,6 +5501,8 @@ def run_one_scenario(
                     if is_hard_clip
                     else "QoS-aware feasible hard projection baseline with non-oracle current recovery under thermal and bus headroom."
                     if is_qos_aware_hard_clip
+                    else "Pilot hard-stress mechanism probe: relaxed upper shield plus QoS-aware hard clipping to test recovery inside the safe feasible set."
+                    if is_qos_recovery_relaxed
                     else "Ungated meta ablation: support update is always accepted without rollback."
                     if is_meta_ungated
                     else "Full hierarchical method on the fixed heterogeneous hybrid structure"
@@ -5953,6 +6003,7 @@ def parse_args() -> argparse.Namespace:
             "wo_lagrangian",
             "hard_clip",
             "qos_aware_hard_clip",
+            "qos_recovery_relaxed_shield",
             "smooth_relaxed",
             "thermal_cap",
         ],
