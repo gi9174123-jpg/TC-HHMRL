@@ -582,6 +582,47 @@ def apply_variant(cfg: Dict, variant: str) -> None:
     raise ValueError(f"Unknown variant: {variant}")
 
 
+def disable_support_gate_for_compat_probe(cfg: Dict) -> None:
+    """Disable support-update rollback while removing its validation budget."""
+    meta_cfg = cfg.setdefault("meta", {})
+    meta_cfg["support_gate_validation_episodes"] = 0
+    meta_cfg["support_update_acceptance"] = "unconditional"
+    gate_cfg = meta_cfg.setdefault("support_gate", {})
+    gate_cfg.setdefault("role", "rollback_guard")
+    gate_cfg["enabled"] = False
+    gate_cfg["paired_validation"] = False
+    gate_cfg["query_leakage"] = False
+    gate_cfg["budget_mode"] = "support_gate_disabled"
+    gate_cfg["extra_support_rollouts"] = 0
+    gate_cfg["extra_gradient_updates"] = 0
+    gate_cfg["extra_query_evaluations"] = 0
+
+
+def set_compatibility_probe_metadata(cfg: Dict, *, changed_mechanisms: List[str]) -> None:
+    meta_cfg = cfg.get("meta", {}) or {}
+    gate_cfg = meta_cfg.get("support_gate", {}) or {}
+    shield_cfg = cfg.get("upper_safety_shield", {}) or {}
+    planner_cfg = cfg.get("residual_planner", {}) or {}
+    safety_cfg = cfg.get("safety", {}) or {}
+    cfg["pilot_metadata"] = {
+        "compatibility_probe": True,
+        "compatibility_changed_mechanisms": list(changed_mechanisms),
+        "pilot_only": True,
+        "formal_ranking_exclude": True,
+        "comparison_role": "full_compatibility_mechanism_probe",
+        "projection_variant": str(safety_cfg.get("projection_mode", "")),
+        "compat_query_updates_enabled": bool(meta_cfg.get("query_updates_enabled", True)),
+        "compat_query_context_updates_enabled": bool(meta_cfg.get("query_context_updates_enabled", True)),
+        "compat_support_gate_enabled": bool(gate_cfg.get("enabled", False)),
+        "compat_support_gate_budget_mode": str(gate_cfg.get("budget_mode", "")),
+        "compat_support_gate_extra_rollouts": int(gate_cfg.get("extra_support_rollouts", 0) or 0),
+        "compat_upper_shield_enabled": bool(shield_cfg.get("enabled", False)),
+        "compat_residual_planner_enabled": bool(planner_cfg.get("enabled", False)),
+        "compat_current_decoder": str(safety_cfg.get("current_decoder", "")),
+        "projection_objective": "isolate_new_full_mechanism_interactions_against_the_old_full_performance_reference",
+    }
+
+
 def apply_ablation(cfg: Dict, ablation: str) -> None:
     ablation = str(ablation)
     if ablation == "full":
@@ -802,6 +843,53 @@ def apply_ablation(cfg: Dict, ablation: str) -> None:
             "execution_guard_fallback": "best_safe_combo_else_anchor_clamp",
             "projection_objective": "test_mildly_tightened_qos_recovery_execution_guard_for_anchor_and_ld2_cost",
         }
+        sync_site_bank_with_cfg(cfg)
+        return
+    if ablation == "full_compat_query_update_on":
+        meta_cfg = cfg.setdefault("meta", {})
+        meta_cfg["query_updates_enabled"] = True
+        meta_cfg["query_context_updates_enabled"] = True
+        set_compatibility_probe_metadata(cfg, changed_mechanisms=["query_updates_enabled"])
+        sync_site_bank_with_cfg(cfg)
+        return
+    if ablation == "full_compat_no_support_gate":
+        disable_support_gate_for_compat_probe(cfg)
+        set_compatibility_probe_metadata(cfg, changed_mechanisms=["support_gate"])
+        sync_site_bank_with_cfg(cfg)
+        return
+    if ablation == "full_compat_no_upper_shield":
+        cfg.setdefault("upper_safety_shield", {})["enabled"] = False
+        set_compatibility_probe_metadata(cfg, changed_mechanisms=["upper_safety_shield"])
+        sync_site_bank_with_cfg(cfg)
+        return
+    if ablation == "full_compat_qu_on_gate_off_shield_off":
+        meta_cfg = cfg.setdefault("meta", {})
+        meta_cfg["query_updates_enabled"] = True
+        meta_cfg["query_context_updates_enabled"] = True
+        disable_support_gate_for_compat_probe(cfg)
+        cfg.setdefault("upper_safety_shield", {})["enabled"] = False
+        set_compatibility_probe_metadata(
+            cfg,
+            changed_mechanisms=["query_updates_enabled", "support_gate", "upper_safety_shield"],
+        )
+        sync_site_bank_with_cfg(cfg)
+        return
+    if ablation == "full_compat_qu_on_gate_off_shield_off_planner_off":
+        meta_cfg = cfg.setdefault("meta", {})
+        meta_cfg["query_updates_enabled"] = True
+        meta_cfg["query_context_updates_enabled"] = True
+        disable_support_gate_for_compat_probe(cfg)
+        cfg.setdefault("upper_safety_shield", {})["enabled"] = False
+        cfg.setdefault("residual_planner", {})["enabled"] = False
+        set_compatibility_probe_metadata(
+            cfg,
+            changed_mechanisms=[
+                "query_updates_enabled",
+                "support_gate",
+                "upper_safety_shield",
+                "residual_planner",
+            ],
+        )
         sync_site_bank_with_cfg(cfg)
         return
     if ablation == "smooth_relaxed":
@@ -4412,6 +4500,11 @@ HARD_TARGETED_VARIANT_ORDER = (
     "hybrid_qos_recovery_exec_guard_rescue_m015",
     "hybrid_qos_recovery_exec_guard_rescue_m015_cap060",
     "hybrid_qos_recovery_exec_guard_rescue_m020_a005",
+    "hybrid_full_compat_query_update_on",
+    "hybrid_full_compat_no_support_gate",
+    "hybrid_full_compat_no_upper_shield",
+    "hybrid_full_compat_qu_on_gate_off_shield_off",
+    "hybrid_full_compat_qu_on_gate_off_shield_off_planner_off",
     "heuristic_safe",
     "sac_lagrangian",
     "shin2024_adapted_codebook",
@@ -5328,6 +5421,18 @@ def run_one_scenario(
                     "projection_variant": str(pilot_meta.get("projection_variant", "")),
                     "pilot_only": pilot_only,
                     "formal_ranking_exclude": formal_ranking_exclude,
+                    "compatibility_probe": bool(pilot_meta.get("compatibility_probe", False)),
+                    "compatibility_changed_mechanisms": pilot_meta.get("compatibility_changed_mechanisms", []),
+                    "compat_query_updates_enabled": pilot_meta.get("compat_query_updates_enabled"),
+                    "compat_query_context_updates_enabled": pilot_meta.get("compat_query_context_updates_enabled"),
+                    "compat_support_gate_enabled": pilot_meta.get("compat_support_gate_enabled"),
+                    "compat_support_gate_budget_mode": str(
+                        pilot_meta.get("compat_support_gate_budget_mode", "")
+                    ),
+                    "compat_support_gate_extra_rollouts": pilot_meta.get("compat_support_gate_extra_rollouts"),
+                    "compat_upper_shield_enabled": pilot_meta.get("compat_upper_shield_enabled"),
+                    "compat_residual_planner_enabled": pilot_meta.get("compat_residual_planner_enabled"),
+                    "compat_current_decoder": str(pilot_meta.get("compat_current_decoder", "")),
                     "upper_shield_protocol": str(pilot_meta.get("upper_shield_protocol", "")),
                     "execution_guard_protocol": str(pilot_meta.get("execution_guard_protocol", "")),
                     "shield_disable_c": pilot_meta.get("shield_disable_c"),
@@ -5648,6 +5753,18 @@ def run_one_scenario(
             is_qos_recovery_exec_guard_rescue_m015 = ablation == "qos_recovery_exec_guard_rescue_m015"
             is_qos_recovery_exec_guard_rescue_m015_cap060 = ablation == "qos_recovery_exec_guard_rescue_m015_cap060"
             is_qos_recovery_exec_guard_rescue_m020 = ablation == "qos_recovery_exec_guard_rescue_m020_a005"
+            is_full_compat_query_update = ablation == "full_compat_query_update_on"
+            is_full_compat_no_gate = ablation == "full_compat_no_support_gate"
+            is_full_compat_no_shield = ablation == "full_compat_no_upper_shield"
+            is_full_compat_combo = ablation == "full_compat_qu_on_gate_off_shield_off"
+            is_full_compat_combo_no_planner = ablation == "full_compat_qu_on_gate_off_shield_off_planner_off"
+            is_full_compat = (
+                is_full_compat_query_update
+                or is_full_compat_no_gate
+                or is_full_compat_no_shield
+                or is_full_compat_combo
+                or is_full_compat_combo_no_planner
+            )
             is_qos_recovery_exec_guard_rescue = (
                 is_qos_recovery_exec_guard_rescue_m015
                 or is_qos_recovery_exec_guard_rescue_m015_cap060
@@ -5683,6 +5800,8 @@ def run_one_scenario(
                 if (is_qos_recovery_relaxed or is_qos_recovery_exec_guard)
                 else "hard_stress_performance_probe"
                 if is_qos_recovery_exec_guard_rescue
+                else "full_compatibility_mechanism_probe"
+                if is_full_compat
                 else "ungated_meta_ablation"
                 if is_meta_ungated
                 else "full_method"
@@ -5703,6 +5822,7 @@ def run_one_scenario(
                     or is_qos_recovery_relaxed
                     or is_qos_recovery_exec_guard
                     or is_qos_recovery_exec_guard_rescue
+                    or is_full_compat
                 )
                 else None,
                 "formal_ranking_exclude": True
@@ -5712,17 +5832,40 @@ def run_one_scenario(
                     or is_qos_recovery_relaxed
                     or is_qos_recovery_exec_guard
                     or is_qos_recovery_exec_guard_rescue
+                    or is_full_compat
                 )
                 else None,
                 "comparison_role": comparison_role,
                 "baseline_family": "hybrid_full" if ablation == "full" else label,
                 "meta_learning": bool(hybrid_meta_enabled),
-                "support_gate": bool(hybrid_gate_enabled),
-                "support_gate_role": "rollback_guard" if hybrid_gate_enabled else "",
+                "support_gate": bool(hybrid_gate_enabled and not (is_full_compat_no_gate or is_full_compat_combo or is_full_compat_combo_no_planner)),
+                "support_gate_role": (
+                    "rollback_guard"
+                    if hybrid_gate_enabled and not (is_full_compat_no_gate or is_full_compat_combo or is_full_compat_combo_no_planner)
+                    else ""
+                ),
                 "support_gate_uses_query": False,
-                "support_gate_budget_mode": definition_gate_budget_mode if hybrid_gate_enabled else "",
-                "support_update_acceptance": "unconditional" if is_meta_ungated else "support_side_gated" if hybrid_meta_enabled else "none",
-                "support_gate_extra_rollouts": definition_gate_extra_rollouts if hybrid_gate_enabled else 0,
+                "support_gate_budget_mode": (
+                    "support_gate_disabled"
+                    if (is_full_compat_no_gate or is_full_compat_combo or is_full_compat_combo_no_planner)
+                    else definition_gate_budget_mode
+                    if hybrid_gate_enabled
+                    else ""
+                ),
+                "support_update_acceptance": (
+                    "unconditional"
+                    if (is_meta_ungated or is_full_compat_no_gate or is_full_compat_combo or is_full_compat_combo_no_planner)
+                    else "support_side_gated"
+                    if hybrid_meta_enabled
+                    else "none"
+                ),
+                "support_gate_extra_rollouts": (
+                    0
+                    if (is_full_compat_no_gate or is_full_compat_combo or is_full_compat_combo_no_planner)
+                    else definition_gate_extra_rollouts
+                    if hybrid_gate_enabled
+                    else 0
+                ),
                 "support_gate_extra_gradient_updates": 0,
                 "support_gate_extra_query_evaluations": 0,
                 "strong_safety_baseline": True
@@ -5791,6 +5934,30 @@ def run_one_scenario(
                     else ""
                 ),
                 "thermal_cap_margin_c": 0.60 if is_qos_recovery_exec_guard_rescue_m015_cap060 else None,
+                "compatibility_probe": bool(is_full_compat),
+                "compatibility_changed_mechanisms": (
+                    ["query_updates_enabled"]
+                    if is_full_compat_query_update
+                    else ["support_gate"]
+                    if is_full_compat_no_gate
+                    else ["upper_safety_shield"]
+                    if is_full_compat_no_shield
+                    else ["query_updates_enabled", "support_gate", "upper_safety_shield"]
+                    if is_full_compat_combo
+                    else ["query_updates_enabled", "support_gate", "upper_safety_shield", "residual_planner"]
+                    if is_full_compat_combo_no_planner
+                    else []
+                ),
+                "compat_query_updates_enabled": (
+                    True if (is_full_compat_query_update or is_full_compat_combo or is_full_compat_combo_no_planner) else None
+                ),
+                "compat_support_gate_enabled": (
+                    False if (is_full_compat_no_gate or is_full_compat_combo or is_full_compat_combo_no_planner) else None
+                ),
+                "compat_upper_shield_enabled": (
+                    False if (is_full_compat_no_shield or is_full_compat_combo or is_full_compat_combo_no_planner) else None
+                ),
+                "compat_residual_planner_enabled": False if is_full_compat_combo_no_planner else None,
                 "description": (
                     "Pilot-only projection sensitivity: full Hybrid with thermal-cap current projection."
                     if is_thermal_cap
@@ -5810,6 +5977,16 @@ def run_one_scenario(
                     if is_qos_recovery_exec_guard_rescue_m015_cap060
                     else "Pilot hard-stress performance probe: mildly tightened rescue guard for anchor and LD thermal cost."
                     if is_qos_recovery_exec_guard_rescue_m020
+                    else "Pilot compatibility probe: re-enable query-side updates while keeping the other current Full mechanisms unchanged."
+                    if is_full_compat_query_update
+                    else "Pilot compatibility probe: disable support-gate rollback and its paired validation budget."
+                    if is_full_compat_no_gate
+                    else "Pilot compatibility probe: disable the upper selection-time thermal shield."
+                    if is_full_compat_no_shield
+                    else "Pilot compatibility probe: re-enable query-side updates while disabling support gate and upper shield."
+                    if is_full_compat_combo
+                    else "Pilot compatibility probe: re-enable query-side updates while disabling support gate, upper shield, and residual planner."
+                    if is_full_compat_combo_no_planner
                     else "Ungated meta ablation: support update is always accepted without rollback."
                     if is_meta_ungated
                     else "Full hierarchical method on the fixed heterogeneous hybrid structure"
@@ -6315,6 +6492,11 @@ def parse_args() -> argparse.Namespace:
             "qos_recovery_exec_guard_rescue_m015",
             "qos_recovery_exec_guard_rescue_m015_cap060",
             "qos_recovery_exec_guard_rescue_m020_a005",
+            "full_compat_query_update_on",
+            "full_compat_no_support_gate",
+            "full_compat_no_upper_shield",
+            "full_compat_qu_on_gate_off_shield_off",
+            "full_compat_qu_on_gate_off_shield_off_planner_off",
             "smooth_relaxed",
             "thermal_cap",
         ],

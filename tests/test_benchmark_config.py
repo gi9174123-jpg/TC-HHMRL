@@ -551,6 +551,107 @@ def test_ablation_qos_recovery_exec_guard_rescue_m020_a005_sets_pilot_metadata()
     assert float(cfg["pilot_metadata"]["execution_guard_anchor_clamp_margin_c"]) == 0.05
 
 
+def test_full_compat_query_update_probe_only_reenables_query_updates():
+    cfg = load_cfg("configs/default.yaml")
+    cfg = copy.deepcopy(cfg)
+    apply_ablation(cfg, "full_compat_query_update_on")
+
+    assert cfg["meta"]["query_updates_enabled"] is True
+    assert cfg["meta"]["query_context_updates_enabled"] is True
+    assert cfg["meta"]["support_gate"]["enabled"] is True
+    assert int(cfg["meta"]["support_gate"]["extra_support_rollouts"]) == 2
+    assert cfg["upper_safety_shield"]["enabled"] is True
+    assert cfg["residual_planner"]["enabled"] is True
+    meta = cfg["pilot_metadata"]
+    assert meta["compatibility_probe"] is True
+    assert meta["compatibility_changed_mechanisms"] == ["query_updates_enabled"]
+    assert meta["compat_query_updates_enabled"] is True
+    assert meta["compat_support_gate_enabled"] is True
+    assert meta["compat_upper_shield_enabled"] is True
+    assert meta["compat_residual_planner_enabled"] is True
+    assert meta["pilot_only"] is True
+    assert meta["formal_ranking_exclude"] is True
+
+
+def test_full_compat_no_support_gate_probe_removes_gate_budget():
+    cfg = load_cfg("configs/default.yaml")
+    cfg = copy.deepcopy(cfg)
+    apply_ablation(cfg, "full_compat_no_support_gate")
+
+    assert cfg["meta"]["support_gate"]["enabled"] is False
+    assert cfg["meta"]["support_update_acceptance"] == "unconditional"
+    assert int(cfg["meta"]["support_gate_validation_episodes"]) == 0
+    assert cfg["meta"]["support_gate"]["paired_validation"] is False
+    assert cfg["meta"]["support_gate"]["budget_mode"] == "support_gate_disabled"
+    assert int(cfg["meta"]["support_gate"]["extra_support_rollouts"]) == 0
+    assert int(cfg["meta"]["support_gate"]["extra_gradient_updates"]) == 0
+    assert int(cfg["meta"]["support_gate"]["extra_query_evaluations"]) == 0
+    assert cfg["meta"]["query_updates_enabled"] is False
+    assert cfg["upper_safety_shield"]["enabled"] is True
+    assert cfg["residual_planner"]["enabled"] is True
+    meta = cfg["pilot_metadata"]
+    assert meta["compatibility_changed_mechanisms"] == ["support_gate"]
+    assert meta["compat_support_gate_enabled"] is False
+    assert meta["compat_support_gate_budget_mode"] == "support_gate_disabled"
+    assert int(meta["compat_support_gate_extra_rollouts"]) == 0
+
+
+def test_full_compat_no_upper_shield_probe_only_disables_shield():
+    cfg = load_cfg("configs/default.yaml")
+    cfg = copy.deepcopy(cfg)
+    apply_ablation(cfg, "full_compat_no_upper_shield")
+
+    assert cfg["upper_safety_shield"]["enabled"] is False
+    assert cfg["meta"]["query_updates_enabled"] is False
+    assert cfg["meta"]["support_gate"]["enabled"] is True
+    assert cfg["residual_planner"]["enabled"] is True
+    meta = cfg["pilot_metadata"]
+    assert meta["compatibility_changed_mechanisms"] == ["upper_safety_shield"]
+    assert meta["compat_upper_shield_enabled"] is False
+
+
+def test_full_compat_combined_probe_sets_query_on_gate_off_shield_off():
+    cfg = load_cfg("configs/default.yaml")
+    cfg = copy.deepcopy(cfg)
+    apply_ablation(cfg, "full_compat_qu_on_gate_off_shield_off")
+
+    assert cfg["meta"]["query_updates_enabled"] is True
+    assert cfg["meta"]["query_context_updates_enabled"] is True
+    assert cfg["meta"]["support_gate"]["enabled"] is False
+    assert int(cfg["meta"]["support_gate_validation_episodes"]) == 0
+    assert cfg["upper_safety_shield"]["enabled"] is False
+    assert cfg["residual_planner"]["enabled"] is True
+    meta = cfg["pilot_metadata"]
+    assert meta["compatibility_changed_mechanisms"] == [
+        "query_updates_enabled",
+        "support_gate",
+        "upper_safety_shield",
+    ]
+    assert meta["compat_query_updates_enabled"] is True
+    assert meta["compat_support_gate_enabled"] is False
+    assert meta["compat_upper_shield_enabled"] is False
+    assert meta["compat_residual_planner_enabled"] is True
+
+
+def test_full_compat_combined_no_planner_probe_disables_planner_too():
+    cfg = load_cfg("configs/default.yaml")
+    cfg = copy.deepcopy(cfg)
+    apply_ablation(cfg, "full_compat_qu_on_gate_off_shield_off_planner_off")
+
+    assert cfg["meta"]["query_updates_enabled"] is True
+    assert cfg["meta"]["support_gate"]["enabled"] is False
+    assert cfg["upper_safety_shield"]["enabled"] is False
+    assert cfg["residual_planner"]["enabled"] is False
+    meta = cfg["pilot_metadata"]
+    assert meta["compatibility_changed_mechanisms"] == [
+        "query_updates_enabled",
+        "support_gate",
+        "upper_safety_shield",
+        "residual_planner",
+    ]
+    assert meta["compat_residual_planner_enabled"] is False
+
+
 def test_ablation_smooth_relaxed_sets_pilot_metadata():
     cfg = load_cfg("configs/default.yaml")
     cfg = copy.deepcopy(cfg)
