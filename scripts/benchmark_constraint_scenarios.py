@@ -731,6 +731,44 @@ def apply_ablation(cfg: Dict, ablation: str) -> None:
         }
         sync_site_bank_with_cfg(cfg)
         return
+    if ablation == "qos_recovery_exec_guard_rescue_m015_cap060":
+        safety_cfg = cfg.setdefault("safety", {})
+        safety_cfg["projection_mode"] = "qos_aware_hard_clip"
+        safety_cfg["thermal_cap_margin_c"] = 0.60
+        cfg.setdefault("upper_safety_shield", {})["enabled"] = False
+        guard_cfg = cfg.setdefault("execution_thermal_guard", {})
+        guard_cfg["enabled"] = True
+        guard_cfg["mode"] = "per_source_predictive_rescue"
+        guard_cfg["candidate_policy"] = "best_safe_combo"
+        guard_cfg["score_proxy"] = "info_current"
+        guard_cfg["ld_guard_margin_c"] = 0.15
+        guard_cfg["ld_emergency_margin_c"] = -0.05
+        guard_cfg["anchor_clamp_margin_c"] = 0.0
+        guard_cfg["fallback"] = "best_safe_combo_else_anchor_clamp"
+        guard_cfg["clamp_first"] = True
+        guard_cfg["remove_only_on_emergency"] = True
+        guard_cfg["reproject_after_guard"] = True
+        cfg["pilot_metadata"] = {
+            "projection_variant": "qos_aware_hard_clip",
+            "upper_shield_protocol": "disabled_selection_time_mask",
+            "execution_guard_protocol": "per_source_predictive_rescue_best_safe_combo_m015_cap060",
+            "pilot_only": True,
+            "formal_ranking_exclude": True,
+            "comparison_role": "hard_stress_performance_probe",
+            "strong_safety_baseline": False,
+            "oracle_future_disturbances": False,
+            "qos_recovery_rule": "non_oracle_current_recovery_to_active_sources_with_thermal_and_bus_headroom",
+            "execution_guard_candidate_policy": "best_safe_combo",
+            "execution_guard_score_proxy": "info_current",
+            "execution_guard_ld_margin_c": 0.15,
+            "execution_guard_ld_emergency_margin_c": -0.05,
+            "execution_guard_anchor_clamp_margin_c": 0.0,
+            "execution_guard_fallback": "best_safe_combo_else_anchor_clamp",
+            "thermal_cap_margin_c": 0.60,
+            "projection_objective": "m015 rescue with mildly tighter thermal-cap margin",
+        }
+        sync_site_bank_with_cfg(cfg)
+        return
     if ablation == "qos_recovery_exec_guard_rescue_m020_a005":
         cfg.setdefault("safety", {})["projection_mode"] = "qos_aware_hard_clip"
         cfg.setdefault("upper_safety_shield", {})["enabled"] = False
@@ -4372,6 +4410,7 @@ HARD_TARGETED_VARIANT_ORDER = (
     "hybrid_qos_recovery_relaxed_shield",
     "hybrid_qos_recovery_per_source_exec_guard",
     "hybrid_qos_recovery_exec_guard_rescue_m015",
+    "hybrid_qos_recovery_exec_guard_rescue_m015_cap060",
     "hybrid_qos_recovery_exec_guard_rescue_m020_a005",
     "heuristic_safe",
     "sac_lagrangian",
@@ -5607,9 +5646,12 @@ def run_one_scenario(
             is_qos_recovery_relaxed = ablation == "qos_recovery_relaxed_shield"
             is_qos_recovery_exec_guard = ablation == "qos_recovery_per_source_exec_guard"
             is_qos_recovery_exec_guard_rescue_m015 = ablation == "qos_recovery_exec_guard_rescue_m015"
+            is_qos_recovery_exec_guard_rescue_m015_cap060 = ablation == "qos_recovery_exec_guard_rescue_m015_cap060"
             is_qos_recovery_exec_guard_rescue_m020 = ablation == "qos_recovery_exec_guard_rescue_m020_a005"
             is_qos_recovery_exec_guard_rescue = (
-                is_qos_recovery_exec_guard_rescue_m015 or is_qos_recovery_exec_guard_rescue_m020
+                is_qos_recovery_exec_guard_rescue_m015
+                or is_qos_recovery_exec_guard_rescue_m015_cap060
+                or is_qos_recovery_exec_guard_rescue_m020
             )
             hybrid_meta_enabled = ablation != "wo_meta"
             hybrid_gate_enabled = bool(hybrid_meta_enabled and not is_meta_ungated)
@@ -5712,6 +5754,8 @@ def run_one_scenario(
                     if is_qos_recovery_exec_guard
                     else "per_source_predictive_rescue_best_safe_combo_m015"
                     if is_qos_recovery_exec_guard_rescue_m015
+                    else "per_source_predictive_rescue_best_safe_combo_m015_cap060"
+                    if is_qos_recovery_exec_guard_rescue_m015_cap060
                     else "per_source_predictive_rescue_best_safe_combo_m020_a005"
                     if is_qos_recovery_exec_guard_rescue_m020
                     else ""
@@ -5724,7 +5768,7 @@ def run_one_scenario(
                 "execution_guard_emergency_margin_c": 0.0 if is_qos_recovery_exec_guard else None,
                 "execution_guard_ld_margin_c": (
                     0.15
-                    if is_qos_recovery_exec_guard_rescue_m015
+                    if (is_qos_recovery_exec_guard_rescue_m015 or is_qos_recovery_exec_guard_rescue_m015_cap060)
                     else 0.20
                     if is_qos_recovery_exec_guard_rescue_m020
                     else None
@@ -5732,7 +5776,7 @@ def run_one_scenario(
                 "execution_guard_ld_emergency_margin_c": -0.05 if is_qos_recovery_exec_guard_rescue else None,
                 "execution_guard_anchor_clamp_margin_c": (
                     0.0
-                    if is_qos_recovery_exec_guard_rescue_m015
+                    if (is_qos_recovery_exec_guard_rescue_m015 or is_qos_recovery_exec_guard_rescue_m015_cap060)
                     else 0.05
                     if is_qos_recovery_exec_guard_rescue_m020
                     else None
@@ -5746,6 +5790,7 @@ def run_one_scenario(
                     if is_qos_recovery_exec_guard_rescue
                     else ""
                 ),
+                "thermal_cap_margin_c": 0.60 if is_qos_recovery_exec_guard_rescue_m015_cap060 else None,
                 "description": (
                     "Pilot-only projection sensitivity: full Hybrid with thermal-cap current projection."
                     if is_thermal_cap
@@ -5761,6 +5806,8 @@ def run_one_scenario(
                     if is_qos_recovery_exec_guard
                     else "Pilot hard-stress performance probe: execution-only rescue guard selects the best safe source combo under QoS-aware hard clipping."
                     if is_qos_recovery_exec_guard_rescue_m015
+                    else "Pilot hard-stress performance probe: m015 rescue with a mildly tighter thermal-cap margin."
+                    if is_qos_recovery_exec_guard_rescue_m015_cap060
                     else "Pilot hard-stress performance probe: mildly tightened rescue guard for anchor and LD thermal cost."
                     if is_qos_recovery_exec_guard_rescue_m020
                     else "Ungated meta ablation: support update is always accepted without rollback."
@@ -6266,6 +6313,7 @@ def parse_args() -> argparse.Namespace:
             "qos_recovery_relaxed_shield",
             "qos_recovery_per_source_exec_guard",
             "qos_recovery_exec_guard_rescue_m015",
+            "qos_recovery_exec_guard_rescue_m015_cap060",
             "qos_recovery_exec_guard_rescue_m020_a005",
             "smooth_relaxed",
             "thermal_cap",
