@@ -469,6 +469,33 @@ def test_ablation_qos_recovery_per_source_exec_guard_sets_pilot_metadata():
     assert cfg["pilot_metadata"]["execution_guard_protocol"] == "per_source_predictive_largest_safe_subset_anchor_clamp"
 
 
+def test_ablation_qos_recovery_exec_guard_rescue_m015_sets_pilot_metadata():
+    cfg = load_cfg("configs/default.yaml")
+    cfg = copy.deepcopy(cfg)
+    apply_ablation(cfg, "qos_recovery_exec_guard_rescue_m015")
+
+    guard = cfg["execution_thermal_guard"]
+    assert cfg["safety"]["projection_mode"] == "qos_aware_hard_clip"
+    assert cfg["upper_safety_shield"]["enabled"] is False
+    assert guard["enabled"] is True
+    assert guard["mode"] == "per_source_predictive_rescue"
+    assert guard["candidate_policy"] == "best_safe_combo"
+    assert guard["score_proxy"] == "info_current"
+    assert float(guard["ld_guard_margin_c"]) == 0.15
+    assert float(guard["ld_emergency_margin_c"]) == -0.05
+    assert float(guard["anchor_clamp_margin_c"]) == 0.0
+    assert guard["fallback"] == "best_safe_combo_else_anchor_clamp"
+    assert guard["clamp_first"] is True
+    assert guard["remove_only_on_emergency"] is True
+    assert guard["reproject_after_guard"] is True
+    assert cfg["pilot_metadata"]["comparison_role"] == "hard_stress_performance_probe"
+    assert cfg["pilot_metadata"]["pilot_only"] is True
+    assert cfg["pilot_metadata"]["formal_ranking_exclude"] is True
+    assert cfg["pilot_metadata"]["upper_shield_protocol"] == "disabled_selection_time_mask"
+    assert cfg["pilot_metadata"]["execution_guard_protocol"] == "per_source_predictive_rescue_best_safe_combo_m015"
+    assert cfg["pilot_metadata"]["execution_guard_score_proxy"] == "info_current"
+
+
 def test_ablation_smooth_relaxed_sets_pilot_metadata():
     cfg = load_cfg("configs/default.yaml")
     cfg = copy.deepcopy(cfg)

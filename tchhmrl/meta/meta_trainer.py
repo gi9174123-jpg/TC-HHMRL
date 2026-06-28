@@ -117,6 +117,15 @@ class EpisodeStats:
     execution_guard_anchor_clamp_rate: float = 0.0
     execution_guard_downgrade_ld1_rate: float = 0.0
     execution_guard_downgrade_ld2_rate: float = 0.0
+    execution_guard_candidate_count_mean: float = 0.0
+    execution_guard_rescue_to_ld1_rate: float = 0.0
+    execution_guard_rescue_to_ld2_rate: float = 0.0
+    execution_guard_rescue_to_all_rate: float = 0.0
+    execution_guard_fallback_anchor_rate: float = 0.0
+    execution_guard_clamp_ld1_rate: float = 0.0
+    execution_guard_clamp_ld2_rate: float = 0.0
+    execution_guard_remove_ld1_rate: float = 0.0
+    execution_guard_remove_ld2_rate: float = 0.0
 
 
 class MetaTrainer:
@@ -630,6 +639,15 @@ class MetaTrainer:
         ep_execution_guard_anchor_clamp = 0.0
         ep_execution_guard_downgrade_ld1 = 0.0
         ep_execution_guard_downgrade_ld2 = 0.0
+        ep_execution_guard_candidate_count = 0.0
+        ep_execution_guard_rescue_to_ld1 = 0.0
+        ep_execution_guard_rescue_to_ld2 = 0.0
+        ep_execution_guard_rescue_to_all = 0.0
+        ep_execution_guard_fallback_anchor = 0.0
+        ep_execution_guard_clamp_ld1 = 0.0
+        ep_execution_guard_clamp_ld2 = 0.0
+        ep_execution_guard_remove_ld1 = 0.0
+        ep_execution_guard_remove_ld2 = 0.0
 
         macro_start_obs = None
         macro_start_z = None
@@ -957,6 +975,15 @@ class MetaTrainer:
             ep_execution_guard_anchor_clamp += float(bool(aux.get("execution_guard_anchor_clamp_applied", False)))
             ep_execution_guard_downgrade_ld1 += float(float(aux.get("execution_guard_downgrade_ld1", 0.0)) > 0.5)
             ep_execution_guard_downgrade_ld2 += float(float(aux.get("execution_guard_downgrade_ld2", 0.0)) > 0.5)
+            ep_execution_guard_candidate_count += float(aux.get("execution_guard_candidate_count", 0.0) or 0.0)
+            ep_execution_guard_rescue_to_ld1 += float(float(aux.get("execution_guard_rescue_to_ld1", 0.0)) > 0.5)
+            ep_execution_guard_rescue_to_ld2 += float(float(aux.get("execution_guard_rescue_to_ld2", 0.0)) > 0.5)
+            ep_execution_guard_rescue_to_all += float(float(aux.get("execution_guard_rescue_to_all", 0.0)) > 0.5)
+            ep_execution_guard_fallback_anchor += float(float(aux.get("execution_guard_fallback_anchor", 0.0)) > 0.5)
+            ep_execution_guard_clamp_ld1 += float(float(aux.get("execution_guard_clamp_ld1", 0.0)) > 0.5)
+            ep_execution_guard_clamp_ld2 += float(float(aux.get("execution_guard_clamp_ld2", 0.0)) > 0.5)
+            ep_execution_guard_remove_ld1 += float(float(aux.get("execution_guard_remove_ld1", 0.0)) > 0.5)
+            ep_execution_guard_remove_ld2 += float(float(aux.get("execution_guard_remove_ld2", 0.0)) > 0.5)
 
             obs = next_obs
 
@@ -1058,6 +1085,15 @@ class MetaTrainer:
             execution_guard_anchor_clamp_rate=ep_execution_guard_anchor_clamp / ep_len_safe,
             execution_guard_downgrade_ld1_rate=ep_execution_guard_downgrade_ld1 / ep_len_safe,
             execution_guard_downgrade_ld2_rate=ep_execution_guard_downgrade_ld2 / ep_len_safe,
+            execution_guard_candidate_count_mean=ep_execution_guard_candidate_count / ep_len_safe,
+            execution_guard_rescue_to_ld1_rate=ep_execution_guard_rescue_to_ld1 / ep_len_safe,
+            execution_guard_rescue_to_ld2_rate=ep_execution_guard_rescue_to_ld2 / ep_len_safe,
+            execution_guard_rescue_to_all_rate=ep_execution_guard_rescue_to_all / ep_len_safe,
+            execution_guard_fallback_anchor_rate=ep_execution_guard_fallback_anchor / ep_len_safe,
+            execution_guard_clamp_ld1_rate=ep_execution_guard_clamp_ld1 / ep_len_safe,
+            execution_guard_clamp_ld2_rate=ep_execution_guard_clamp_ld2 / ep_len_safe,
+            execution_guard_remove_ld1_rate=ep_execution_guard_remove_ld1 / ep_len_safe,
+            execution_guard_remove_ld2_rate=ep_execution_guard_remove_ld2 / ep_len_safe,
         )
 
     def train(self, meta_iters: int | None = None) -> Path:
@@ -1702,6 +1738,15 @@ class MetaTrainer:
                 "execution_guard_anchor_clamp_rate",
                 "execution_guard_downgrade_ld1_rate",
                 "execution_guard_downgrade_ld2_rate",
+                "execution_guard_candidate_count_mean",
+                "execution_guard_rescue_to_ld1_rate",
+                "execution_guard_rescue_to_ld2_rate",
+                "execution_guard_rescue_to_all_rate",
+                "execution_guard_fallback_anchor_rate",
+                "execution_guard_clamp_ld1_rate",
+                "execution_guard_clamp_ld2_rate",
+                "execution_guard_remove_ld1_rate",
+                "execution_guard_remove_ld2_rate",
             ]
             for prefix, stats_group in (("support", support_stats), ("query", query_stats)):
                 for name in diagnostic_names:

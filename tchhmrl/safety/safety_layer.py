@@ -136,10 +136,21 @@ class SafetyLayer:
         exec_guard_cfg = cfg.get("execution_thermal_guard", {}) or {}
         self.execution_guard_enabled = bool(exec_guard_cfg.get("enabled", False))
         self.execution_guard_mode = str(exec_guard_cfg.get("mode", "per_source_predictive")).lower()
+        self.execution_guard_candidate_policy = str(exec_guard_cfg.get("candidate_policy", "largest_safe_subset")).lower()
+        self.execution_guard_score_proxy = str(exec_guard_cfg.get("score_proxy", "projected_current")).lower()
         self.execution_guard_margin_c = float(exec_guard_cfg.get("guard_margin_c", 0.25))
         self.execution_guard_emergency_margin_c = float(exec_guard_cfg.get("emergency_margin_c", 0.0))
+        self.execution_guard_ld_margin_c = float(exec_guard_cfg.get("ld_guard_margin_c", self.execution_guard_margin_c))
+        self.execution_guard_ld_emergency_margin_c = float(
+            exec_guard_cfg.get("ld_emergency_margin_c", self.execution_guard_emergency_margin_c)
+        )
+        self.execution_guard_anchor_clamp_margin_c = float(
+            exec_guard_cfg.get("anchor_clamp_margin_c", self.execution_guard_margin_c)
+        )
         self.execution_guard_fallback = str(exec_guard_cfg.get("fallback", "largest_safe_subset")).lower()
         self.execution_guard_clamp_anchor_current = bool(exec_guard_cfg.get("clamp_anchor_current", True))
+        self.execution_guard_clamp_first = bool(exec_guard_cfg.get("clamp_first", False))
+        self.execution_guard_remove_only_on_emergency = bool(exec_guard_cfg.get("remove_only_on_emergency", False))
         self.execution_guard_reproject_after_guard = bool(exec_guard_cfg.get("reproject_after_guard", True))
 
     def state_dict(self) -> Dict:
@@ -1013,6 +1024,78 @@ class SafetyLayer:
         guard_anchor_current_before = float("nan")
         guard_anchor_current_after = float("nan")
         guard_reason = "disabled"
+        guard_candidate_count = 0
+        guard_selected_score = float("nan")
+        guard_rescue_to_ld1 = False
+        guard_rescue_to_ld2 = False
+        guard_rescue_to_all = False
+        guard_fallback_anchor = False
+        guard_clamp_ld1 = False
+        guard_clamp_ld2 = False
+        guard_remove_ld1 = False
+        guard_remove_ld2 = False
+
+        def _refresh_project_fields(proj_dict: Dict[str, object], currents_new: np.ndarray) -> Dict[str, object]:
+            refreshed = dict(proj_dict)
+            currents_new = np.asarray(currents_new, dtype=np.float32).reshape(-1)[:3]
+            base = np.asarray(refreshed["thermal_base"], dtype=np.float32).reshape(-1)[:3]
+            t_pred_new = (base + thermal_coeff_safe_np * (currents_new**2)).astype(np.float32)
+            requested = np.asarray(refreshed["current_requested"], dtype=np.float32).reshape(-1)[:3]
+            refreshed["currents"] = currents_new.astype(np.float32)
+            refreshed["T_pred"] = t_pred_new.astype(np.float32)
+            refreshed["thermal_margin"] = (self.thermal_safe - t_pred_new).astype(np.float32)
+            refreshed["projected_current_total"] = float(np.sum(currents_new))
+            refreshed["projection_compression_ratio"] = float(
+                refreshed["projected_current_total"] / max(float(refreshed["raw_current_total"]), 1.0e-6)
+            )
+            refreshed["projection_compression_ratio_per_source"] = np.where(
+                requested > 1.0e-6,
+                currents_new / np.maximum(requested, 1.0e-6),
+                np.where(currents_new > 1.0e-6, 1.0, 0.0),
+            ).astype(np.float32)
+            refreshed["thermal_cap_scale"] = np.where(
+                requested > 1.0e-6,
+                currents_new / np.maximum(requested, 1.0e-6),
+                np.ones_like(currents_new, dtype=np.float32),
+            ).astype(np.float32)
+            refreshed["thermal_scale"] = refreshed["thermal_cap_scale"].astype(np.float32)
+            return refreshed
+
+        def _source_current_cap(proj_dict: Dict[str, object], src_idx: int, margin_c: float) -> float:
+            base = np.asarray(proj_dict["thermal_base"], dtype=np.float32).reshape(-1)[:3]
+            allowed_rise = float(self.thermal_safe - float(margin_c) - float(base[src_idx]))
+            denom = float(max(thermal_coeff_safe_np[src_idx], 1.0e-6))
+            cap = float(np.sqrt(max(allowed_rise / denom, 0.0)))
+            return float(min(cap, float(self.current_max[src_idx])))
+
+        def _clamp_source_to_margin(
+            proj_dict: Dict[str, object],
+            src_idx: int,
+            margin_c: float,
+        ) -> Tuple[Dict[str, object], bool, float, float, float]:
+            currents_tmp = np.asarray(proj_dict["currents"], dtype=np.float32).copy()
+            before = float(currents_tmp[src_idx])
+            cap = _source_current_cap(proj_dict, src_idx, margin_c)
+            applied = bool(before > cap + 1.0e-8)
+            if applied:
+                currents_tmp[src_idx] = cap
+            clamped = _refresh_project_fields(proj_dict, currents_tmp)
+            cap_arr = np.asarray(clamped["thermal_cap_current"], dtype=np.float32).copy()
+            cap_arr[src_idx] = min(float(cap_arr[src_idx]), cap)
+            clamped["thermal_cap_current"] = cap_arr.astype(np.float32)
+            after = float(np.asarray(clamped["currents"], dtype=np.float32)[src_idx])
+            return clamped, applied, before, after, cap
+
+        def _info_current_score(proj_dict: Dict[str, object], combo: int) -> float:
+            decoded_tmp = np.asarray(proj_dict["decoded"], dtype=np.float32).reshape(-1)
+            rho_tmp, tau_tmp = self._project_mode_params_np(mode, float(decoded_tmp[3]), float(decoded_tmp[4]))
+            if self.execution_guard_score_proxy == "info_current":
+                score = float(proj_dict["projected_current_total"]) * float(tau_tmp) * max(0.0, 1.0 - float(rho_tmp))
+            else:
+                score = float(proj_dict["projected_current_total"])
+            if int(combo) == int(guard_requested_boost):
+                score += 1.0e-4
+            return float(score)
 
         if bool(self.execution_guard_enabled and self.execution_guard_mode == "per_source_predictive"):
             guard_reason = "no_guard_needed"
@@ -1089,6 +1172,135 @@ class SafetyLayer:
                         ).astype(np.float32)
                     guard_anchor_current_after = float(np.asarray(proj["currents"], dtype=np.float32)[0])
             guard_applied = bool(guard_downgrade_applied or guard_anchor_clamp_applied)
+
+        if bool(self.execution_guard_enabled and self.execution_guard_mode == "per_source_predictive_rescue"):
+            guard_reason = "best_safe_combo_no_change"
+            requested_mask = self._boost_mask(guard_requested_boost) > 0.0
+            scored_candidates: list[Tuple[float, int, Dict[str, object], Dict[str, object]]] = []
+            total_candidates = 0
+            for combo in range(4):
+                total_candidates += 1
+                cand = _project_for_boost(combo)
+                cand_mask = self._boost_mask(combo) > 0.0
+                cand_flags: Dict[str, object] = {
+                    "anchor_clamp": False,
+                    "clamp_ld1": False,
+                    "clamp_ld2": False,
+                    "remove_ld1": False,
+                    "remove_ld2": False,
+                    "anchor_before": float("nan"),
+                    "anchor_after": float("nan"),
+                    "anchor_cap": float("nan"),
+                }
+
+                margin = np.asarray(cand["thermal_margin"], dtype=np.float32).reshape(-1)[:3]
+                if bool(cand_mask[0] and margin[0] < float(self.execution_guard_anchor_clamp_margin_c)):
+                    cand, applied, before, after, cap = _clamp_source_to_margin(
+                        cand,
+                        0,
+                        float(self.execution_guard_anchor_clamp_margin_c),
+                    )
+                    cand_flags["anchor_clamp"] = bool(applied)
+                    cand_flags["anchor_before"] = before
+                    cand_flags["anchor_after"] = after
+                    cand_flags["anchor_cap"] = cap
+
+                rejected = False
+                for src_idx, flag_name, remove_name in (
+                    (1, "clamp_ld1", "remove_ld1"),
+                    (2, "clamp_ld2", "remove_ld2"),
+                ):
+                    if not bool(cand_mask[src_idx]):
+                        continue
+                    margin = np.asarray(cand["thermal_margin"], dtype=np.float32).reshape(-1)[:3]
+                    if float(margin[src_idx]) < float(self.execution_guard_ld_emergency_margin_c):
+                        cand_flags[remove_name] = True
+                        rejected = True
+                        break
+                    if bool(self.execution_guard_clamp_first) and float(margin[src_idx]) < float(self.execution_guard_ld_margin_c):
+                        cand, applied, _, _, _ = _clamp_source_to_margin(
+                            cand,
+                            src_idx,
+                            float(self.execution_guard_ld_margin_c),
+                        )
+                        cand_flags[flag_name] = bool(applied)
+                        margin_after = np.asarray(cand["thermal_margin"], dtype=np.float32).reshape(-1)[:3]
+                        if float(margin_after[src_idx]) < float(self.execution_guard_ld_emergency_margin_c):
+                            cand_flags[remove_name] = True
+                            rejected = True
+                            break
+
+                if rejected:
+                    continue
+                scored_candidates.append((_info_current_score(cand, combo), combo, cand, cand_flags))
+
+            guard_candidate_count = total_candidates
+            if scored_candidates:
+                selected = max(
+                    scored_candidates,
+                    key=lambda item: (
+                        item[0],
+                        1 if int(item[1]) == int(guard_requested_boost) else 0,
+                        int(item[1]),
+                    ),
+                )
+                guard_selected_score, guard_final_boost, proj, selected_flags = selected
+                exec_boost = int(guard_final_boost)
+                if int(exec_boost) != int(guard_requested_boost) and bool(self.execution_guard_reproject_after_guard):
+                    mem["current_boost"] = int(exec_boost)
+                    mem["dwell_count"] = 1
+                guard_anchor_clamp_applied = bool(selected_flags.get("anchor_clamp", False))
+                guard_clamp_ld1 = bool(selected_flags.get("clamp_ld1", False))
+                guard_clamp_ld2 = bool(selected_flags.get("clamp_ld2", False))
+                guard_remove_ld1 = bool(selected_flags.get("remove_ld1", False)) or bool(requested_mask[1] and exec_boost not in {1, 3})
+                guard_remove_ld2 = bool(selected_flags.get("remove_ld2", False)) or bool(requested_mask[2] and exec_boost not in {2, 3})
+                guard_anchor_cap = float(selected_flags.get("anchor_cap", float("nan")))
+                guard_anchor_current_before = float(selected_flags.get("anchor_before", float("nan")))
+                guard_anchor_current_after = float(selected_flags.get("anchor_after", float("nan")))
+                guard_downgrade_ld1 = bool(requested_mask[1] and exec_boost not in {1, 3})
+                guard_downgrade_ld2 = bool(requested_mask[2] and exec_boost not in {2, 3})
+                guard_downgrade_applied = int(exec_boost) != int(guard_requested_boost)
+                guard_rescue_to_ld1 = bool(exec_boost == 1 and int(exec_boost) != int(guard_requested_boost))
+                guard_rescue_to_ld2 = bool(exec_boost == 2 and int(exec_boost) != int(guard_requested_boost))
+                guard_rescue_to_all = bool(exec_boost == 3 and int(exec_boost) != int(guard_requested_boost))
+                guard_fallback_anchor = bool(exec_boost == 0 and int(guard_requested_boost) != 0)
+                if guard_downgrade_applied or guard_anchor_clamp_applied or guard_clamp_ld1 or guard_clamp_ld2:
+                    guard_reason = "best_safe_combo_rescue"
+                else:
+                    guard_reason = "best_safe_combo_no_change"
+            else:
+                guard_selected_score = float("nan")
+                guard_final_boost = 0
+                exec_boost = 0
+                proj = _project_for_boost(0)
+                margin = np.asarray(proj["thermal_margin"], dtype=np.float32).reshape(-1)[:3]
+                if bool(margin[0] < float(self.execution_guard_anchor_clamp_margin_c)):
+                    proj, applied, before, after, cap = _clamp_source_to_margin(
+                        proj,
+                        0,
+                        float(self.execution_guard_anchor_clamp_margin_c),
+                    )
+                    guard_anchor_clamp_applied = bool(applied)
+                    guard_anchor_current_before = before
+                    guard_anchor_current_after = after
+                    guard_anchor_cap = cap
+                mem["current_boost"] = 0
+                mem["dwell_count"] = 1
+                guard_downgrade_applied = int(guard_requested_boost) != 0
+                guard_downgrade_ld1 = bool(requested_mask[1])
+                guard_downgrade_ld2 = bool(requested_mask[2])
+                guard_remove_ld1 = bool(requested_mask[1])
+                guard_remove_ld2 = bool(requested_mask[2])
+                guard_fallback_anchor = True
+                guard_reason = "fallback_anchor_no_safe_combo"
+            guard_applied = bool(
+                guard_downgrade_applied
+                or guard_anchor_clamp_applied
+                or guard_clamp_ld1
+                or guard_clamp_ld2
+                or guard_remove_ld1
+                or guard_remove_ld2
+            )
 
         currents = np.asarray(proj["currents"], dtype=np.float32)
         current_frac = np.asarray(proj["current_frac"], dtype=np.float32)
@@ -1182,6 +1394,21 @@ class SafetyLayer:
             "execution_guard_anchor_current_after": float(guard_anchor_current_after),
             "execution_guard_margin_c": float(self.execution_guard_margin_c),
             "execution_guard_emergency_margin_c": float(self.execution_guard_emergency_margin_c),
+            "execution_guard_ld_margin_c": float(self.execution_guard_ld_margin_c),
+            "execution_guard_ld_emergency_margin_c": float(self.execution_guard_ld_emergency_margin_c),
+            "execution_guard_anchor_clamp_margin_c": float(self.execution_guard_anchor_clamp_margin_c),
+            "execution_guard_candidate_count": int(guard_candidate_count),
+            "execution_guard_selected_score": float(guard_selected_score),
+            "execution_guard_rescue_to_ld1": float(bool(guard_rescue_to_ld1)),
+            "execution_guard_rescue_to_ld2": float(bool(guard_rescue_to_ld2)),
+            "execution_guard_rescue_to_all": float(bool(guard_rescue_to_all)),
+            "execution_guard_fallback_anchor": float(bool(guard_fallback_anchor)),
+            "execution_guard_clamp_ld1": float(bool(guard_clamp_ld1)),
+            "execution_guard_clamp_ld2": float(bool(guard_clamp_ld2)),
+            "execution_guard_remove_ld1": float(bool(guard_remove_ld1)),
+            "execution_guard_remove_ld2": float(bool(guard_remove_ld2)),
+            "execution_guard_candidate_policy": self.execution_guard_candidate_policy,
+            "execution_guard_score_proxy": self.execution_guard_score_proxy,
             "execution_guard_reason": str(guard_reason),
             "current_requested": current_requested.astype(np.float32),
             "current_requested_pre_static_cap": np.asarray(

@@ -743,3 +743,82 @@ def test_execution_guard_downgrades_removable_sources_and_clamps_anchor():
     assert float(out["execution_guard_downgrade_ld1"]) == 1.0
     assert float(out["execution_guard_downgrade_ld2"]) == 1.0
     assert float(out["execution_guard_anchor_current_after"]) <= float(out["execution_guard_anchor_current_before"]) + 1.0e-7
+
+
+def test_execution_rescue_guard_keeps_safe_all_combo_without_mem_reset():
+    cfg = copy.deepcopy(load_cfg("configs/default.yaml"))
+    cfg["safety"]["projection_mode"] = "qos_aware_hard_clip"
+    cfg["upper_safety_shield"]["enabled"] = False
+    cfg["execution_thermal_guard"] = {
+        "enabled": True,
+        "mode": "per_source_predictive_rescue",
+        "candidate_policy": "best_safe_combo",
+        "score_proxy": "info_current",
+        "ld_guard_margin_c": 0.15,
+        "ld_emergency_margin_c": -0.05,
+        "anchor_clamp_margin_c": 0.0,
+        "fallback": "best_safe_combo_else_anchor_clamp",
+        "clamp_first": True,
+        "remove_only_on_emergency": True,
+        "reproject_after_guard": True,
+    }
+    safety = SafetyLayer(cfg)
+    out, mem = safety.project_np(
+        upper_raw=11,
+        lower_raw=np.asarray([1.0, 1.0, 1.0, 0.0, 0.0], dtype=np.float32),
+        temps=np.asarray([42.0, 44.8, 40.0], dtype=np.float32),
+        amb_temp=38.0,
+        gamma=0.06,
+        delta=4.0,
+        mem={"current_boost": 3, "dwell_count": 3},
+    )
+
+    assert out["execution_guard_enabled"] is True
+    assert int(out["execution_guard_candidate_count"]) == 4
+    assert int(out["boost_combo_exec"]) == 3
+    assert out["execution_guard_applied"] is False
+    assert out["execution_guard_reason"] == "best_safe_combo_no_change"
+    assert float(out["execution_guard_fallback_anchor"]) == 0.0
+    assert float(out["execution_guard_selected_score"]) > 0.0
+    assert int(mem["current_boost"]) == 3
+    assert int(mem["dwell_count"]) == 4
+
+
+def test_execution_rescue_guard_uses_ld2_when_ld1_is_emergency_hot():
+    cfg = copy.deepcopy(load_cfg("configs/default.yaml"))
+    cfg["safety"]["projection_mode"] = "qos_aware_hard_clip"
+    cfg["upper_safety_shield"]["enabled"] = False
+    cfg["execution_thermal_guard"] = {
+        "enabled": True,
+        "mode": "per_source_predictive_rescue",
+        "candidate_policy": "best_safe_combo",
+        "score_proxy": "info_current",
+        "ld_guard_margin_c": 0.15,
+        "ld_emergency_margin_c": -0.05,
+        "anchor_clamp_margin_c": 0.0,
+        "fallback": "best_safe_combo_else_anchor_clamp",
+        "clamp_first": True,
+        "remove_only_on_emergency": True,
+        "reproject_after_guard": True,
+    }
+    safety = SafetyLayer(cfg)
+    out, mem = safety.project_np(
+        upper_raw=11,
+        lower_raw=np.asarray([1.0, 1.0, 1.0, 0.0, 0.0], dtype=np.float32),
+        temps=np.asarray([42.0, 50.0, 40.0], dtype=np.float32),
+        amb_temp=38.0,
+        gamma=0.06,
+        delta=4.0,
+        mem={"current_boost": 3, "dwell_count": 3},
+    )
+
+    assert int(out["execution_guard_candidate_count"]) == 4
+    assert int(out["boost_combo_exec"]) == 2
+    assert int(mem["current_boost"]) == 2
+    assert out["execution_guard_applied"] is True
+    assert out["execution_guard_reason"] == "best_safe_combo_rescue"
+    assert float(out["execution_guard_remove_ld1"]) == 1.0
+    assert float(out["execution_guard_remove_ld2"]) == 0.0
+    assert float(out["execution_guard_fallback_anchor"]) == 0.0
+    assert float(out["currents_exec"][1]) == 0.0
+    assert float(out["currents_exec"][2]) > 0.0
