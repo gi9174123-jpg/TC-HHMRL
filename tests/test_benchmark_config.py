@@ -619,6 +619,93 @@ def test_full_legacy_strong_gated_restores_old_full_mechanics_with_gate():
     assert meta["execution_guard_enabled"] is False
 
 
+def test_full_final_gated_compat_uses_old_chain_with_paired_rollback_gate():
+    cfg = load_cfg("configs/default.yaml")
+    cfg = copy.deepcopy(cfg)
+    apply_ablation(cfg, "full_final_gated_compat")
+
+    assert cfg["safety"]["projection_mode"] == "thermal_cap"
+    assert float(cfg["safety"]["thermal_cap_margin_c"]) == 0.5
+    assert cfg["safety"]["current_decoder"] == "per_source"
+    assert cfg["meta"]["protocol_name"] == "final_gated_compat"
+    assert int(cfg["meta"]["support_episodes"]) == 5
+    assert int(cfg["meta"]["support_adaptation_episodes"]) == 3
+    assert int(cfg["meta"]["support_gate_validation_episodes"]) == 2
+    assert int(cfg["meta"]["query_episodes"]) == 2
+    assert cfg["meta"]["query_updates_enabled"] is True
+    assert cfg["meta"]["query_context_updates_enabled"] is True
+    assert cfg["meta"]["support_gate"]["enabled"] is True
+    assert cfg["meta"]["support_gate"]["paired_validation"] is True
+    assert cfg["meta"]["support_gate"]["query_leakage"] is False
+    assert cfg["meta"]["support_gate"]["budget_mode"] == "paired_support_validation"
+    assert int(cfg["meta"]["support_gate"]["extra_support_rollouts"]) == 2
+    assert int(cfg["meta"]["support_gate"]["extra_gradient_updates"]) == 0
+    assert int(cfg["meta"]["support_gate"]["extra_query_evaluations"]) == 0
+    assert cfg["meta"]["support_update_acceptance"] == "support_side_gated"
+    assert cfg["upper_safety_shield"]["enabled"] is False
+    assert cfg["residual_planner"]["enabled"] is False
+    assert cfg["execution_thermal_guard"]["enabled"] is False
+    assert int(cfg["agent"]["upper_update_every"]) == 2
+
+    meta = cfg["pilot_metadata"]
+    assert meta["final_compat_full"] is True
+    assert meta["final_gated_compat"] is True
+    assert meta["final_ungated_compat"] is False
+    assert meta["support_gate"] is True
+    assert meta["support_gate_budget_mode"] == "paired_support_validation"
+    assert int(meta["support_gate_extra_rollouts"]) == 2
+    assert meta["pilot_only"] is False
+    assert meta["formal_ranking_exclude"] is False
+    assert "per_source_current_decoder" in meta["final_mechanisms"]
+    assert "five_support_three_update_two_paired_gate_validation" in meta["final_mechanisms"]
+    assert meta["current_decoder"] == "per_source"
+    assert meta["upper_shield_enabled"] is False
+    assert meta["residual_planner_enabled"] is False
+
+
+def test_full_final_ungated_compat_matches_final_chain_without_gate():
+    gated = load_cfg("configs/default.yaml")
+    gated = copy.deepcopy(gated)
+    apply_ablation(gated, "full_final_gated_compat")
+
+    ungated = load_cfg("configs/default.yaml")
+    ungated = copy.deepcopy(ungated)
+    apply_ablation(ungated, "full_final_ungated_compat")
+
+    for cfg in (gated, ungated):
+        assert cfg["safety"]["projection_mode"] == "thermal_cap"
+        assert float(cfg["safety"]["thermal_cap_margin_c"]) == 0.5
+        assert cfg["safety"]["current_decoder"] == "per_source"
+        assert int(cfg["meta"]["support_episodes"]) == 5
+        assert int(cfg["meta"]["support_adaptation_episodes"]) == 3
+        assert int(cfg["meta"]["query_episodes"]) == 2
+        assert cfg["meta"]["query_updates_enabled"] is True
+        assert cfg["meta"]["query_context_updates_enabled"] is True
+        assert cfg["upper_safety_shield"]["enabled"] is False
+        assert cfg["residual_planner"]["enabled"] is False
+        assert cfg["execution_thermal_guard"]["enabled"] is False
+        assert int(cfg["agent"]["upper_update_every"]) == 2
+
+    assert ungated["meta"]["protocol_name"] == "final_ungated_compat"
+    assert ungated["meta"]["support_gate"]["enabled"] is False
+    assert ungated["meta"]["support_gate"]["paired_validation"] is False
+    assert ungated["meta"]["support_gate"]["budget_mode"] == "support_gate_disabled"
+    assert int(ungated["meta"]["support_gate_validation_episodes"]) == 0
+    assert int(ungated["meta"]["support_gate"]["extra_support_rollouts"]) == 0
+    assert int(ungated["meta"]["support_gate"]["extra_gradient_updates"]) == 0
+    assert int(ungated["meta"]["support_gate"]["extra_query_evaluations"]) == 0
+    assert ungated["meta"]["support_update_acceptance"] == "unconditional"
+
+    meta = ungated["pilot_metadata"]
+    assert meta["final_compat_full"] is True
+    assert meta["final_gated_compat"] is False
+    assert meta["final_ungated_compat"] is True
+    assert meta["support_gate"] is False
+    assert meta["support_gate_budget_mode"] == "support_gate_disabled"
+    assert int(meta["support_gate_extra_rollouts"]) == 0
+    assert "five_support_three_update_two_context_only_support" in meta["final_mechanisms"]
+
+
 def test_full_compat_no_support_gate_probe_removes_gate_budget():
     cfg = load_cfg("configs/default.yaml")
     cfg = copy.deepcopy(cfg)
