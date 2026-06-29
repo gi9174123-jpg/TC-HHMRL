@@ -749,6 +749,9 @@ def test_full_final_recover_variants_restore_old_lightweight_selection_and_optim
         assert "optimizer_state_not_reset_after_outer_update" in meta["final_recover_mechanisms"]
         assert "checkpoint_selection_3_tasks_1_episode" in meta["final_recover_mechanisms"]
         assert "task_thermal_params_in_thermal_cap" in meta["final_recover_mechanisms"]
+        formal_meta = formal_metadata_snapshot(cfg)
+        assert formal_meta["thermal_parameter_source"] == "task_thermal_params"
+        assert formal_meta["controller_uses_task_gamma_delta"] is True
 
     for cfg in (gated, ungated):
         assert cfg["meta"]["protocol_name"] == "final_no_rollback_recover"

@@ -296,6 +296,9 @@ def formal_metadata_snapshot(cfg: Dict, *, pre_alignment: bool | None = None, ta
     planner_cfg = cfg.get("residual_planner", {}) or {}
     upper_cfg = cfg.get("upper_dqn", {}) or {}
     safety_cfg = cfg.get("safety", {}) or {}
+    thermal_parameter_source = str(
+        safety_cfg.get("thermal_parameter_source", "nominal_plus_online_effective_gain")
+    )
     return {
         **alignment_snapshot(cfg, pre_alignment=pre_alignment, task_source=task_source),
         **physics_snapshot_from_cfg(cfg),
@@ -304,10 +307,8 @@ def formal_metadata_snapshot(cfg: Dict, *, pre_alignment: bool | None = None, ta
         "adaptive_thermal_projection": "gamma_nominal_plus_effective_gain_safe"
         if bool(adaptive_cfg.get("enabled", False))
         else "gamma_nominal_plus_initial_effective_gain",
-        "thermal_parameter_source": str(
-            safety_cfg.get("thermal_parameter_source", "nominal_plus_online_effective_gain")
-        ),
-        "controller_uses_task_gamma_delta": False,
+        "thermal_parameter_source": thermal_parameter_source,
+        "controller_uses_task_gamma_delta": thermal_parameter_source == "task_thermal_params",
         "gamma_nominal": float(safety_cfg.get("gamma_nominal", cfg.get("env", {}).get("gamma", 0.0))),
         "effective_gain_initial": list(safety_cfg.get("effective_gain_initial", [])),
         "current_decoder": str(safety_cfg.get("current_decoder", "per_source")),
@@ -6354,8 +6355,10 @@ def run_one_scenario(
                 "final_gated_compat": bool(is_final_gated_compat),
                 "final_ungated_compat": bool(is_final_ungated_compat),
                 "final_recover_full": bool(is_final_recover),
-                "final_gated_recover": bool(is_final_gated_recover),
+                "final_gated_recover": False if is_final_recover else bool(is_final_gated_recover),
                 "final_ungated_recover": bool(is_final_ungated_recover),
+                "final_no_rollback_recover": bool(is_final_recover),
+                "deprecated_gated_recover_alias": bool(is_final_gated_recover),
                 "final_mechanisms": (
                     [
                         "per_source_current_decoder",
@@ -6376,11 +6379,13 @@ def run_one_scenario(
                 "final_recover_mechanisms": (
                     [
                         "per_source_current_decoder",
+                        "task_thermal_params_in_thermal_cap",
                         "online_query_updates",
                         "three_support_three_update_two_query",
                         "support_gate_disabled_control",
                         "no_support_gate_rollback",
                         "optimizer_state_not_reset_after_outer_update",
+                        "adaptive_thermal_disabled",
                         "checkpoint_selection_3_tasks_1_episode",
                         "upper_shield_disabled",
                         "residual_planner_disabled",
