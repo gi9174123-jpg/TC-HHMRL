@@ -562,6 +562,30 @@ def test_uncertainty_aware_thermal_cap_tightens_current_limit():
     assert np.all(out_adaptive["effective_gain_safe"] > np.array([9.0, 12.0, 12.0], dtype=np.float32))
 
 
+def test_task_thermal_parameter_source_restores_delta_sensitive_cap():
+    cfg = copy.deepcopy(load_cfg("configs/default.yaml"))
+    cfg["safety"]["projection_mode"] = "thermal_cap"
+    cfg["safety"]["current_decoder"] = "per_source"
+    cfg["safety"]["thermal_parameter_source"] = "task_thermal_params"
+    cfg["adaptive_thermal"]["enabled"] = False
+    safety = SafetyLayer(cfg)
+    kwargs = {
+        "upper_raw": 11,
+        "lower_raw": np.array([1.0, 1.0, 1.0, 0.0, 0.0], dtype=np.float32),
+        "temps": np.array([42.0, 42.0, 42.0], dtype=np.float32),
+        "amb_temp": 35.0,
+        "gamma": 0.06,
+        "mem": {"current_boost": 3, "dwell_count": 3},
+    }
+
+    low_delta, _ = safety.project_np(delta=3.0, **kwargs)
+    high_delta, _ = safety.project_np(delta=8.0, **kwargs)
+
+    assert low_delta["thermal_parameter_source"] == "task_thermal_params"
+    assert np.all(high_delta["thermal_cap_current"] <= low_delta["thermal_cap_current"] + 1e-7)
+    assert float(np.sum(high_delta["currents_exec"])) < float(np.sum(low_delta["currents_exec"]))
+
+
 def test_safety_state_dict_restores_adaptive_thermal_estimator():
     cfg = copy.deepcopy(load_cfg("configs/default.yaml"))
     cfg["adaptive_thermal"]["enabled"] = True

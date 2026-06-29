@@ -630,6 +630,8 @@ def apply_legacy_strong_gated_full(cfg: Dict) -> None:
     safety_cfg["projection_mode"] = "thermal_cap"
     safety_cfg["thermal_cap_margin_c"] = 0.5
     safety_cfg["current_decoder"] = "per_source"
+    safety_cfg["thermal_parameter_source"] = "task_thermal_params"
+    cfg.setdefault("adaptive_thermal", {})["enabled"] = False
 
     cfg.setdefault("upper_safety_shield", {})["enabled"] = False
     cfg.setdefault("execution_thermal_guard", {})["enabled"] = False
@@ -666,6 +668,8 @@ def apply_legacy_strong_gated_full(cfg: Dict) -> None:
             "upper_update_every_2",
         ],
         "current_decoder": "per_source",
+        "thermal_parameter_source": "task_thermal_params",
+        "adaptive_thermal_enabled": False,
         "query_updates_enabled": True,
         "query_context_updates_enabled": True,
         "upper_shield_enabled": False,
@@ -708,6 +712,8 @@ def apply_final_compat_full(cfg: Dict, *, gated: bool) -> None:
     safety_cfg["projection_mode"] = "thermal_cap"
     safety_cfg["thermal_cap_margin_c"] = 0.5
     safety_cfg["current_decoder"] = "per_source"
+    safety_cfg["thermal_parameter_source"] = "task_thermal_params"
+    cfg.setdefault("adaptive_thermal", {})["enabled"] = False
 
     cfg.setdefault("upper_safety_shield", {})["enabled"] = False
     cfg.setdefault("execution_thermal_guard", {})["enabled"] = False
@@ -798,6 +804,8 @@ def apply_final_recover_full(cfg: Dict, *, gated: bool) -> None:
     safety_cfg["projection_mode"] = "thermal_cap"
     safety_cfg["thermal_cap_margin_c"] = 0.5
     safety_cfg["current_decoder"] = "per_source"
+    safety_cfg["thermal_parameter_source"] = "task_thermal_params"
+    cfg.setdefault("adaptive_thermal", {})["enabled"] = False
 
     cfg.setdefault("upper_safety_shield", {})["enabled"] = False
     cfg.setdefault("execution_thermal_guard", {})["enabled"] = False
@@ -835,6 +843,7 @@ def apply_final_recover_full(cfg: Dict, *, gated: bool) -> None:
         "support_update_acceptance": "support_side_gated" if gated else "unconditional",
         "final_recover_mechanisms": [
             "per_source_current_decoder",
+            "task_thermal_params_in_thermal_cap",
             "online_query_updates",
             "three_support_three_update_two_query",
             "support_gate_relaxed_support_side_guard" if gated else "support_gate_disabled_control",
@@ -846,6 +855,8 @@ def apply_final_recover_full(cfg: Dict, *, gated: bool) -> None:
             "upper_update_every_2",
         ],
         "current_decoder": "per_source",
+        "thermal_parameter_source": "task_thermal_params",
+        "adaptive_thermal_enabled": False,
         "query_updates_enabled": True,
         "query_context_updates_enabled": True,
         "reset_optimizer_after_outer_update": False,

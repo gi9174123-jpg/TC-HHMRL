@@ -719,6 +719,8 @@ def test_full_final_recover_variants_restore_old_lightweight_selection_and_optim
         assert cfg["safety"]["projection_mode"] == "thermal_cap"
         assert float(cfg["safety"]["thermal_cap_margin_c"]) == 0.5
         assert cfg["safety"]["current_decoder"] == "per_source"
+        assert cfg["safety"]["thermal_parameter_source"] == "task_thermal_params"
+        assert cfg["adaptive_thermal"]["enabled"] is False
         assert int(cfg["meta"]["support_episodes"]) == 3
         assert int(cfg["meta"]["support_adaptation_episodes"]) == 3
         assert int(cfg["meta"]["support_gate_validation_episodes"]) == 0
@@ -739,11 +741,14 @@ def test_full_final_recover_variants_restore_old_lightweight_selection_and_optim
         assert meta["pilot_only"] is False
         assert meta["formal_ranking_exclude"] is False
         assert meta["current_decoder"] == "per_source"
+        assert meta["thermal_parameter_source"] == "task_thermal_params"
+        assert meta["adaptive_thermal_enabled"] is False
         assert meta["reset_optimizer_after_outer_update"] is False
         assert int(meta["checkpoint_selection_eval_tasks"]) == 3
         assert int(meta["checkpoint_selection_eval_eps"]) == 1
         assert "optimizer_state_not_reset_after_outer_update" in meta["final_recover_mechanisms"]
         assert "checkpoint_selection_3_tasks_1_episode" in meta["final_recover_mechanisms"]
+        assert "task_thermal_params_in_thermal_cap" in meta["final_recover_mechanisms"]
 
     assert gated["meta"]["protocol_name"] == "final_gated_recover"
     assert gated["meta"]["support_gate"]["enabled"] is True

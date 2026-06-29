@@ -95,7 +95,7 @@ class SafetyLayer:
         self.thermal_cutoff = float(safety_cfg["thermal_cutoff"])
         self.thermal_parameter_source = str(
             safety_cfg.get("thermal_parameter_source", "nominal_plus_online_effective_gain")
-        )
+        ).lower()
         self.gamma_nominal = float(safety_cfg.get("gamma_nominal", env_cfg.get("gamma", 0.07)))
 
         tx_device = hybrid_cfg.get("tx_device", ["LED", "LD", "LD"])
@@ -198,6 +198,33 @@ class SafetyLayer:
 
     def _safe_thermal_coeff_torch(self, *, dtype: torch.dtype, device: torch.device) -> torch.Tensor:
         return torch.as_tensor(self.thermal_estimator.effective_gain_safe(), dtype=dtype, device=device).view(1, -1)
+
+    def _uses_task_thermal_params(self) -> bool:
+        return self.thermal_parameter_source in {
+            "task_thermal_params",
+            "legacy_task_thermal_params",
+            "task_oracle",
+            "legacy_oracle",
+        }
+
+    def _effective_thermal_gain_np(self, delta: float | None = None) -> np.ndarray:
+        if self._uses_task_thermal_params() and delta is not None:
+            return (max(float(delta), 0.0) * self.tx_thermal_coeff).astype(np.float32)
+        return self._safe_thermal_coeff_np()
+
+    def _effective_thermal_gain_torch(
+        self,
+        *,
+        dtype: torch.dtype,
+        device: torch.device,
+        delta: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        if self._uses_task_thermal_params() and delta is not None:
+            if delta.dim() == 1:
+                delta = delta.unsqueeze(1)
+            coeff = torch.as_tensor(self.tx_thermal_coeff, dtype=dtype, device=device).view(1, -1)
+            return torch.clamp(delta.to(dtype=dtype, device=device), min=0.0) * coeff
+        return self._safe_thermal_coeff_torch(dtype=dtype, device=device)
 
     @staticmethod
     def decode_upper(upper_raw: int | np.ndarray) -> Tuple[int, int]:
@@ -671,8 +698,8 @@ class SafetyLayer:
     def _thermal_base_np(self, temps: np.ndarray, amb_temp: float, gamma: float | None = None) -> Tuple[np.ndarray, np.ndarray]:
         temps = np.asarray(temps, dtype=np.float32)
         coupling = self._thermal_coupling_term_np(temps)
-        gamma_nominal = float(self.gamma_nominal)
-        base = ((1.0 - gamma_nominal) * temps + gamma_nominal * float(amb_temp) + coupling).astype(np.float32)
+        gamma_eff = float(gamma) if self._uses_task_thermal_params() and gamma is not None else float(self.gamma_nominal)
+        base = ((1.0 - gamma_eff) * temps + gamma_eff * float(amb_temp) + coupling).astype(np.float32)
         return base, coupling
 
     def _thermal_coupling_term_torch(self, temps: torch.Tensor) -> torch.Tensor:
@@ -689,8 +716,13 @@ class SafetyLayer:
         gamma: torch.Tensor | None = None,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         coupling = self._thermal_coupling_term_torch(temps)
-        gamma_nominal = torch.as_tensor(float(self.gamma_nominal), dtype=temps.dtype, device=temps.device)
-        base = (1.0 - gamma_nominal) * temps + gamma_nominal * amb_temp + coupling
+        if self._uses_task_thermal_params() and gamma is not None:
+            if gamma.dim() == 1:
+                gamma = gamma.unsqueeze(1)
+            gamma_eff = gamma.to(dtype=temps.dtype, device=temps.device)
+        else:
+            gamma_eff = torch.as_tensor(float(self.gamma_nominal), dtype=temps.dtype, device=temps.device)
+        base = (1.0 - gamma_eff) * temps + gamma_eff * amb_temp + coupling
         return base, coupling
 
     def _thermal_cap_np(
@@ -704,7 +736,7 @@ class SafetyLayer:
     ) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray, float]:
         base, coupling = self._thermal_base_np(temps, amb_temp, gamma)
         allowed_rise = self.thermal_safe - self.thermal_cap_margin_c - base
-        denom = self._safe_thermal_coeff_np() + 1.0e-6
+        denom = self._effective_thermal_gain_np(delta) + 1.0e-6
         cap = np.sqrt(np.maximum(allowed_rise / denom, 0.0)).astype(np.float32)
         cap = np.minimum(cap, self.current_max).astype(np.float32)
         safe_currents = np.minimum(currents, cap).astype(np.float32)
@@ -777,10 +809,10 @@ class SafetyLayer:
         gamma: torch.Tensor | None = None,
         delta: torch.Tensor | None = None,
         current_max: torch.Tensor,
-        thermal_coeff: torch.Tensor,
     ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
         base, coupling = self._thermal_base_torch(temps, amb_temp, gamma)
         allowed_rise = self.thermal_safe - self.thermal_cap_margin_c - base
+        thermal_coeff = self._effective_thermal_gain_torch(dtype=currents.dtype, device=currents.device, delta=delta)
         denom = thermal_coeff + 1.0e-6
         cap = torch.sqrt(torch.clamp(allowed_rise / denom, min=0.0))
         cap = torch.minimum(cap, current_max)
@@ -803,7 +835,6 @@ class SafetyLayer:
         gamma: torch.Tensor | None = None,
         delta: torch.Tensor | None = None,
         current_max: torch.Tensor,
-        thermal_coeff: torch.Tensor,
     ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
         safe_currents, cap, scale, base, coupling = self._thermal_cap_torch(
             currents=currents,
@@ -812,7 +843,6 @@ class SafetyLayer:
             gamma=gamma,
             delta=delta,
             current_max=current_max,
-            thermal_coeff=thermal_coeff,
         )
         active = (active_mask > 0.5).to(currents.dtype)
         cap = torch.minimum(cap, current_max * active)
@@ -886,7 +916,7 @@ class SafetyLayer:
 
         lower_raw = np.asarray(lower_raw, dtype=np.float32)
         temps = np.asarray(temps, dtype=np.float32)
-        thermal_coeff_safe_np = self._safe_thermal_coeff_np()
+        thermal_coeff_safe_np = self._effective_thermal_gain_np(delta)
 
         def _project_for_boost(boost_combo: int) -> Dict[str, object]:
             boost_combo = int(np.clip(boost_combo, 0, 3))
@@ -920,7 +950,7 @@ class SafetyLayer:
                 currents_p *= self._hard_bus_scale_np(total_p)
             bus_projected_current_total_p = float(np.sum(currents_p))
 
-            thermal_base_p, thermal_source_term_p = self._thermal_base_np(temps, float(amb_temp))
+            thermal_base_p, thermal_source_term_p = self._thermal_base_np(temps, float(amb_temp), gamma)
             t_pred_p = thermal_base_p + thermal_coeff_safe_np * (currents_p**2)
             thermal_cap_current_p = self.current_max.astype(np.float32)
             thermal_cap_scale_p = np.ones_like(currents_p, dtype=np.float32)
@@ -944,6 +974,8 @@ class SafetyLayer:
                     currents=currents_p,
                     temps=temps,
                     amb_temp=float(amb_temp),
+                    gamma=gamma,
+                    delta=delta,
                 )
                 t_pred_p = thermal_base_p + thermal_coeff_safe_np * (currents_p**2)
                 thermal_cap_scale_p = thermal_scale_p.astype(np.float32)
@@ -963,6 +995,8 @@ class SafetyLayer:
                     active_mask=active_mask_p,
                     temps=temps,
                     amb_temp=float(amb_temp),
+                    gamma=gamma,
+                    delta=delta,
                 )
                 t_pred_p = thermal_base_p + thermal_coeff_safe_np * (currents_p**2)
                 thermal_cap_scale_p = thermal_scale_p.astype(np.float32)
@@ -1499,8 +1533,8 @@ class SafetyLayer:
             temps = temps.unsqueeze(0)
         if amb_temp.dim() == 1:
             amb_temp = amb_temp.unsqueeze(1)
-        thermal_coeff = self._safe_thermal_coeff_torch(dtype=lower_raw.dtype, device=device)
-        thermal_base, thermal_source_term = self._thermal_base_torch(temps, amb_temp)
+        thermal_coeff = self._effective_thermal_gain_torch(dtype=lower_raw.dtype, device=device, delta=delta)
+        thermal_base, thermal_source_term = self._thermal_base_torch(temps, amb_temp, gamma)
         T_pred = thermal_base + thermal_coeff * (currents**2)
         thermal_cap_current = current_max.expand_as(currents)
         thermal_cap_scale = torch.ones_like(currents)
@@ -1517,9 +1551,11 @@ class SafetyLayer:
                 currents=currents,
                 temps=temps,
                 amb_temp=amb_temp,
+                gamma=gamma,
+                delta=delta,
                 current_max=current_max,
-                thermal_coeff=thermal_coeff,
             )
+            thermal_coeff = self._effective_thermal_gain_torch(dtype=lower_raw.dtype, device=device, delta=delta)
             T_pred = thermal_base + thermal_coeff * (currents**2)
             thermal_cap_scale = thermal_scale
             soft_scale = thermal_scale
@@ -1538,9 +1574,11 @@ class SafetyLayer:
                 active_mask=active_mask,
                 temps=temps,
                 amb_temp=amb_temp,
+                gamma=gamma,
+                delta=delta,
                 current_max=current_max,
-                thermal_coeff=thermal_coeff,
             )
+            thermal_coeff = self._effective_thermal_gain_torch(dtype=lower_raw.dtype, device=device, delta=delta)
             T_pred = thermal_base + thermal_coeff * (currents**2)
             thermal_cap_scale = thermal_scale
             soft_scale = thermal_scale
