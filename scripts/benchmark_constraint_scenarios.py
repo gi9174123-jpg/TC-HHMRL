@@ -5291,6 +5291,198 @@ def write_statistics_artifact(out_root: Path, artifact: Dict[str, object]) -> Di
     return {"json": str(json_path), "csv": str(csv_path)}
 
 
+def build_model_mismatch_artifact(run_rows: List[Dict]) -> Dict[str, object] | None:
+    mismatch_rows = [
+        dict(row)
+        for row in run_rows
+        if str(row.get("scenario", "")).startswith("model_mismatch_d")
+    ]
+    if not mismatch_rows:
+        return None
+
+    variants = ("hybrid", "mpc_grid", "mpc_grid_nominal_model")
+    metrics = ["reward", "se", "eh", "cost", "violation_rate"]
+    metric_fields = {metric: STAT_METRIC_FIELDS[metric] for metric in metrics}
+    scenario_order = sorted(
+        {str(row["scenario"]) for row in mismatch_rows},
+        key=lambda s: float(next((r.get("model_mismatch_level", 0.0) for r in mismatch_rows if str(r.get("scenario")) == s), 0.0) or 0.0),
+    )
+
+    csv_rows: List[Dict[str, object]] = []
+    scenario_payload: Dict[str, Dict[str, object]] = {}
+
+    for scenario in scenario_order:
+        rows = [row for row in mismatch_rows if str(row.get("scenario")) == scenario]
+        level = float(next((row.get("model_mismatch_level", 0.0) for row in rows), 0.0) or 0.0)
+        scenario_payload[scenario] = {"model_mismatch_level": level, "groups": {}, "pairwise": [], "boundary": []}
+
+        for variant in variants:
+            v_rows = [row for row in rows if str(row.get("variant")) == variant]
+            if not v_rows:
+                continue
+            group = {"n": len(v_rows)}
+            for metric, field in metric_fields.items():
+                vals = np.asarray([float(row[field]) for row in v_rows if field in row], dtype=np.float64)
+                if vals.size:
+                    group[metric] = {"mean": float(vals.mean()), "std": float(vals.std(ddof=0))}
+                    csv_rows.append(
+                        {
+                            "artifact": "stats_model_mismatch_robustness",
+                            "row_type": "group",
+                            "scenario": scenario,
+                            "model_mismatch_level": level,
+                            "variant": variant,
+                            "metric": metric,
+                            "n": int(vals.size),
+                            "mean": float(vals.mean()),
+                            "std": float(vals.std(ddof=0)),
+                        }
+                    )
+            scenario_payload[scenario]["groups"][variant] = group
+
+        for variant in ("mpc_grid", "mpc_grid_nominal_model"):
+            v_rows = [row for row in rows if str(row.get("variant")) == variant]
+            if not v_rows:
+                continue
+            scoring_models = {str(row.get("mpc_scoring_model", "")) for row in v_rows}
+            uses_true = {str(row.get("mpc_scoring_uses_true_gamma_delta", "")) for row in v_rows}
+            expected_model = "perfect_env" if variant == "mpc_grid" else "nominal_model"
+            expected_uses_true = "True" if variant == "mpc_grid" else "False"
+            mismatch_abs = [
+                abs(float(row.get("mean_mpc_gamma_mismatch", 0.0) or 0.0))
+                + abs(float(row.get("mean_mpc_delta_mismatch", 0.0) or 0.0))
+                for row in v_rows
+            ]
+            boundary_ok = scoring_models == {expected_model} and uses_true == {expected_uses_true}
+            if variant == "mpc_grid_nominal_model" and level > 1.0e-9:
+                boundary_ok = boundary_ok and bool(np.mean(mismatch_abs) > 0.0)
+            boundary_row = {
+                "variant": variant,
+                "boundary_ok": bool(boundary_ok),
+                "expected_scoring_model": expected_model,
+                "observed_scoring_models": sorted(scoring_models),
+                "expected_uses_true_gamma_delta": expected_uses_true,
+                "observed_uses_true_gamma_delta": sorted(uses_true),
+                "mean_abs_gamma_delta_mismatch": float(np.mean(mismatch_abs)) if mismatch_abs else None,
+            }
+            scenario_payload[scenario]["boundary"].append(boundary_row)
+            csv_rows.append(
+                {
+                    "artifact": "stats_model_mismatch_robustness",
+                    "row_type": "boundary",
+                    "scenario": scenario,
+                    "model_mismatch_level": level,
+                    **boundary_row,
+                }
+            )
+
+        for left_variant, right_variant in [
+            ("mpc_grid", "mpc_grid_nominal_model"),
+            ("hybrid", "mpc_grid_nominal_model"),
+            ("hybrid", "mpc_grid"),
+        ]:
+            for metric, field in metric_fields.items():
+                left_map = {
+                    _stats_pairing_key(row, scenario): float(row[field])
+                    for row in rows
+                    if str(row.get("variant")) == left_variant and field in row
+                }
+                right_map = {
+                    _stats_pairing_key(row, scenario): float(row[field])
+                    for row in rows
+                    if str(row.get("variant")) == right_variant and field in row
+                }
+                common_keys = sorted(set(left_map.keys()) & set(right_map.keys()))
+                if not common_keys:
+                    continue
+                diffs = np.asarray([left_map[key] - right_map[key] for key in common_keys], dtype=np.float64)
+                stat = _paired_diff_stats(diffs)
+                pair_row = {
+                    "scenario": scenario,
+                    "model_mismatch_level": level,
+                    "metric": metric,
+                    "left_variant": left_variant,
+                    "right_variant": right_variant,
+                    "pairing_key_fields": list(PAIRING_KEY_FIELDS),
+                    **stat,
+                }
+                scenario_payload[scenario]["pairwise"].append(pair_row)
+                csv_rows.append(
+                    {
+                        "artifact": "stats_model_mismatch_robustness",
+                        "row_type": "pairwise",
+                        "scenario": scenario,
+                        "model_mismatch_level": level,
+                        "metric": metric,
+                        "left_variant": left_variant,
+                        "right_variant": right_variant,
+                        "n_pairs": stat["n_pairs"],
+                        "mean_diff": stat["mean_diff"],
+                        "median_diff": stat.get("median_diff"),
+                        "std_diff": stat["std_diff"],
+                        "bootstrap_ci_low": stat.get("bootstrap_ci_low"),
+                        "bootstrap_ci_high": stat.get("bootstrap_ci_high"),
+                        "positive_seed_count": stat.get("positive_seed_count"),
+                        "negative_seed_count": stat.get("negative_seed_count"),
+                        "p_value": stat["p_value"],
+                    }
+                )
+
+        for metric, field in metric_fields.items():
+            hybrid_map = {
+                _stats_pairing_key(row, scenario): float(row[field])
+                for row in rows
+                if str(row.get("variant")) == "hybrid" and field in row
+            }
+            perfect_map = {
+                _stats_pairing_key(row, scenario): float(row[field])
+                for row in rows
+                if str(row.get("variant")) == "mpc_grid" and field in row
+            }
+            nominal_map = {
+                _stats_pairing_key(row, scenario): float(row[field])
+                for row in rows
+                if str(row.get("variant")) == "mpc_grid_nominal_model" and field in row
+            }
+            common_keys = sorted(set(hybrid_map) & set(perfect_map) & set(nominal_map))
+            if not common_keys:
+                continue
+            perfect_adv = np.asarray([perfect_map[key] - hybrid_map[key] for key in common_keys], dtype=np.float64)
+            nominal_adv = np.asarray([nominal_map[key] - hybrid_map[key] for key in common_keys], dtype=np.float64)
+            erosion = perfect_adv - nominal_adv
+            row = {
+                "scenario": scenario,
+                "model_mismatch_level": level,
+                "metric": metric,
+                "n_pairs": int(len(common_keys)),
+                "perfect_mpc_advantage_mean": float(perfect_adv.mean()),
+                "nominal_mpc_advantage_mean": float(nominal_adv.mean()),
+                "advantage_erosion_mean": float(erosion.mean()),
+                "advantage_erosion_median": float(np.median(erosion)),
+                "positive_erosion_seed_count": int(np.sum(erosion > 0)),
+                "negative_erosion_seed_count": int(np.sum(erosion < 0)),
+            }
+            scenario_payload[scenario].setdefault("advantage_erosion", []).append(row)
+            csv_rows.append(
+                {
+                    "artifact": "stats_model_mismatch_robustness",
+                    "row_type": "advantage_erosion",
+                    **row,
+                }
+            )
+
+    return {
+        "artifact": "stats_model_mismatch_robustness",
+        "generated_at": datetime.now().isoformat(timespec="seconds"),
+        "purpose": "quantify perfect-model MPC advantage erosion under pre-registered model mismatch",
+        "pairing_key_fields": list(PAIRING_KEY_FIELDS),
+        "variants": list(variants),
+        "metrics": metrics,
+        "scenarios": scenario_payload,
+        "csv_rows": csv_rows,
+    }
+
+
 def plot_current_allocation(current_df: pd.DataFrame, out_path: Path) -> None:
     variants = list(current_df["variant"].unique())
     current_cols = _current_columns(current_df)
@@ -7000,6 +7192,7 @@ def run_benchmark(
                 variant_order=THERMAL_VARIANT_ORDER,
                 metrics=["reward", "cost", "violation_rate", "temp_q90", "thermal_step_violation_fraction"],
             ),
+            build_model_mismatch_artifact(all_run_summaries),
         ],
     ):
         stats_artifacts[str(artifact["artifact"])] = write_statistics_artifact(out_root, artifact)

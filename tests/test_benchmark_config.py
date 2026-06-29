@@ -14,6 +14,7 @@ from scripts.benchmark_constraint_scenarios import (
     apply_baseline_overrides,
     apply_scenario,
     apply_variant,
+    build_model_mismatch_artifact,
     formal_metadata_snapshot,
     inject_default_curriculum,
     sample_fixed_tasks,
@@ -205,6 +206,52 @@ def test_model_mismatch_d00_is_nominal_no_shift():
     assert np.isclose(cfg["env"]["amb_temp"], nominal["amb_temp"])
     assert np.allclose(cfg["sampler"]["gamma_range"], [nominal["gamma"], nominal["gamma"]])
     assert np.allclose(cfg["sampler"]["delta_range"], [nominal["delta"], nominal["delta"]])
+
+
+def test_model_mismatch_artifact_reports_boundary_and_advantage_erosion():
+    rows = []
+    for seed in [101, 202]:
+        for variant, reward, se, cost, violation, model, uses_true, gm, dm in [
+            ("hybrid", 0.50, 0.52, 0.010, 0.020, "", None, None, None),
+            ("mpc_grid", 0.70, 0.71, 0.000, 0.000, "perfect_env", True, 0.0, 0.0),
+            ("mpc_grid_nominal_model", 0.58, 0.59, 0.020, 0.050, "nominal_model", False, 0.01, 1.0),
+        ]:
+            rows.append(
+                {
+                    "scenario": "model_mismatch_d30",
+                    "variant": variant,
+                    "seed": seed,
+                    "eval_task_batch_hash": f"task-{seed}",
+                    "ordered_eval_task_batch_hash": f"ordered-{seed}",
+                    "model_mismatch_level": 0.30,
+                    "eval_reward": reward,
+                    "eval_se": se,
+                    "eval_eh": 0.001,
+                    "eval_cost": cost,
+                    "eval_violation_rate": violation,
+                    "mpc_scoring_model": model,
+                    "mpc_scoring_uses_true_gamma_delta": uses_true,
+                    "mean_mpc_gamma_mismatch": gm,
+                    "mean_mpc_delta_mismatch": dm,
+                    "formal_ranking_comparable": True,
+                }
+            )
+
+    artifact = build_model_mismatch_artifact(rows)
+    assert artifact is not None
+    scenario = artifact["scenarios"]["model_mismatch_d30"]
+    boundary = {row["variant"]: row for row in scenario["boundary"]}
+    assert boundary["mpc_grid"]["boundary_ok"] is True
+    assert boundary["mpc_grid_nominal_model"]["boundary_ok"] is True
+
+    reward_erosion = [
+        row for row in scenario["advantage_erosion"] if row["metric"] == "reward"
+    ][0]
+    assert np.isclose(reward_erosion["perfect_mpc_advantage_mean"], 0.20)
+    assert np.isclose(reward_erosion["nominal_mpc_advantage_mean"], 0.08)
+    assert np.isclose(reward_erosion["advantage_erosion_mean"], 0.12)
+    assert any(row["row_type"] == "boundary" for row in artifact["csv_rows"])
+    assert any(row["row_type"] == "advantage_erosion" for row in artifact["csv_rows"])
 
 
 def test_moderate_config_keeps_model_aware_lower_components_enabled():
