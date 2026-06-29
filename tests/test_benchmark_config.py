@@ -7,6 +7,7 @@ import pandas as pd
 import torch
 
 from scripts.benchmark_constraint_scenarios import (
+    MODEL_MISMATCH_SCENARIOS,
     Shin2024MatchedBaseline,
     apply_common_settings,
     apply_ablation,
@@ -157,6 +158,53 @@ def test_formal_metadata_reports_model_aware_lower_components():
     assert meta["upper_double_dqn"] is True
     assert meta["upper_dueling_dqn"] is True
     assert meta["upper_physical_context_enabled"] is True
+
+
+def test_model_mismatch_scenario_freezes_nominal_model_and_shifts_real_task():
+    cfg = load_cfg("configs/default.yaml")
+    cfg = copy.deepcopy(cfg)
+    apply_scenario(cfg, "model_mismatch_d30")
+
+    mismatch = cfg["model_mismatch"]
+    nominal = cfg["baselines"]["mpc_grid"]["nominal_model"]
+    sampler = cfg["sampler"]
+    meta = formal_metadata_snapshot(cfg)
+
+    assert set(MODEL_MISMATCH_SCENARIOS) >= {"model_mismatch_d00", "model_mismatch_d50"}
+    assert mismatch["enabled"] is True
+    assert np.isclose(mismatch["level"], 0.30)
+    assert mismatch["base_scenario"] == "practical_hard"
+    assert mismatch["mpc_nominal_model_fixed"] is True
+    assert nominal["gamma"] == 0.070
+    assert nominal["delta"] == 5.2
+    assert nominal["amb_temp"] == 32.0
+    assert cfg["env"]["gamma"] > nominal["gamma"]
+    assert cfg["env"]["delta"] > nominal["delta"]
+    assert cfg["env"]["amb_temp"] > nominal["amb_temp"]
+    assert cfg["env"]["hybrid"]["thermal_ld_coeff"] > nominal["thermal_ld_coeff"]
+    assert np.mean(sampler["gamma_range"]) > nominal["gamma"]
+    assert np.mean(sampler["delta_range"]) > nominal["delta"]
+    assert np.isclose(cfg["safety"]["gamma_nominal"], nominal["gamma"])
+    assert np.allclose(
+        cfg["adaptive_thermal"]["initial_effective_gain"],
+        [nominal["delta"] * nominal["thermal_led_coeff"], nominal["delta"] * nominal["thermal_ld_coeff"], nominal["delta"] * nominal["thermal_ld_coeff"]],
+    )
+    assert meta["thermal_parameter_source"] == "nominal_plus_online_effective_gain"
+    assert meta["controller_uses_task_gamma_delta"] is False
+
+
+def test_model_mismatch_d00_is_nominal_no_shift():
+    cfg = load_cfg("configs/default.yaml")
+    cfg = copy.deepcopy(cfg)
+    apply_scenario(cfg, "model_mismatch_d00")
+
+    nominal = cfg["baselines"]["mpc_grid"]["nominal_model"]
+    assert cfg["model_mismatch"]["level"] == 0.0
+    assert np.isclose(cfg["env"]["gamma"], nominal["gamma"])
+    assert np.isclose(cfg["env"]["delta"], nominal["delta"])
+    assert np.isclose(cfg["env"]["amb_temp"], nominal["amb_temp"])
+    assert np.allclose(cfg["sampler"]["gamma_range"], [nominal["gamma"], nominal["gamma"]])
+    assert np.allclose(cfg["sampler"]["delta_range"], [nominal["delta"], nominal["delta"]])
 
 
 def test_moderate_config_keeps_model_aware_lower_components_enabled():

@@ -62,6 +62,8 @@ from tchhmrl.utils.config import apply_cli_overrides, load_cfg, resolve_device
 from tchhmrl.utils.logger import Logger
 from tchhmrl.utils.seed import set_seed
 
+MODEL_MISMATCH_SCENARIOS = tuple(f"model_mismatch_d{pct:02d}" for pct in (0, 10, 20, 30, 40, 50))
+
 
 def _git_output(args: List[str]) -> str:
     try:
@@ -553,6 +555,123 @@ def sync_thermal_gain_prior_with_tx_devices(
     synced = [float(by_device.get(device, float(ref_gains[min(i, ref_gains.size - 1)]))) for i, device in enumerate(tx_device)]
     cfg.setdefault("safety", {})["effective_gain_initial"] = synced
     cfg.setdefault("adaptive_thermal", {})["initial_effective_gain"] = list(synced)
+
+
+def _range_around(center: float, half_width: float, *, lower: float = 0.0) -> List[float]:
+    return [float(max(lower, center - half_width)), float(max(lower, center + half_width))]
+
+
+def _freeze_mpc_nominal_model_from_current_cfg(cfg: Dict) -> Dict[str, object]:
+    env_cfg = cfg.setdefault("env", {})
+    safety_cfg = cfg.setdefault("safety", {})
+    hybrid_cfg = env_cfg.setdefault("hybrid", {})
+    nominal = cfg.setdefault("baselines", {}).setdefault("mpc_grid", {}).setdefault("nominal_model", {})
+
+    nominal_update = {
+        "gamma": float(env_cfg.get("gamma", 0.07)),
+        "delta": float(env_cfg.get("delta", 5.2)),
+        "amb_temp": float(env_cfg.get("amb_temp", 32.0)),
+        "thermal_safe": float(env_cfg.get("thermal_safe", safety_cfg.get("thermal_safe", 49.0))),
+        "qos_min_rate": float(env_cfg.get("qos_min_rate", 0.05)),
+        "current_max": [float(x) for x in np.asarray(safety_cfg.get("current_max", [3.0, 3.0, 3.0]), dtype=float)],
+        "bus_current_max": float(safety_cfg.get("bus_current_max", 6.4)),
+        "eta_led": float(hybrid_cfg.get("eta_led", 0.90)),
+        "eta_ld": float(hybrid_cfg.get("eta_ld", 1.25)),
+        "se_led_weight": float(hybrid_cfg.get("se_led_weight", 0.95)),
+        "se_ld_weight": float(hybrid_cfg.get("se_ld_weight", 1.10)),
+        "eh_led_weight": float(hybrid_cfg.get("eh_led_weight", 1.15)),
+        "eh_ld_weight": float(hybrid_cfg.get("eh_ld_weight", 0.82)),
+        "thermal_led_coeff": float(hybrid_cfg.get("thermal_led_coeff", 1.08)),
+        "thermal_ld_coeff": float(hybrid_cfg.get("thermal_ld_coeff", 1.60)),
+        "noise_floor": float(hybrid_cfg.get("noise_floor", env_cfg.get("noise_floor", 0.05))),
+        "noise_led_coeff": float(hybrid_cfg.get("noise_led_coeff", 0.017)),
+        "noise_ld_coeff": float(hybrid_cfg.get("noise_ld_coeff", 0.034)),
+        "mode_se_gain": [float(x) for x in np.asarray(env_cfg.get("mode_se_gain", [1.0, 1.30, 0.72]), dtype=float)],
+        "mode_eh_gain": [float(x) for x in np.asarray(env_cfg.get("mode_eh_gain", [1.0, 0.72, 1.30]), dtype=float)],
+        "channel_gain_scale": 1.0,
+    }
+    nominal.update(nominal_update)
+
+    nominal_gamma = float(nominal_update["gamma"])
+    nominal_delta = float(nominal_update["delta"])
+    nominal_led_gain = nominal_delta * float(nominal_update["thermal_led_coeff"])
+    nominal_ld_gain = nominal_delta * float(nominal_update["thermal_ld_coeff"])
+    safety_cfg["gamma_nominal"] = nominal_gamma
+    safety_cfg["effective_gain_initial"] = [nominal_led_gain, nominal_ld_gain, nominal_ld_gain]
+    cfg.setdefault("adaptive_thermal", {})["initial_effective_gain"] = [nominal_led_gain, nominal_ld_gain, nominal_ld_gain]
+    return nominal_update
+
+
+def apply_model_mismatch_overlay(cfg: Dict, level: float, *, base_scenario: str) -> None:
+    level = float(np.clip(level, 0.0, 0.5))
+    env_cfg = cfg.setdefault("env", {})
+    sampler_cfg = cfg.setdefault("sampler", {})
+    hybrid_cfg = env_cfg.setdefault("hybrid", {})
+    safety_cfg = cfg.setdefault("safety", {})
+
+    nominal = _freeze_mpc_nominal_model_from_current_cfg(cfg)
+    gamma0 = float(nominal["gamma"])
+    delta0 = float(nominal["delta"])
+    amb0 = float(nominal["amb_temp"])
+    attenuation0 = float(env_cfg.get("attenuation_c", 0.24))
+    misalign0 = float(env_cfg.get("misalign_std", 0.10))
+    thermal_led0 = float(nominal["thermal_led_coeff"])
+    thermal_ld0 = float(nominal["thermal_ld_coeff"])
+
+    gamma_true = gamma0 * (1.0 + 0.25 * level)
+    delta_true = delta0 * (1.0 + 0.65 * level)
+    amb_true = amb0 + 6.0 * level
+    attenuation_true = attenuation0 + 0.12 * level
+    misalign_true = misalign0 + 0.08 * level
+    thermal_led_true = thermal_led0 * (1.0 + 0.25 * level)
+    thermal_ld_true = thermal_ld0 * (1.0 + 0.45 * level)
+
+    env_cfg["gamma"] = float(gamma_true)
+    env_cfg["delta"] = float(delta_true)
+    env_cfg["amb_temp"] = float(amb_true)
+    env_cfg["attenuation_c"] = float(attenuation_true)
+    env_cfg["misalign_std"] = float(misalign_true)
+    hybrid_cfg["thermal_led_coeff"] = float(thermal_led_true)
+    hybrid_cfg["thermal_ld_coeff"] = float(thermal_ld_true)
+    hybrid_cfg["noise_ld_coeff"] = float(float(nominal["noise_ld_coeff"]) * (1.0 + 0.20 * level))
+    hybrid_cfg["eta_ld"] = float(float(nominal["eta_ld"]) * (1.0 - 0.08 * level))
+    hybrid_cfg["misalign_ld_scale"] = float(hybrid_cfg.get("misalign_ld_scale", 0.55) * (1.0 - 0.20 * level))
+
+    if level <= 1.0e-9:
+        sampler_cfg["gamma_range"] = [gamma_true, gamma_true]
+        sampler_cfg["delta_range"] = [delta_true, delta_true]
+        sampler_cfg["amb_temp_range"] = [amb_true, amb_true]
+        sampler_cfg["attenuation_c_range"] = [attenuation_true, attenuation_true]
+        sampler_cfg["misalign_std_range"] = [misalign_true, misalign_true]
+    else:
+        sampler_cfg["gamma_range"] = _range_around(gamma_true, max(0.002, gamma0 * 0.05 * level), lower=1.0e-6)
+        sampler_cfg["delta_range"] = _range_around(delta_true, max(0.05, delta0 * 0.06 * level), lower=1.0e-6)
+        sampler_cfg["amb_temp_range"] = _range_around(amb_true, 1.0 + 2.0 * level, lower=-50.0)
+        sampler_cfg["attenuation_c_range"] = _range_around(attenuation_true, 0.01 + 0.04 * level, lower=0.0)
+        sampler_cfg["misalign_std_range"] = _range_around(misalign_true, 0.005 + 0.03 * level, lower=0.0)
+
+    cfg["model_mismatch"] = {
+        "enabled": True,
+        "level": float(level),
+        "base_scenario": str(base_scenario),
+        "real_environment": "shifted_channel_thermal_task_distribution",
+        "nominal_model_source": "pre_mismatch_practical_hard_config",
+        "mpc_nominal_model_fixed": True,
+        "hybrid_information_boundary": "observation_history_feedback_no_true_task_gamma_delta",
+        "nominal_gamma": gamma0,
+        "nominal_delta": delta0,
+        "nominal_amb_temp": amb0,
+        "true_gamma_center": float(gamma_true),
+        "true_delta_center": float(delta_true),
+        "true_amb_temp_center": float(amb_true),
+        "true_attenuation_c_center": float(attenuation_true),
+        "true_misalign_std_center": float(misalign_true),
+        "true_thermal_led_coeff": float(thermal_led_true),
+        "true_thermal_ld_coeff": float(thermal_ld_true),
+    }
+    safety_cfg.setdefault("thermal_parameter_source", "nominal_plus_online_effective_gain")
+    cfg.setdefault("adaptive_thermal", {})["enabled"] = bool(cfg.get("adaptive_thermal", {}).get("enabled", True))
+    sync_site_bank_with_cfg(cfg)
 
 
 def apply_variant(cfg: Dict, variant: str) -> None:
@@ -1751,6 +1870,14 @@ def apply_baseline_overrides(cfg: Dict, baseline: str) -> None:
 def apply_scenario(cfg: Dict, scenario: str) -> None:
     def finish() -> None:
         sync_site_bank_with_cfg(cfg)
+
+    if scenario in MODEL_MISMATCH_SCENARIOS:
+        # A pre-registered model-mismatch sweep. The nominal model is frozen
+        # from practical_hard before the real task dynamics are shifted.
+        level = float(int(str(scenario).rsplit("d", 1)[1])) / 100.0
+        apply_scenario(cfg, "practical_hard")
+        apply_model_mismatch_overlay(cfg, level, base_scenario="practical_hard")
+        return
 
     if scenario in {"easy_baseline", "baseline_easy"}:
         # Easy / baseline: mild channel, low thermal pressure, smooth dynamics.
@@ -5608,6 +5735,7 @@ def run_one_scenario(
             run_ckpt_cfg = dict(run_meta_cfg.get("checkpoint_selection", {}) or {})
             run_support_gate_cfg = dict(run_meta_cfg.get("support_gate", {}) or {})
             formal_meta = formal_metadata_snapshot(cfg)
+            mismatch_meta = dict(cfg.get("model_mismatch", {}) or {})
             formal_record_probe = {
                 **formal_meta,
                 "projection_mode": projection_mode,
@@ -5716,6 +5844,18 @@ def run_one_scenario(
                         else None
                     ),
                     "sampler_ranges": sampler_snapshot(cfg),
+                    "model_mismatch_enabled": bool(mismatch_meta.get("enabled", False)),
+                    "model_mismatch_level": mismatch_meta.get("level"),
+                    "model_mismatch_base_scenario": str(mismatch_meta.get("base_scenario", "")),
+                    "model_mismatch_real_environment": str(mismatch_meta.get("real_environment", "")),
+                    "model_mismatch_nominal_model_source": str(mismatch_meta.get("nominal_model_source", "")),
+                    "model_mismatch_mpc_nominal_model_fixed": mismatch_meta.get("mpc_nominal_model_fixed"),
+                    "hybrid_information_boundary": str(mismatch_meta.get("hybrid_information_boundary", "")),
+                    "mismatch_nominal_gamma": mismatch_meta.get("nominal_gamma"),
+                    "mismatch_nominal_delta": mismatch_meta.get("nominal_delta"),
+                    "mismatch_true_gamma_center": mismatch_meta.get("true_gamma_center"),
+                    "mismatch_true_delta_center": mismatch_meta.get("true_delta_center"),
+                    "mismatch_true_amb_temp_center": mismatch_meta.get("true_amb_temp_center"),
                     "selection_task_batch_hash": selection_task_hash,
                     "eval_task_batch_hash": eval_task_hash,
                     "env_task_batch_hash": env_task_hash,
@@ -6991,6 +7131,7 @@ def parse_args() -> argparse.Namespace:
             "thermal_tight",
             "channel_harsh",
             "thermal_rebalanced",
+            *MODEL_MISMATCH_SCENARIOS,
         ],
     )
     parser.add_argument(
