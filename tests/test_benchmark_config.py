@@ -917,6 +917,7 @@ def test_non_meta_baseline_overrides_disable_support_gate():
         "sac_dalal_safe",
         "uysal_policy_optimizer",
         "mpc_grid",
+        "mpc_grid_nominal_model",
         "javadi_ppo_dimming",
         "deeprat_assignment_power",
         "pdqn_hybrid_action",
@@ -934,6 +935,24 @@ def test_non_meta_baseline_overrides_disable_support_gate():
             assert cfg["constraint_critics"]["reward_target"] == "penalized_reward"
             assert cfg["baseline_metadata"]["constraint_critics_enabled"] is False
             assert cfg["baseline_metadata"]["lower_reward_target"] == "penalized_reward"
+
+
+def test_mpc_grid_nominal_model_override_sets_information_boundary():
+    cfg = load_cfg("configs/default.yaml")
+    cfg = copy.deepcopy(cfg)
+    apply_baseline_overrides(cfg, "mpc_grid_nominal_model")
+
+    meta = cfg["baseline_metadata"]
+    nominal = cfg["baselines"]["mpc_grid"]["nominal_model"]
+    assert cfg["baselines"]["mpc_grid"]["scoring_model"] == "nominal_model"
+    assert meta["baseline_family"] == "mpc_grid_nominal_model"
+    assert meta["comparison_role"] == "model_mismatch_optimizer_reference"
+    assert meta["mpc_scoring_model"] == "nominal_model"
+    assert meta["mpc_scoring_uses_true_gamma_delta"] is False
+    assert meta["mpc_information_boundary"] == "nominal_model_candidate_scoring_no_true_gamma_delta"
+    assert meta["model_mismatch_role"] == "nominal_model_under_real_execution_mismatch"
+    assert meta["mpc_nominal_gamma"] == nominal["gamma"]
+    assert meta["mpc_nominal_delta"] == nominal["delta"]
 
 
 def test_shin2024_matched_action_contract_forces_hy_and_fixed_currents(tmp_path):

@@ -1283,6 +1283,20 @@ PAPER_BASELINE_EXPLANATIONS: Dict[str, Dict[str, str]] = {
         "environment_dependency": "selected candidates depend on current observable state, deterministic model, safety projection, and latency budget",
         "not_exact_reproduction_reason": "implemented as MPC-Grid only; no SCA or convexified subproblem is claimed",
     },
+    "mpc_grid_nominal_model": {
+        "paper_core_mechanism": "traditional model-based online resource optimization by deterministic candidate search",
+        "adapted_mapping_to_tc_hhmrl": (
+            "uses the same MPC-Grid candidate set as the perfect-model reference, but scores candidates with a "
+            "pre-registered nominal channel/thermal model while execution occurs in the real task environment"
+        ),
+        "domain_match": "model_based_optimizer_not_single_paper_exact",
+        "environment_dependency": (
+            "performance depends on mismatch between nominal scoring parameters and the real task channel/thermal dynamics"
+        ),
+        "not_exact_reproduction_reason": (
+            "implemented as an information-boundary robustness reference; no SCA or convexified subproblem is claimed"
+        ),
+    },
     "javadi_ppo_dimming": {
         "paper_core_mechanism": "OWC-SLIPT active LED selection, joint dimming, and PPO dynamic resource allocation",
         "adapted_mapping_to_tc_hhmrl": (
@@ -1534,7 +1548,7 @@ def apply_baseline_overrides(cfg: Dict, baseline: str) -> None:
             "safety_protocol": f"common_{cfg.get('safety', {}).get('projection_mode', 'thermal_cap')}_projection_for_hardware_feasibility",
         }
         return
-    if baseline == "mpc_grid":
+    if baseline in {"mpc_grid", "mpc_grid_nominal_model"}:
         cfg.setdefault("context", {})["enabled"] = False
         cfg.setdefault("agent", {})["z_dim"] = 0
         cfg.setdefault("meta", {})["explicit_inner_outer"] = False
@@ -1545,24 +1559,44 @@ def apply_baseline_overrides(cfg: Dict, baseline: str) -> None:
         cfg["meta"]["dual_lrs"] = [0.0] * len(cfg["meta"].get("dual_names", []))
         cfg.setdefault("baselines", {}).setdefault("mpc_grid", {})
         mpc_cfg = cfg["baselines"]["mpc_grid"]
+        scoring_model = "nominal_model" if baseline == "mpc_grid_nominal_model" else "perfect_env"
+        mpc_cfg["scoring_model"] = scoring_model
+        mpc_cfg.setdefault("nominal_model", {})
+        nominal_cfg = mpc_cfg["nominal_model"]
         n_templates = len(mpc_cfg.get("current_templates", {})) or 5
         n_rho = len(mpc_cfg.get("rho_grid", [0.10, 0.30, 0.50, 0.70, 0.90]))
         n_tau = len(mpc_cfg.get("tau_grid", [0.10, 0.30, 0.50, 0.70, 0.90]))
         candidate_count = int(4 * n_templates * (n_rho + n_tau + n_rho * n_tau))
         cfg["baseline_metadata"] = {
-            "baseline_family": "mpc_grid",
+            "baseline_family": baseline,
             "paper_inspired": True,
             "exact_reproduction": False,
-            **paper_baseline_explanation("mpc_grid"),
+            **paper_baseline_explanation(baseline),
             "uses_learned_policy": False,
             "uses_same_safety_projection": True,
-            "comparison_role": "model_based_optimizer",
+            "comparison_role": "model_based_optimizer" if baseline == "mpc_grid" else "model_mismatch_optimizer_reference",
             "action_contract": "boost_mode_structured_current_template_receiver_grid",
             "selected_action_contract": "boost_mode_structured_current_template_receiver_grid",
             "candidate_count": candidate_count,
             "current_templates": "source_aware_feasible_operating_templates",
             "candidate_state_protocol": "deterministic_expected_one_step_no_rng_mutation",
             "oracle_future_disturbances": False,
+            "mpc_scoring_model": scoring_model,
+            "mpc_information_boundary": (
+                "perfect_model_upper_bound_uses_true_current_model"
+                if scoring_model == "perfect_env"
+                else "nominal_model_candidate_scoring_no_true_gamma_delta"
+            ),
+            "mpc_scoring_uses_true_gamma_delta": bool(scoring_model == "perfect_env"),
+            "mpc_nominal_gamma": nominal_cfg.get("gamma", cfg.get("env", {}).get("gamma")),
+            "mpc_nominal_delta": nominal_cfg.get("delta", cfg.get("env", {}).get("delta")),
+            "mpc_nominal_amb_temp": nominal_cfg.get("amb_temp", cfg.get("env", {}).get("amb_temp")),
+            "mpc_nominal_thermal_safe": nominal_cfg.get("thermal_safe", cfg.get("env", {}).get("thermal_safe")),
+            "model_mismatch_role": (
+                "perfect_model_upper_bound_reference"
+                if scoring_model == "perfect_env"
+                else "nominal_model_under_real_execution_mismatch"
+            ),
             "rho_symbol_mapping": "paper_rho_is_id_fraction; env_rho_exec_is_eh_fraction; paper_rho=1-env_rho_exec",
             "tau_symbol_mapping": "paper_tau_and_env_tau_exec_are_id_time_fraction",
             "meta_learning": False,
@@ -2606,6 +2640,13 @@ def _add_baseline_aux_diagnostics(row: Dict, aux: Dict) -> None:
         "paper_rho_equiv",
         "paper_tau_equiv",
         "mpc_grid_score",
+        "mpc_scoring_uses_true_gamma_delta",
+        "mpc_scoring_gamma",
+        "mpc_scoring_delta",
+        "mpc_true_gamma",
+        "mpc_true_delta",
+        "mpc_gamma_mismatch",
+        "mpc_delta_mismatch",
         "predicted_qos_rate",
         "predicted_eh_metric",
         "predicted_snr",
@@ -2702,6 +2743,8 @@ def _add_baseline_aux_diagnostics(row: Dict, aux: Dict) -> None:
         "rho_symbol_mapping",
         "fixed_current_template_name",
         "candidate_state_protocol",
+        "mpc_scoring_model",
+        "mpc_information_boundary",
         "selected_action_contract",
         "receiver_ratio_rule",
         "dimming_type",
@@ -4784,6 +4827,7 @@ STRUCTURAL_VARIANT_ORDER = (
     "shin2024_matched",
     "uysal_policy_optimizer",
     "mpc_grid",
+    "mpc_grid_nominal_model",
     "javadi_ppo_dimming",
     "deeprat_assignment_power",
     "pdqn_hybrid_action",
@@ -4818,6 +4862,7 @@ HARD_TARGETED_VARIANT_ORDER = (
     "shin2024_matched",
     "uysal_policy_optimizer",
     "mpc_grid",
+    "mpc_grid_nominal_model",
     "javadi_ppo_dimming",
     "deeprat_assignment_power",
     "pdqn_hybrid_action",
@@ -4836,6 +4881,7 @@ THERMAL_VARIANT_ORDER = (
     "shin2024_matched",
     "uysal_policy_optimizer",
     "mpc_grid",
+    "mpc_grid_nominal_model",
     "javadi_ppo_dimming",
     "deeprat_assignment_power",
     "pdqn_hybrid_action",
@@ -5201,6 +5247,7 @@ def run_one_scenario(
             "mpc_lite",
             "uysal_policy_optimizer",
             "mpc_grid",
+            "mpc_grid_nominal_model",
             "javadi_ppo_dimming",
             "deeprat_assignment_power",
             "pdqn_hybrid_action",
@@ -5221,11 +5268,12 @@ def run_one_scenario(
         elif baseline in {
             "uysal_policy_optimizer",
             "mpc_grid",
+            "mpc_grid_nominal_model",
             "javadi_ppo_dimming",
             "deeprat_assignment_power",
             "pdqn_hybrid_action",
         }:
-            runner = baseline
+            runner = "mpc_grid" if baseline == "mpc_grid_nominal_model" else baseline
             baseline_override = baseline
         else:
             runner = "trainer"
@@ -5685,6 +5733,50 @@ def run_one_scenario(
                     "mpc_horizon": baseline_meta.get("horizon"),
                     "mpc_candidate_count": baseline_meta.get("candidate_count"),
                     "candidate_count": baseline_meta.get("candidate_count"),
+                    "mpc_scoring_model": str(
+                        baseline_meta.get(
+                            "mpc_scoring_model",
+                            env_df["mpc_scoring_model"].iloc[0]
+                            if "mpc_scoring_model" in env_df and not env_df.empty
+                            else "",
+                        )
+                    ),
+                    "mpc_information_boundary": str(
+                        baseline_meta.get(
+                            "mpc_information_boundary",
+                            env_df["mpc_information_boundary"].iloc[0]
+                            if "mpc_information_boundary" in env_df and not env_df.empty
+                            else "",
+                        )
+                    ),
+                    "mpc_scoring_uses_true_gamma_delta": baseline_meta.get(
+                        "mpc_scoring_uses_true_gamma_delta",
+                        bool(env_df["mpc_scoring_uses_true_gamma_delta"].mean() >= 0.5)
+                        if "mpc_scoring_uses_true_gamma_delta" in env_df and not env_df.empty
+                        else None,
+                    ),
+                    "mpc_nominal_gamma": baseline_meta.get("mpc_nominal_gamma"),
+                    "mpc_nominal_delta": baseline_meta.get("mpc_nominal_delta"),
+                    "mpc_nominal_amb_temp": baseline_meta.get("mpc_nominal_amb_temp"),
+                    "mpc_nominal_thermal_safe": baseline_meta.get("mpc_nominal_thermal_safe"),
+                    "mean_mpc_scoring_gamma": float(env_df["mpc_scoring_gamma"].mean())
+                    if "mpc_scoring_gamma" in env_df and not env_df.empty
+                    else None,
+                    "mean_mpc_scoring_delta": float(env_df["mpc_scoring_delta"].mean())
+                    if "mpc_scoring_delta" in env_df and not env_df.empty
+                    else None,
+                    "mean_mpc_true_gamma": float(env_df["mpc_true_gamma"].mean())
+                    if "mpc_true_gamma" in env_df and not env_df.empty
+                    else None,
+                    "mean_mpc_true_delta": float(env_df["mpc_true_delta"].mean())
+                    if "mpc_true_delta" in env_df and not env_df.empty
+                    else None,
+                    "mean_mpc_gamma_mismatch": float(env_df["mpc_gamma_mismatch"].mean())
+                    if "mpc_gamma_mismatch" in env_df and not env_df.empty
+                    else None,
+                    "mean_mpc_delta_mismatch": float(env_df["mpc_delta_mismatch"].mean())
+                    if "mpc_delta_mismatch" in env_df and not env_df.empty
+                    else None,
                     "online_latency_ms": float(env_df["online_latency_ms"].mean())
                     if "online_latency_ms" in env_df and not env_df.empty
                     else baseline_meta.get("online_latency_ms"),
@@ -6035,6 +6127,7 @@ def run_one_scenario(
         elif runner in {
             "uysal_policy_optimizer",
             "mpc_grid",
+            "mpc_grid_nominal_model",
             "javadi_ppo_dimming",
             "deeprat_assignment_power",
             "pdqn_hybrid_action",
@@ -6995,6 +7088,7 @@ def parse_args() -> argparse.Namespace:
             "mpc_lite",
             "uysal_policy_optimizer",
             "mpc_grid",
+            "mpc_grid_nominal_model",
             "javadi_ppo_dimming",
             "deeprat_assignment_power",
             "pdqn_hybrid_action",

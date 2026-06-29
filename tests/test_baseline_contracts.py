@@ -147,6 +147,50 @@ def test_mpc_grid_uses_structured_templates_and_preserves_state_rng(tmp_path):
     assert PAPER_EXPLANATION_FIELDS.issubset(cfg["baseline_metadata"])
 
 
+def test_mpc_grid_nominal_model_uses_fixed_scoring_model_not_true_task_params(tmp_path):
+    cfg = _cfg_for_baseline(tmp_path, "mpc_grid_nominal_model")
+    policy = MpcGridBaseline(cfg)
+    env = MultiTxUwSliptEnv(cfg)
+    obs, _ = env.reset(seed=101)
+
+    nominal = cfg["baselines"]["mpc_grid"]["nominal_model"]
+    env.gamma = float(nominal["gamma"]) + 0.031
+    env.delta = float(nominal["delta"]) + 1.25
+    temps_before = env.temps.copy()
+    t_before = int(env.t)
+    rng_before = repr(env.rng.bit_generator.state)
+
+    _, _, _, metrics = policy.score_candidate(
+        env,
+        boost_combo=3,
+        mode=2,
+        template_name="balanced_hybrid",
+        rho=0.5,
+        tau=0.5,
+    )
+    assert int(env.t) == t_before
+    assert np.allclose(env.temps, temps_before)
+    assert repr(env.rng.bit_generator.state) == rng_before
+    assert cfg["baseline_metadata"]["baseline_family"] == "mpc_grid_nominal_model"
+    assert cfg["baseline_metadata"]["mpc_scoring_model"] == "nominal_model"
+    assert cfg["baseline_metadata"]["mpc_scoring_uses_true_gamma_delta"] is False
+    assert policy.scoring_model == "nominal_model"
+    assert metrics["scoring_model"] == "nominal_model"
+    assert np.isclose(metrics["scoring_gamma"], float(nominal["gamma"]))
+    assert np.isclose(metrics["scoring_delta"], float(nominal["delta"]))
+    assert not np.isclose(metrics["scoring_gamma"], env.gamma)
+    assert not np.isclose(metrics["scoring_delta"], env.delta)
+
+    _, aux = policy.act(obs, env, eval_mode=True)
+    assert aux["mpc_scoring_model"] == "nominal_model"
+    assert aux["mpc_information_boundary"] == "nominal_model_candidate_scoring_no_true_gamma_delta"
+    assert aux["mpc_scoring_uses_true_gamma_delta"] is False
+    assert np.isclose(aux["mpc_scoring_gamma"], float(nominal["gamma"]))
+    assert np.isclose(aux["mpc_scoring_delta"], float(nominal["delta"]))
+    assert np.isclose(aux["mpc_gamma_mismatch"], env.gamma - float(nominal["gamma"]))
+    assert np.isclose(aux["mpc_delta_mismatch"], env.delta - float(nominal["delta"]))
+
+
 def test_javadi_ppo_dimming_contract(tmp_path):
     cfg = _cfg_for_baseline(tmp_path, "javadi_ppo_dimming")
     policy = JavadiPPODimmingBaseline(cfg)
@@ -227,6 +271,7 @@ def test_new_baselines_can_run_one_episode_smoke(tmp_path):
     baseline_classes = {
         "uysal_policy_optimizer": UysalPolicyOptimizer,
         "mpc_grid": MpcGridBaseline,
+        "mpc_grid_nominal_model": MpcGridBaseline,
         "javadi_ppo_dimming": JavadiPPODimmingBaseline,
         "deeprat_assignment_power": DeepRATAssignmentPowerBaseline,
         "pdqn_hybrid_action": PDQNHybridActionBaseline,

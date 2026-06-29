@@ -48,7 +48,90 @@ def current_action_from_frac(
     return raw_from_frac01(frac, action_decode_mode).astype(np.float32)
 
 
-def expected_step_metrics(env: MultiTxUwSliptEnv, safe: Dict[str, object]) -> Dict[str, float | np.ndarray]:
+def _model_scalar(model: Dict[str, object] | None, key: str, default: float) -> float:
+    val = None if not model else model.get(key)
+    if val is None or (isinstance(val, str) and val == ""):
+        return float(default)
+    return float(val)
+
+
+def _model_vector(
+    model: Dict[str, object] | None,
+    key: str,
+    default: np.ndarray,
+    *,
+    shape: tuple[int, ...] | None = None,
+) -> np.ndarray:
+    default_arr = np.asarray(default, dtype=np.float32)
+    val = None if not model else model.get(key)
+    if val is None or (isinstance(val, str) and val == ""):
+        out = default_arr.copy()
+    else:
+        out = np.asarray(val, dtype=np.float32)
+    if shape is not None:
+        out = out.reshape(shape)
+    return out.astype(np.float32)
+
+
+def mpc_nominal_scoring_model_from_cfg(cfg: Dict, env: MultiTxUwSliptEnv) -> Dict[str, object]:
+    """Build the pre-registered model used by nominal-model MPC scoring.
+
+    The snapshot intentionally comes from the configuration rather than the
+    task-reset values inside ``env``. This gives MPC a fixed model for candidate
+    scoring while the final selected action is still executed in the real task
+    environment.
+    """
+    env_cfg = cfg.get("env", {}) or {}
+    safety_cfg = cfg.get("safety", {}) or {}
+    hybrid_cfg = env_cfg.get("hybrid", {}) or {}
+    opts = cfg.get("baselines", {}).get("mpc_grid", {}) or {}
+    nominal = dict(opts.get("nominal_model", {}) or {})
+
+    gamma = float(nominal.get("gamma", env_cfg.get("gamma", env.gamma)))
+    delta = float(nominal.get("delta", env_cfg.get("delta", env.delta)))
+    amb_temp = float(nominal.get("amb_temp", env_cfg.get("amb_temp", env.amb_temp)))
+    thermal_safe = float(nominal.get("thermal_safe", env_cfg.get("thermal_safe", env.thermal_safe)))
+    qos_min_rate = float(nominal.get("qos_min_rate", env_cfg.get("qos_min_rate", env.qos_min_rate)))
+    current_max = np.asarray(nominal.get("current_max", safety_cfg.get("current_max", env.current_max)), dtype=np.float32)
+    tx_is_led = np.asarray(env.tx_is_led, dtype=np.float32)
+    tx_is_ld = np.asarray(env.tx_is_ld, dtype=np.float32)
+
+    def _tx_vector_cfg(led_key: str, ld_key: str, env_led: float, env_ld: float) -> np.ndarray:
+        led = float(nominal.get(led_key, hybrid_cfg.get(led_key, env_led)))
+        ld = float(nominal.get(ld_key, hybrid_cfg.get(ld_key, env_ld)))
+        return (tx_is_led * led + tx_is_ld * ld).astype(np.float32)
+
+    return {
+        "model_name": "nominal_model",
+        "gamma": gamma,
+        "delta": delta,
+        "amb_temp": amb_temp,
+        "thermal_safe": thermal_safe,
+        "qos_min_rate": qos_min_rate,
+        "current_max": current_max,
+        "bus_current_max": float(nominal.get("bus_current_max", safety_cfg.get("bus_current_max", env.bus_current_max))),
+        "eta_tx": _tx_vector_cfg("eta_led", "eta_ld", env.eta_led, env.eta_ld),
+        "se_tx_weight": _tx_vector_cfg("se_led_weight", "se_ld_weight", env.se_led_weight, env.se_ld_weight),
+        "eh_tx_weight": _tx_vector_cfg("eh_led_weight", "eh_ld_weight", env.eh_led_weight, env.eh_ld_weight),
+        "thermal_coeff": _tx_vector_cfg("thermal_led_coeff", "thermal_ld_coeff", env.thermal_led_coeff, env.thermal_ld_coeff),
+        "noise_floor": float(nominal.get("noise_floor", hybrid_cfg.get("noise_floor", env.noise_floor))),
+        "noise_led_coeff": float(nominal.get("noise_led_coeff", hybrid_cfg.get("noise_led_coeff", env.noise_led_coeff))),
+        "noise_ld_coeff": float(nominal.get("noise_ld_coeff", hybrid_cfg.get("noise_ld_coeff", env.noise_ld_coeff))),
+        "mode_se_gain": np.asarray(nominal.get("mode_se_gain", env_cfg.get("mode_se_gain", env.mode_se_gain)), dtype=np.float32),
+        "mode_eh_gain": np.asarray(nominal.get("mode_eh_gain", env_cfg.get("mode_eh_gain", env.mode_eh_gain)), dtype=np.float32),
+        "channel_gain_scale": float(nominal.get("channel_gain_scale", 1.0)),
+        "thermal_source_term": np.asarray(nominal.get("thermal_source_term", np.zeros(3, dtype=np.float32)), dtype=np.float32),
+        "uses_true_gamma_delta": False,
+        "uses_future_disturbance": False,
+    }
+
+
+def expected_step_metrics(
+    env: MultiTxUwSliptEnv,
+    safe: Dict[str, object],
+    *,
+    model: Dict[str, object] | None = None,
+) -> Dict[str, float | np.ndarray]:
     """Deterministic one-step prediction from the current observable state.
 
     This mirrors the environment reward calculation but intentionally omits all
@@ -61,19 +144,26 @@ def expected_step_metrics(env: MultiTxUwSliptEnv, safe: Dict[str, object]) -> Di
     rho = float(safe["rho_exec"])
     tau = float(safe["tau_exec"])
 
-    tx_signal = env._compute_tx_signal(currents)
+    eta_tx = _model_vector(model, "eta_tx", env._tx_vector(env.eta_led, env.eta_ld), shape=(3,))
+    channel_gain_scale = _model_scalar(model, "channel_gain_scale", 1.0)
+    tx_signal = currents * eta_tx * env.channel.astype(np.float32) * float(channel_gain_scale)
     signal = float(np.sum(tx_signal))
     signal_led = float(np.sum(tx_signal * env.tx_is_led))
     signal_ld = float(np.sum(tx_signal * env.tx_is_ld))
-    noise_power = env.noise_floor + env.noise_led_coeff * abs(signal_led) + env.noise_ld_coeff * abs(signal_ld)
+    noise_floor = _model_scalar(model, "noise_floor", env.noise_floor)
+    noise_led_coeff = _model_scalar(model, "noise_led_coeff", env.noise_led_coeff)
+    noise_ld_coeff = _model_scalar(model, "noise_ld_coeff", env.noise_ld_coeff)
+    noise_power = noise_floor + noise_led_coeff * abs(signal_led) + noise_ld_coeff * abs(signal_ld)
 
-    se_tx_weight = env._tx_vector(env.se_led_weight, env.se_ld_weight)
-    eh_tx_weight = env._tx_vector(env.eh_led_weight, env.eh_ld_weight)
+    se_tx_weight = _model_vector(model, "se_tx_weight", env._tx_vector(env.se_led_weight, env.se_ld_weight), shape=(3,))
+    eh_tx_weight = _model_vector(model, "eh_tx_weight", env._tx_vector(env.eh_led_weight, env.eh_ld_weight), shape=(3,))
     info_signal = float(np.sum(tx_signal * se_tx_weight))
     eh_input = float(np.sum(tx_signal * eh_tx_weight))
     snr = max(info_signal / max(noise_power, 1.0e-6), 1.0e-6)
-    mode_se = env._mode_gain(mode, env.mode_se_gain)
-    mode_eh = env._mode_gain(mode, env.mode_eh_gain)
+    mode_se_gain = _model_vector(model, "mode_se_gain", env.mode_se_gain)
+    mode_eh_gain = _model_vector(model, "mode_eh_gain", env.mode_eh_gain)
+    mode_se = env._mode_gain(mode, mode_se_gain)
+    mode_eh = env._mode_gain(mode, mode_eh_gain)
 
     if mode == 0:
         info_share, eh_share = 1.0 - rho, rho
@@ -90,25 +180,37 @@ def expected_step_metrics(env: MultiTxUwSliptEnv, safe: Dict[str, object]) -> Di
     eh_diag = env._compute_eh_metric(eh_input_eff)
     eh_metric = float(eh_diag["eh_metric"])
 
-    thermal_coeff = env._tx_vector(env.thermal_led_coeff, env.thermal_ld_coeff)
+    thermal_coeff = _model_vector(
+        model,
+        "thermal_coeff",
+        env._tx_vector(env.thermal_led_coeff, env.thermal_ld_coeff),
+        shape=(3,),
+    )
     temps_before = env.temps.copy().astype(np.float32)
-    thermal_source_term = env._thermal_coupling_term(temps_before)
-    thermal_base = (1.0 - env.gamma) * temps_before + env.gamma * env.amb_temp + thermal_source_term
-    temps_next = (thermal_base + env.delta * thermal_coeff * (currents**2)).astype(np.float32)
-    thermal_violation_vec = np.maximum(temps_next - env.thermal_safe, 0.0).astype(np.float32)
-    qos_violation = float(max(env.qos_min_rate - qos_rate, 0.0))
+    thermal_source_term = _model_vector(model, "thermal_source_term", env._thermal_coupling_term(temps_before), shape=(3,))
+    gamma = _model_scalar(model, "gamma", env.gamma)
+    delta = _model_scalar(model, "delta", env.delta)
+    amb_temp = _model_scalar(model, "amb_temp", env.amb_temp)
+    thermal_safe = _model_scalar(model, "thermal_safe", env.thermal_safe)
+    qos_min_rate = _model_scalar(model, "qos_min_rate", env.qos_min_rate)
+    current_max = _model_vector(model, "current_max", env.current_max, shape=(3,))
+    bus_current_max = _model_scalar(model, "bus_current_max", env.bus_current_max)
+    thermal_base = (1.0 - gamma) * temps_before + gamma * amb_temp + thermal_source_term
+    temps_next = (thermal_base + delta * thermal_coeff * (currents**2)).astype(np.float32)
+    thermal_violation_vec = np.maximum(temps_next - thermal_safe, 0.0).astype(np.float32)
+    qos_violation = float(max(qos_min_rate - qos_rate, 0.0))
     cost_vec = np.concatenate([np.asarray([qos_violation], dtype=np.float32), thermal_violation_vec], axis=0)
     cost = float(np.sum(cost_vec))
     power_penalty = float(np.sum(currents**2))
 
-    delta_curr_norm = (currents - env.prev_currents) / np.maximum(env.current_max, 1.0e-6)
+    delta_curr_norm = (currents - env.prev_currents) / np.maximum(current_max, 1.0e-6)
     smooth_raw = float(np.mean(delta_curr_norm**2) + 0.5 * ((rho - env.prev_rho) ** 2 + (tau - env.prev_tau) ** 2))
     smooth_penalty = env.action_smooth_weight * smooth_raw
     mode_switch = float(mode != env.prev_mode)
     boost_switch = float(boost_combo != env.prev_boost)
     switch_penalty = env.mode_switch_penalty * mode_switch + env.boost_switch_penalty * boost_switch
     temp_peak = float(np.max(temps_next))
-    margin_norm = float(np.clip((env.thermal_safe - temp_peak) / max(env.thermal_safe, 1.0e-6), 0.0, 1.0))
+    margin_norm = float(np.clip((thermal_safe - temp_peak) / max(thermal_safe, 1.0e-6), 0.0, 1.0))
     margin_reward = env.thermal_margin_weight * margin_norm
     se = float(env.se_weight * qos_rate)
     eh = float(env.eh_weight * eh_metric)
@@ -134,7 +236,15 @@ def expected_step_metrics(env: MultiTxUwSliptEnv, safe: Dict[str, object]) -> Di
         "signal": signal,
         "temps_next": temps_next,
         "thermal_violation": float(np.sum(thermal_violation_vec)),
-        "bus_utilization": float(np.sum(currents) / max(env.bus_current_max, 1.0e-6)),
+        "bus_utilization": float(np.sum(currents) / max(bus_current_max, 1.0e-6)),
+        "scoring_model": str((model or {}).get("model_name", "perfect_env")),
+        "scoring_gamma": float(gamma),
+        "scoring_delta": float(delta),
+        "scoring_amb_temp": float(amb_temp),
+        "scoring_thermal_safe": float(thermal_safe),
+        "scoring_qos_min_rate": float(qos_min_rate),
+        "true_gamma": float(env.gamma),
+        "true_delta": float(env.delta),
     }
 
 

@@ -265,6 +265,14 @@ baselines:
     tau_grid: [0.10, 0.20, 0.30, 0.40, 0.50, 0.60, 0.70, 0.80, 0.90]
     eh_min_target: 0.002
   mpc_grid:
+    scoring_model: perfect_env
+    nominal_model:
+      gamma: 0.070
+      delta: 5.2
+      amb_temp: 25.0
+      thermal_safe: 48.0
+      qos_min_rate: 0.05
+      channel_gain_scale: 1.0
     current_templates:
       safe_anchor: [0.55, 0.00, 0.00]
       balanced_hybrid: [0.45, 0.40, 0.40]
