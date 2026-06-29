@@ -586,6 +586,8 @@ class HierarchicalAgent:
                 thermal_headroom=(float(self.safety.thermal_safe) - np.asarray(temps, dtype=np.float32)),
                 temps=temps,
                 amb_temp=amb_temp,
+                gamma=gamma,
+                delta=delta,
                 meta_iter=int(self.current_meta_iter),
                 global_step=planner_step,
                 previous_projection_residual=self.prev_projection_residual,

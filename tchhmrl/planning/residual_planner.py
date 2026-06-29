@@ -144,15 +144,19 @@ class ResidualPlanner:
         thermal_headroom: np.ndarray | None,
         temps: np.ndarray,
         amb_temp: float,
-        previous_projection_residual: np.ndarray | None,
+        gamma: float | None = None,
+        delta: float | None = None,
+        previous_projection_residual: np.ndarray | None = None,
     ) -> Dict[str, float]:
         raw = torch.as_tensor(np.asarray(policy_raw, dtype=np.float32).reshape(1, -1), dtype=torch.float32, device=self.device)
         boost_t = torch.full((1,), int(boost_combo), dtype=torch.long, device=self.device)
         mode_t = torch.full((1,), int(mode), dtype=torch.long, device=self.device)
         temps_t = torch.as_tensor(np.asarray(temps, dtype=np.float32), dtype=torch.float32, device=self.device).view(1, -1)
         amb_t = torch.full((1,), float(amb_temp), dtype=torch.float32, device=self.device)
+        gamma_t = None if gamma is None else torch.full((1,), float(gamma), dtype=torch.float32, device=self.device)
+        delta_t = None if delta is None else torch.full((1,), float(delta), dtype=torch.float32, device=self.device)
         with torch.no_grad():
-            safe = safety.project_torch(raw, boost_t, mode_t, temps_t, amb_t)
+            safe = safety.project_torch(raw, boost_t, mode_t, temps_t, amb_t, gamma=gamma_t, delta=delta_t)
             executed = self._executed_action(safe)
             obs_aug = lower._augment_np(
                 np.asarray(obs, dtype=np.float32),
@@ -258,6 +262,8 @@ class ResidualPlanner:
         safe: Dict[str, torch.Tensor],
         safety,
         amb_temp: torch.Tensor,
+        gamma: torch.Tensor | None,
+        delta: torch.Tensor | None,
         thermal_horizon: int,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
         margin1 = safe["thermal_margin"]
@@ -273,8 +279,12 @@ class ResidualPlanner:
             return risk1, zeros, zeros, max_t1, veto
 
         temps2_in = safe["t_pred"]
-        base2, _ = safety._thermal_base_torch(temps2_in, amb_temp)
-        effective_gain = safety._safe_thermal_coeff_torch(dtype=temps2_in.dtype, device=temps2_in.device)
+        base2, _ = safety._thermal_base_torch(temps2_in, amb_temp, gamma=gamma)
+        effective_gain = safety._effective_thermal_gain_torch(
+            dtype=temps2_in.dtype,
+            device=temps2_in.device,
+            delta=delta,
+        )
         currents = safe["currents_exec"]
         t2 = base2 + effective_gain * (currents**2)
         margin2 = safety.thermal_safe - t2
@@ -318,6 +328,8 @@ class ResidualPlanner:
         thermal_headroom: np.ndarray | None,
         temps: np.ndarray,
         amb_temp: float,
+        gamma: float | None = None,
+        delta: float | None = None,
         meta_iter: int,
         global_step: int = 0,
         previous_projection_residual: np.ndarray | None = None,
@@ -340,6 +352,8 @@ class ResidualPlanner:
             thermal_headroom=thermal_headroom,
             temps=temps,
             amb_temp=amb_temp,
+            gamma=gamma,
+            delta=delta,
             previous_projection_residual=previous_projection_residual,
         )
         probe_latency_ms = float((time.perf_counter() - probe_start) * 1000.0)
@@ -411,9 +425,11 @@ class ResidualPlanner:
         temps_t = torch.as_tensor(np.asarray(temps, dtype=np.float32), dtype=torch.float32, device=self.device).view(1, -1)
         temps_t = temps_t.expand(k, -1)
         amb_t = torch.full((k,), float(amb_temp), dtype=torch.float32, device=self.device)
+        gamma_t = None if gamma is None else torch.full((k,), float(gamma), dtype=torch.float32, device=self.device)
+        delta_t = None if delta is None else torch.full((k,), float(delta), dtype=torch.float32, device=self.device)
 
         with torch.no_grad():
-            safe = safety.project_torch(candidates, boost_t, mode_t, temps_t, amb_t)
+            safe = safety.project_torch(candidates, boost_t, mode_t, temps_t, amb_t, gamma=gamma_t, delta=delta_t)
             executed = self._executed_action(safe)
             obs_aug = lower._augment_np(
                 np.asarray(obs, dtype=np.float32),
@@ -449,6 +465,8 @@ class ResidualPlanner:
                 safe=safe,
                 safety=safety,
                 amb_temp=amb_t.view(-1, 1),
+                gamma=None if gamma_t is None else gamma_t.view(-1, 1),
+                delta=None if delta_t is None else delta_t.view(-1, 1),
                 thermal_horizon=effective_thermal_horizon,
             )
 

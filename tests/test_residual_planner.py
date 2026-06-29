@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import copy
 import random
+import types
 
 import numpy as np
 import torch
@@ -97,13 +98,28 @@ def test_agent_act_uses_residual_planner_after_start_iter():
     obs = np.zeros(int(cfg["agent"]["obs_dim"]), dtype=np.float32)
     z = np.zeros(int(cfg["agent"]["z_dim"]), dtype=np.float32)
     temps = np.asarray([28.0, 28.0, 28.0], dtype=np.float32)
+    gamma = 0.123
+    delta = 1.75
+    projection_calls: list[tuple[torch.Tensor | None, torch.Tensor | None]] = []
+    original_project = agent.safety.project_torch
+
+    def wrapped_project(self, lower_raw, boost_combo, mode, temps, amb_temp, gamma=None, delta=None):
+        projection_calls.append(
+            (
+                None if gamma is None else gamma.detach().cpu().clone(),
+                None if delta is None else delta.detach().cpu().clone(),
+            )
+        )
+        return original_project(lower_raw, boost_combo, mode, temps, amb_temp, gamma=gamma, delta=delta)
+
+    agent.safety.project_torch = types.MethodType(wrapped_project, agent.safety)
 
     action, aux = agent.act(
         obs=obs,
         temps=temps,
         amb_temp=float(cfg["env"]["amb_temp"]),
-        gamma=float(cfg["env"]["gamma"]),
-        delta=float(cfg["env"]["delta"]),
+        gamma=gamma,
+        delta=delta,
         z=z,
         eval_mode=True,
     )
@@ -128,6 +144,12 @@ def test_agent_act_uses_residual_planner_after_start_iter():
     assert np.asarray(aux["policy_action_raw"], dtype=np.float32).shape == (5,)
     assert np.asarray(aux["planner_action_raw"], dtype=np.float32).shape == (5,)
     assert np.asarray(aux["executed_action"], dtype=np.float32).shape == (5,)
+    assert len(projection_calls) >= 2
+    for gamma_t, delta_t in projection_calls:
+        assert gamma_t is not None
+        assert delta_t is not None
+        assert torch.allclose(gamma_t, torch.full_like(gamma_t, float(gamma)))
+        assert torch.allclose(delta_t, torch.full_like(delta_t, float(delta)))
     assert np.allclose(np.asarray(aux["act_refined_raw"], dtype=np.float32), np.asarray(aux["planner_action_raw"], dtype=np.float32))
     assert np.allclose(np.asarray(aux["act_exec"], dtype=np.float32), np.asarray(aux["executed_action"], dtype=np.float32))
     assert isinstance(aux["planner_selected"], bool)
