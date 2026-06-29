@@ -189,6 +189,19 @@ class LowerDDPG:
         selector_oh = F.one_hot(selector, num_classes=3).float()
         return torch.cat([boost_oh, selector_oh], dim=1)
 
+    def _thermal_param_tensors(
+        self,
+        batch: Dict[str, np.ndarray],
+        batch_size: int,
+    ) -> tuple[torch.Tensor | None, torch.Tensor | None]:
+        gamma = None
+        delta = None
+        if "gamma_env" in batch:
+            gamma = torch.tensor(batch["gamma_env"], dtype=torch.float32, device=self.device).view(batch_size)
+        if "delta_env" in batch:
+            delta = torch.tensor(batch["delta_env"], dtype=torch.float32, device=self.device).view(batch_size)
+        return gamma, delta
+
     def select_action(
         self,
         obs: np.ndarray,
@@ -289,13 +302,22 @@ class LowerDDPG:
         temps = torch.tensor(batch["temps"], dtype=torch.float32, device=self.device)
         next_temps = torch.tensor(batch["next_temps"], dtype=torch.float32, device=self.device)
         amb = torch.tensor(batch["amb_temp"], dtype=torch.float32, device=self.device)
+        gamma_env, delta_env = self._thermal_param_tensors(batch, int(obs.shape[0]))
 
         with torch.no_grad():
             raw_next = self._expand_learned_raw_torch(
                 self.actor_tgt(next_obs_aug, z_next),
                 current_template_level=current_template_level_next,
             )
-            safe_next = self.safety.project_torch(raw_next, boost_next, mode_next, next_temps, amb)
+            safe_next = self.safety.project_torch(
+                raw_next,
+                boost_next,
+                mode_next,
+                next_temps,
+                amb,
+                gamma=gamma_env,
+                delta=delta_env,
+            )
             a_next = torch.cat(
                 [safe_next["currents_exec"], safe_next["rho_exec"], safe_next["tau_exec"]],
                 dim=1,
@@ -311,7 +333,7 @@ class LowerDDPG:
         self.critic_optim.step()
 
         raw_pi = self._expand_learned_raw_torch(self.actor(obs_aug, z), current_template_level=current_template_level)
-        safe_pi = self.safety.project_torch(raw_pi, boost, mode, temps, amb)
+        safe_pi = self.safety.project_torch(raw_pi, boost, mode, temps, amb, gamma=gamma_env, delta=delta_env)
         a_pi = torch.cat([safe_pi["currents_exec"], safe_pi["rho_exec"], safe_pi["tau_exec"]], dim=1)
         actor_loss = -self.critic(obs_aug, z, a_pi).mean()
 

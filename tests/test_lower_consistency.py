@@ -205,10 +205,14 @@ def test_lower_update_uses_next_macro_for_target_projection():
     cfg = _small_cfg()
     safety = SafetyLayer(cfg)
     calls: list[torch.Tensor] = []
+    gamma_calls: list[torch.Tensor | None] = []
+    delta_calls: list[torch.Tensor | None] = []
     original = safety.project_torch
 
     def wrapped(self, lower_raw, boost_combo, mode, temps, amb_temp, gamma=None, delta=None):
         calls.append(boost_combo.detach().cpu().clone())
+        gamma_calls.append(None if gamma is None else gamma.detach().cpu().clone())
+        delta_calls.append(None if delta is None else delta.detach().cpu().clone())
         return original(lower_raw, boost_combo, mode, temps, amb_temp, gamma, delta)
 
     safety.project_torch = types.MethodType(wrapped, safety)
@@ -253,3 +257,7 @@ def test_lower_update_uses_next_macro_for_target_projection():
     assert torch.all(calls[0] == 3)
     # Second call is policy projection on current macro condition.
     assert torch.all(calls[1] == 0)
+    assert all(g is not None for g in gamma_calls[:2])
+    assert all(d is not None for d in delta_calls[:2])
+    assert torch.allclose(gamma_calls[0], torch.full((b,), float(cfg["env"]["gamma"])))
+    assert torch.allclose(delta_calls[0], torch.full((b,), float(cfg["env"]["delta"])))

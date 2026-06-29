@@ -596,6 +596,8 @@ class HierarchicalAgent:
             lower_raw,
             temps=temps,
             amb_temp=amb_temp,
+            gamma=gamma,
+            delta=delta,
             mem=self.safety_mem,
         )
 

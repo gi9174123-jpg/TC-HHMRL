@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import types
+
 import numpy as np
 import torch
 
@@ -15,6 +17,14 @@ def test_hierarchical_agent_one_step_interaction():
 
     obs, _ = env.reset(seed=0)
     z = np.zeros(cfg["agent"]["z_dim"], dtype=np.float32)
+    project_calls: list[tuple[float | None, float | None]] = []
+    original_project = agent.safety.project_np
+
+    def wrapped_project(self, *args, **kwargs):
+        project_calls.append((kwargs.get("gamma"), kwargs.get("delta")))
+        return original_project(*args, **kwargs)
+
+    agent.safety.project_np = types.MethodType(wrapped_project, agent.safety)
 
     action, aux = agent.act(
         obs=obs,
@@ -25,6 +35,9 @@ def test_hierarchical_agent_one_step_interaction():
         z=z,
         eval_mode=False,
     )
+    assert project_calls
+    assert np.isclose(project_calls[0][0], env.gamma)
+    assert np.isclose(project_calls[0][1], env.delta)
     next_obs, reward, terminated, truncated, info = env.step(action)
 
     transition = {

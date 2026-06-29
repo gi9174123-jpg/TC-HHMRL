@@ -220,6 +220,19 @@ class LowerSAC:
             arr = out
         return torch.tensor(arr, dtype=torch.float32, device=self.device)
 
+    def _thermal_param_tensors(
+        self,
+        batch: Dict[str, np.ndarray],
+        batch_size: int,
+    ) -> tuple[torch.Tensor | None, torch.Tensor | None]:
+        gamma = None
+        delta = None
+        if "gamma_env" in batch:
+            gamma = torch.tensor(batch["gamma_env"], dtype=torch.float32, device=self.device).view(batch_size)
+        if "delta_env" in batch:
+            delta = torch.tensor(batch["delta_env"], dtype=torch.float32, device=self.device).view(batch_size)
+        return gamma, delta
+
     def _augment_np(
         self,
         obs: np.ndarray,
@@ -373,12 +386,21 @@ class LowerSAC:
         next_temps = torch.tensor(batch["next_temps"], dtype=torch.float32, device=self.device)
 
         amb = torch.tensor(batch["amb_temp"], dtype=torch.float32, device=self.device)
+        gamma_env, delta_env = self._thermal_param_tensors(batch, batch_size)
         alpha_t = self._alpha_tensor(dtype=obs.dtype)
 
         with torch.no_grad():
             raw_next, logp_next, logp_next_dim = self.actor.sample(next_obs_aug_actor, z_next, return_log_prob_per_dim=True)
             logp_next_eff = self._masked_logp(logp_next_dim, boost_next, mode_next)
-            safe_next = self.safety.project_torch(raw_next, boost_next, mode_next, next_temps, amb)
+            safe_next = self.safety.project_torch(
+                raw_next,
+                boost_next,
+                mode_next,
+                next_temps,
+                amb,
+                gamma=gamma_env,
+                delta=delta_env,
+            )
             a_next = torch.cat(
                 [safe_next["currents_exec"], safe_next["rho_exec"], safe_next["tau_exec"]], dim=1
             )
@@ -446,9 +468,18 @@ class LowerSAC:
             )
             c_next_temps = torch.tensor(cb["next_temps"], dtype=torch.float32, device=self.device)
             c_amb = torch.tensor(cb["amb_temp"], dtype=torch.float32, device=self.device)
+            c_gamma_env, c_delta_env = self._thermal_param_tensors(cb, c_batch_size)
             with torch.no_grad():
                 c_raw_next, _ = self.actor.sample(c_next_obs_aug_actor, c_z_next)
-                c_safe_next = self.safety.project_torch(c_raw_next, c_boost_next, c_mode_next, c_next_temps, c_amb)
+                c_safe_next = self.safety.project_torch(
+                    c_raw_next,
+                    c_boost_next,
+                    c_mode_next,
+                    c_next_temps,
+                    c_amb,
+                    gamma=c_gamma_env,
+                    delta=c_delta_env,
+                )
                 c_a_next = torch.cat(
                     [c_safe_next["currents_exec"], c_safe_next["rho_exec"], c_safe_next["tau_exec"]],
                     dim=1,
@@ -531,7 +562,7 @@ class LowerSAC:
         try:
             raw_pi, logp, logp_dim = self.actor.sample(obs_aug_actor, z, return_log_prob_per_dim=True)
             logp_eff = self._masked_logp(logp_dim, boost, mode)
-            safe_pi = self.safety.project_torch(raw_pi, boost, mode, temps, amb)
+            safe_pi = self.safety.project_torch(raw_pi, boost, mode, temps, amb, gamma=gamma_env, delta=delta_env)
             a_pi = torch.cat([safe_pi["currents_exec"], safe_pi["rho_exec"], safe_pi["tau_exec"]], dim=1)
             obs_aug_q1_pi = self._augment_torch(obs, boost, mode, physical, self.q1_phys)
             obs_aug_q2_pi = self._augment_torch(obs, boost, mode, physical, self.q2_phys)
