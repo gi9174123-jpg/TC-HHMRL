@@ -313,19 +313,19 @@ def test_ablation_wo_meta_disables_meta_adaptation_and_context():
     assert int(cfg["meta"]["support_episodes"]) > 0
 
 
-def test_full_hybrid_support_gate_default_and_ungated_ablation():
+def test_full_hybrid_support_gate_disabled_by_default_and_ungated_ablation():
     cfg = load_cfg("configs/default.yaml")
-    assert cfg["meta"]["support_gate"]["enabled"] is True
+    assert cfg["meta"]["support_gate"]["enabled"] is False
     assert cfg["meta"]["support_gate"]["role"] == "rollback_guard"
     assert cfg["meta"]["support_gate"]["rule"] == "safety_first"
     assert cfg["meta"]["support_gate"]["query_leakage"] is False
     assert float(cfg["meta"]["support_gate"]["max_violation_increase"]) == 1.0e-4
     assert float(cfg["meta"]["support_gate"]["max_cost_increase"]) == 1.0e-5
     assert int(cfg["meta"]["support_adaptation_episodes"]) == 3
-    assert int(cfg["meta"]["support_gate_validation_episodes"]) == 2
-    assert cfg["meta"]["support_gate"]["paired_validation"] is True
-    assert cfg["meta"]["support_gate"]["budget_mode"] == "paired_support_validation"
-    assert int(cfg["meta"]["support_gate"]["extra_support_rollouts"]) == 2
+    assert int(cfg["meta"]["support_gate_validation_episodes"]) == 0
+    assert cfg["meta"]["support_gate"]["paired_validation"] is False
+    assert cfg["meta"]["support_gate"]["budget_mode"] == "support_gate_disabled"
+    assert int(cfg["meta"]["support_gate"]["extra_support_rollouts"]) == 0
     assert int(cfg["meta"]["support_gate"]["extra_gradient_updates"]) == 0
 
     ungated = copy.deepcopy(cfg)
@@ -558,15 +558,15 @@ def test_full_compat_query_update_probe_only_reenables_query_updates():
 
     assert cfg["meta"]["query_updates_enabled"] is True
     assert cfg["meta"]["query_context_updates_enabled"] is True
-    assert cfg["meta"]["support_gate"]["enabled"] is True
-    assert int(cfg["meta"]["support_gate"]["extra_support_rollouts"]) == 2
+    assert cfg["meta"]["support_gate"]["enabled"] is False
+    assert int(cfg["meta"]["support_gate"]["extra_support_rollouts"]) == 0
     assert cfg["upper_safety_shield"]["enabled"] is True
     assert cfg["residual_planner"]["enabled"] is True
     meta = cfg["pilot_metadata"]
     assert meta["compatibility_probe"] is True
     assert meta["compatibility_changed_mechanisms"] == ["query_updates_enabled"]
     assert meta["compat_query_updates_enabled"] is True
-    assert meta["compat_support_gate_enabled"] is True
+    assert meta["compat_support_gate_enabled"] is False
     assert meta["compat_upper_shield_enabled"] is True
     assert meta["compat_residual_planner_enabled"] is True
     assert meta["pilot_only"] is True
@@ -750,28 +750,26 @@ def test_full_final_recover_variants_restore_old_lightweight_selection_and_optim
         assert "checkpoint_selection_3_tasks_1_episode" in meta["final_recover_mechanisms"]
         assert "task_thermal_params_in_thermal_cap" in meta["final_recover_mechanisms"]
 
-    assert gated["meta"]["protocol_name"] == "final_gated_recover"
-    assert gated["meta"]["support_gate"]["enabled"] is True
-    assert gated["meta"]["support_gate"]["paired_validation"] is False
-    assert gated["meta"]["support_gate"]["budget_mode"] == "support_adaptation_only"
-    assert float(gated["meta"]["support_gate"]["max_cost_increase"]) == 5.0e-4
-    assert float(gated["meta"]["support_gate"]["max_violation_increase"]) == 1.0e-2
-    assert int(gated["meta"]["support_gate"]["extra_support_rollouts"]) == 0
-    assert int(gated["meta"]["support_gate"]["extra_gradient_updates"]) == 0
-    assert int(gated["meta"]["support_gate"]["extra_query_evaluations"]) == 0
-    assert gated["meta"]["support_update_acceptance"] == "support_side_gated"
-    assert gated["pilot_metadata"]["final_gated_recover"] is True
-    assert gated["pilot_metadata"]["support_gate"] is True
-    assert gated["pilot_metadata"]["support_gate_budget_mode"] == "support_adaptation_only"
+    for cfg in (gated, ungated):
+        assert cfg["meta"]["protocol_name"] == "final_no_rollback_recover"
+        assert cfg["meta"]["support_gate"]["enabled"] is False
+        assert cfg["meta"]["support_gate"]["paired_validation"] is False
+        assert cfg["meta"]["support_gate"]["budget_mode"] == "support_gate_disabled"
+        assert int(cfg["meta"]["support_gate"]["extra_support_rollouts"]) == 0
+        assert int(cfg["meta"]["support_gate"]["extra_gradient_updates"]) == 0
+        assert int(cfg["meta"]["support_gate"]["extra_query_evaluations"]) == 0
+        assert cfg["meta"]["support_update_acceptance"] == "unconditional"
+        assert cfg["pilot_metadata"]["final_no_rollback_recover"] is True
+        assert cfg["pilot_metadata"]["support_gate"] is False
+        assert cfg["pilot_metadata"]["support_gate_budget_mode"] == "support_gate_disabled"
+        assert "support_gate_disabled_control" in cfg["pilot_metadata"]["final_recover_mechanisms"]
+        assert "no_support_gate_rollback" in cfg["pilot_metadata"]["final_recover_mechanisms"]
 
-    assert ungated["meta"]["protocol_name"] == "final_ungated_recover"
-    assert ungated["meta"]["support_gate"]["enabled"] is False
-    assert ungated["meta"]["support_gate"]["paired_validation"] is False
-    assert ungated["meta"]["support_gate"]["budget_mode"] == "support_gate_disabled"
-    assert int(ungated["meta"]["support_gate"]["extra_support_rollouts"]) == 0
-    assert ungated["meta"]["support_update_acceptance"] == "unconditional"
+    assert gated["pilot_metadata"]["deprecated_gated_recover_alias"] is True
+    assert gated["pilot_metadata"]["final_gated_recover"] is False
+
     assert ungated["pilot_metadata"]["final_ungated_recover"] is True
-    assert ungated["pilot_metadata"]["support_gate"] is False
+    assert ungated["pilot_metadata"]["deprecated_gated_recover_alias"] is False
 
 
 def test_full_compat_no_support_gate_probe_removes_gate_budget():
@@ -804,7 +802,7 @@ def test_full_compat_no_upper_shield_probe_only_disables_shield():
 
     assert cfg["upper_safety_shield"]["enabled"] is False
     assert cfg["meta"]["query_updates_enabled"] is False
-    assert cfg["meta"]["support_gate"]["enabled"] is True
+    assert cfg["meta"]["support_gate"]["enabled"] is False
     assert cfg["residual_planner"]["enabled"] is True
     meta = cfg["pilot_metadata"]
     assert meta["compatibility_changed_mechanisms"] == ["upper_safety_shield"]

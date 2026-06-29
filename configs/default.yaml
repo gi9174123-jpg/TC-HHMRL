@@ -305,7 +305,7 @@ meta:
   meta_iters: 100
   support_episodes: 5
   support_adaptation_episodes: 3
-  support_gate_validation_episodes: 2
+  support_gate_validation_episodes: 0
   query_episodes: 2
   dual_lr: 0.05
   dual_lrs: [0.02, 0.05, 0.05, 0.05]
@@ -321,10 +321,10 @@ meta:
   query_context_updates_enabled: false
   protocol_name: strict_support_query
   support_gate:
-    enabled: true
+    enabled: false
     role: rollback_guard
     rule: safety_first
-    paired_validation: true
+    paired_validation: false
     reward_weight: 1.0
     cost_weight: 1.0
     violation_weight: 1.0
@@ -336,8 +336,8 @@ meta:
     min_parameter_delta_norm: 0.0
     max_parameter_delta_norm: .inf
     query_leakage: false
-    budget_mode: paired_support_validation
-    extra_support_rollouts: 2
+    budget_mode: support_gate_disabled
+    extra_support_rollouts: 0
     extra_gradient_updates: 0
     extra_query_evaluations: 0
   inner_warmup_steps: 128

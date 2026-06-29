@@ -772,6 +772,10 @@ def apply_final_compat_full(cfg: Dict, *, gated: bool) -> None:
 
 def apply_final_recover_full(cfg: Dict, *, gated: bool) -> None:
     """Lightweight final-candidate recovery path aligned with the old strong Full run."""
+    # The old "gated" recover label is kept as a backward-compatible alias, but
+    # the final recover path no longer rolls back support updates: a locally
+    # worse support update can still be useful for the subsequent query/task.
+    support_gate_enabled = False
     meta_cfg = cfg.setdefault("meta", {})
     meta_cfg["n_tasks_per_iter"] = 6
     meta_cfg["support_episodes"] = 3
@@ -783,22 +787,22 @@ def apply_final_recover_full(cfg: Dict, *, gated: bool) -> None:
     meta_cfg["explicit_inner_outer"] = True
     meta_cfg["outer_step_size"] = 0.15
     meta_cfg["reset_optimizer_after_outer_update"] = False
-    meta_cfg["protocol_name"] = "final_gated_recover" if gated else "final_ungated_recover"
+    meta_cfg["protocol_name"] = "final_no_rollback_recover"
     gate_cfg = meta_cfg.setdefault("support_gate", {})
     gate_cfg.setdefault("role", "rollback_guard")
     gate_cfg["rule"] = "safety_first"
-    gate_cfg["enabled"] = bool(gated)
+    gate_cfg["enabled"] = support_gate_enabled
     gate_cfg["normalized_reward_threshold"] = 0.0
     gate_cfg["reward_normalization_eps"] = 1.0
     gate_cfg["max_cost_increase"] = 5.0e-4
     gate_cfg["max_violation_increase"] = 1.0e-2
     gate_cfg["paired_validation"] = False
     gate_cfg["query_leakage"] = False
-    gate_cfg["budget_mode"] = "support_adaptation_only" if gated else "support_gate_disabled"
+    gate_cfg["budget_mode"] = "support_gate_disabled"
     gate_cfg["extra_support_rollouts"] = 0
     gate_cfg["extra_gradient_updates"] = 0
     gate_cfg["extra_query_evaluations"] = 0
-    meta_cfg["support_update_acceptance"] = "support_side_gated" if gated else "unconditional"
+    meta_cfg["support_update_acceptance"] = "unconditional"
 
     safety_cfg = cfg.setdefault("safety", {})
     safety_cfg["projection_mode"] = "thermal_cap"
@@ -826,27 +830,30 @@ def apply_final_recover_full(cfg: Dict, *, gated: bool) -> None:
 
     cfg["pilot_metadata"] = {
         "final_recover_full": True,
-        "final_gated_recover": bool(gated),
+        "final_gated_recover": False,
         "final_ungated_recover": bool(not gated),
+        "final_no_rollback_recover": True,
+        "deprecated_gated_recover_alias": bool(gated),
         "pilot_only": False,
         "formal_ranking_exclude": False,
-        "comparison_role": "final_full_candidate_gated_recover" if gated else "final_full_candidate_ungated_recover",
+        "comparison_role": "final_full_candidate_no_rollback_recover",
         "projection_variant": "thermal_cap",
-        "support_gate": bool(gated),
-        "support_gate_role": "rollback_guard" if gated else "",
-        "support_gate_budget_mode": "support_adaptation_only" if gated else "support_gate_disabled",
+        "support_gate": False,
+        "support_gate_role": "",
+        "support_gate_budget_mode": "support_gate_disabled",
         "support_gate_extra_rollouts": 0,
         "support_gate_extra_gradient_updates": 0,
         "support_gate_extra_query_evaluations": 0,
-        "support_gate_max_cost_increase": 5.0e-4 if gated else None,
-        "support_gate_max_violation_increase": 1.0e-2 if gated else None,
-        "support_update_acceptance": "support_side_gated" if gated else "unconditional",
+        "support_gate_max_cost_increase": None,
+        "support_gate_max_violation_increase": None,
+        "support_update_acceptance": "unconditional",
         "final_recover_mechanisms": [
             "per_source_current_decoder",
             "task_thermal_params_in_thermal_cap",
             "online_query_updates",
             "three_support_three_update_two_query",
-            "support_gate_relaxed_support_side_guard" if gated else "support_gate_disabled_control",
+            "support_gate_disabled_control",
+            "no_support_gate_rollback",
             "optimizer_state_not_reset_after_outer_update",
             "checkpoint_selection_3_tasks_1_episode",
             "upper_shield_disabled",
@@ -866,9 +873,7 @@ def apply_final_recover_full(cfg: Dict, *, gated: bool) -> None:
         "residual_planner_enabled": False,
         "execution_guard_enabled": False,
         "projection_objective": (
-            "recover_old_full_performance_chain_with_lightweight_support_gated_rollback"
-            if gated
-            else "recover_old_full_performance_chain_without_support_gate_control"
+            "recover_old_full_performance_chain_without_support_gate_control"
         ),
     }
 
@@ -6136,7 +6141,7 @@ def run_one_scenario(
                 if is_final_gated_compat
                 else "final_full_candidate_ungated_compat"
                 if is_final_ungated_compat
-                else "final_full_candidate_gated_recover"
+                else "final_full_candidate_no_rollback_recover"
                 if is_final_gated_recover
                 else "final_full_candidate_ungated_recover"
                 if is_final_ungated_recover
@@ -6184,7 +6189,6 @@ def run_one_scenario(
                 "meta_learning": bool(hybrid_meta_enabled),
                 "support_gate": bool(
                     is_final_gated_compat
-                    or is_final_gated_recover
                     or (
                         hybrid_gate_enabled
                         and not (
@@ -6192,7 +6196,7 @@ def run_one_scenario(
                             or is_full_compat_combo
                             or is_full_compat_combo_no_planner
                             or is_final_ungated_compat
-                            or is_final_ungated_recover
+                            or is_final_recover
                         )
                     )
                 ),
@@ -6200,7 +6204,6 @@ def run_one_scenario(
                     "rollback_guard"
                     if (
                         is_final_gated_compat
-                        or is_final_gated_recover
                         or (
                             hybrid_gate_enabled
                             and not (
@@ -6208,7 +6211,7 @@ def run_one_scenario(
                                 or is_full_compat_combo
                                 or is_full_compat_combo_no_planner
                                 or is_final_ungated_compat
-                                or is_final_ungated_recover
+                                or is_final_recover
                             )
                         )
                     )
@@ -6222,12 +6225,10 @@ def run_one_scenario(
                         or is_full_compat_combo
                         or is_full_compat_combo_no_planner
                         or is_final_ungated_compat
-                        or is_final_ungated_recover
+                        or is_final_recover
                     )
                     else "paired_support_validation"
                     if is_final_gated_compat
-                    else "support_adaptation_only"
-                    if is_final_gated_recover
                     else "support_adaptation_only"
                     if is_legacy_strong_gated
                     else definition_gate_budget_mode
@@ -6242,7 +6243,7 @@ def run_one_scenario(
                         or is_full_compat_combo
                         or is_full_compat_combo_no_planner
                         or is_final_ungated_compat
-                        or is_final_ungated_recover
+                        or is_final_recover
                     )
                     else "support_side_gated"
                     if hybrid_meta_enabled
@@ -6377,11 +6378,8 @@ def run_one_scenario(
                         "per_source_current_decoder",
                         "online_query_updates",
                         "three_support_three_update_two_query",
-                        (
-                            "support_gate_relaxed_support_side_guard"
-                            if is_final_gated_recover
-                            else "support_gate_disabled_control"
-                        ),
+                        "support_gate_disabled_control",
+                        "no_support_gate_rollback",
                         "optimizer_state_not_reset_after_outer_update",
                         "checkpoint_selection_3_tasks_1_episode",
                         "upper_shield_disabled",

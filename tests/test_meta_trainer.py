@@ -21,16 +21,17 @@ def test_default_meta_protocol_uses_heldout_query_and_stable_checkpoint_selectio
         assert int(cfg["meta"]["n_tasks_per_iter"]) == 8
         assert int(cfg["meta"]["support_episodes"]) == 5
         assert int(cfg["meta"]["support_adaptation_episodes"]) == 3
-        assert int(cfg["meta"]["support_gate_validation_episodes"]) == 2
+        assert int(cfg["meta"]["support_gate_validation_episodes"]) == 0
         assert int(cfg["meta"]["query_episodes"]) == 2
         assert bool(cfg["meta"]["query_updates_enabled"]) is False
         assert bool(cfg["meta"]["query_context_updates_enabled"]) is False
         assert str(cfg["meta"]["protocol_name"]) == "strict_support_query"
-        assert bool(cfg["meta"]["support_gate"]["enabled"]) is True
+        assert bool(cfg["meta"]["support_gate"]["enabled"]) is False
         assert str(cfg["meta"]["support_gate"]["role"]) == "rollback_guard"
         assert str(cfg["meta"]["support_gate"]["rule"]) == "safety_first"
         assert cfg["meta"]["support_gate"]["query_leakage"] is False
-        assert cfg["meta"]["support_gate"]["budget_mode"] == "paired_support_validation"
+        assert cfg["meta"]["support_gate"]["budget_mode"] == "support_gate_disabled"
+        assert int(cfg["meta"]["support_gate"]["extra_support_rollouts"]) == 0
         assert float(cfg["meta"]["support_gate"]["max_violation_increase"]) == 1.0e-4
         assert float(cfg["meta"]["support_gate"]["max_cost_increase"]) == 1.0e-5
         assert bool(cfg["meta"]["reset_optimizer_after_outer_update"]) is True
@@ -97,8 +98,8 @@ def test_meta_trainer_one_iter_explicit_inner_outer_smoke(tmp_path):
     assert "upper_warmup_steps" in rows[0]
     assert "iter_upper_update_step_delta" in rows[0]
     assert "support_gate_enabled" in rows[0]
-    assert rows[0]["support_gate_enabled"] == "True"
-    assert rows[0]["support_update_acceptance"] == "support_side_gated"
+    assert rows[0]["support_gate_enabled"] == "False"
+    assert rows[0]["support_update_acceptance"] == "unconditional"
     assert rows[0]["query_leakage"] == "False"
 
 
@@ -391,6 +392,8 @@ def test_support_gate_uses_paired_pre_post_validation_seeds(tmp_path):
     cfg["meta"]["inner_upper_warmup_steps"] = 2
     cfg["meta"]["support_gate"]["enabled"] = True
     cfg["meta"]["support_gate"]["paired_validation"] = True
+    cfg["meta"]["support_gate"]["budget_mode"] = "paired_support_validation"
+    cfg["meta"]["support_gate"]["extra_support_rollouts"] = 1
     cfg["meta"]["support_gate"]["score_threshold"] = -1.0e9
     cfg["upper_dqn"]["epsilon_decay_steps"] = 10
     cfg["context"]["gru_hidden"] = 16
