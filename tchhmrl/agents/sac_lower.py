@@ -43,6 +43,7 @@ class LowerSAC:
         self.alpha_start = float(sac_cfg.get("alpha_start", alpha_default))
         self.alpha_end = float(sac_cfg.get("alpha_end", self.alpha_start))
         self.alpha_decay_steps = int(sac_cfg.get("alpha_decay_steps", 0))
+        self.alpha_override: float | None = None
         self.auto_alpha = bool(sac_cfg.get("auto_alpha", False))
         self.target_entropy = float(sac_cfg.get("target_entropy", -float(self.act_dim)))
         self.grad_clip = float(sac_cfg["grad_clip"])
@@ -299,6 +300,8 @@ class LowerSAC:
             p_tgt.data.add_(self.tau * p.data)
 
     def _alpha_tensor(self, dtype: torch.dtype) -> torch.Tensor:
+        if self.alpha_override is not None:
+            return torch.tensor(float(self.alpha_override), dtype=dtype, device=self.device)
         if self.auto_alpha:
             return self.log_alpha.exp()
         if self.alpha_decay_steps <= 0:
@@ -307,6 +310,9 @@ class LowerSAC:
             frac = min(float(self.update_steps) / float(max(1, self.alpha_decay_steps)), 1.0)
             alpha_val = self.alpha_start + frac * (self.alpha_end - self.alpha_start)
         return torch.tensor(alpha_val, dtype=dtype, device=self.device)
+
+    def set_alpha_override(self, alpha: float | None) -> None:
+        self.alpha_override = None if alpha is None else float(alpha)
 
     def update(self, batch: Dict[str, np.ndarray], constraint_batch: Dict[str, np.ndarray] | None = None) -> Dict[str, float]:
         if self.constraint_critics_enabled:
@@ -658,6 +664,7 @@ class LowerSAC:
             "alpha_start": self.alpha_start,
             "alpha_end": self.alpha_end,
             "alpha_decay_steps": self.alpha_decay_steps,
+            "alpha_override": self.alpha_override,
             "target_entropy": self.target_entropy,
             "log_alpha": self.log_alpha.detach().cpu().item() if self.log_alpha is not None else None,
             "alpha_optim": self.alpha_optim.state_dict() if self.alpha_optim is not None else None,
@@ -698,6 +705,8 @@ class LowerSAC:
         if self.constraint_optim is not None and state.get("constraint_optim") is not None:
             self.constraint_optim.load_state_dict(state["constraint_optim"])
         self.update_steps = int(state.get("update_steps", 0))
+        if "alpha_override" in state:
+            self.alpha_override = None if state.get("alpha_override") is None else float(state["alpha_override"])
         if self.auto_alpha and self.log_alpha is not None and state.get("log_alpha") is not None:
             with torch.no_grad():
                 self.log_alpha.copy_(torch.tensor(float(state["log_alpha"]), device=self.device))

@@ -3,9 +3,10 @@ from __future__ import annotations
 import copy
 import math
 import time
+from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Dict, List
+from typing import Dict, Iterator, List
 
 import numpy as np
 import torch
@@ -159,6 +160,44 @@ class MetaTrainer:
         self.reset_optimizer_after_outer_update = bool(meta_cfg.get("reset_optimizer_after_outer_update", False))
         self.query_updates_enabled = bool(meta_cfg.get("query_updates_enabled", True))
         self.query_context_updates_enabled = bool(meta_cfg.get("query_context_updates_enabled", True))
+        schedule_cfg = cfg.get("safety", {}).get("thermal_cap_margin_schedule", {}) or {}
+        if not isinstance(schedule_cfg, dict):
+            schedule_cfg = {}
+        self.thermal_cap_margin_schedule_cfg = copy.deepcopy(schedule_cfg)
+        self.thermal_cap_margin_schedule_enabled = bool(schedule_cfg.get("enabled", False))
+        self.thermal_cap_margin_schedule_type = str(schedule_cfg.get("schedule_type", "")).lower()
+        self.thermal_cap_margin_schedule_scope = str(schedule_cfg.get("apply_scope", "train_adaptation_only")).lower()
+        self.thermal_cap_margin_warmup_c = float(
+            schedule_cfg.get("warmup_margin_c", cfg.get("safety", {}).get("thermal_cap_margin_c", 0.5))
+        )
+        self.thermal_cap_margin_nominal_c = float(
+            schedule_cfg.get("nominal_margin_c", cfg.get("safety", {}).get("thermal_cap_margin_c", 0.5))
+        )
+        self.thermal_cap_margin_eval_c = float(schedule_cfg.get("eval_margin_c", self.thermal_cap_margin_nominal_c))
+        self.thermal_cap_margin_warmup_steps = int(max(0, int(schedule_cfg.get("warmup_control_steps", 0) or 0)))
+        self.global_adaptation_control_steps = 0
+        self._thermal_cap_margin_schedule_phase = "disabled"
+        self._thermal_cap_margin_schedule_active = False
+        alpha_schedule_cfg = cfg.get("lower_sac", {}).get("alpha_schedule", {}) or {}
+        if not isinstance(alpha_schedule_cfg, dict):
+            alpha_schedule_cfg = {}
+        lower_sac_cfg = cfg.get("lower_sac", {}) or {}
+        default_alpha = float(lower_sac_cfg.get("alpha", 0.10))
+        self.lower_sac_alpha_schedule_cfg = copy.deepcopy(alpha_schedule_cfg)
+        self.lower_sac_alpha_schedule_enabled = bool(alpha_schedule_cfg.get("enabled", False))
+        self.lower_sac_alpha_schedule_type = str(alpha_schedule_cfg.get("schedule_type", "")).lower()
+        self.lower_sac_alpha_schedule_scope = str(
+            alpha_schedule_cfg.get("apply_scope", "train_adaptation_only")
+        ).lower()
+        self.lower_sac_alpha_warmup = float(alpha_schedule_cfg.get("warmup_alpha", default_alpha))
+        self.lower_sac_alpha_nominal = float(alpha_schedule_cfg.get("nominal_alpha", default_alpha))
+        self.lower_sac_alpha_eval = float(alpha_schedule_cfg.get("eval_alpha", self.lower_sac_alpha_nominal))
+        self.lower_sac_alpha_warmup_steps = int(
+            max(0, int(alpha_schedule_cfg.get("warmup_control_steps", 0) or 0))
+        )
+        self._lower_sac_alpha_current = float(default_alpha)
+        self._lower_sac_alpha_schedule_phase = "disabled"
+        self._lower_sac_alpha_schedule_active = False
         support_gate_cfg = meta_cfg.get("support_gate", {})
         if not isinstance(support_gate_cfg, dict):
             support_gate_cfg = {}
@@ -192,6 +231,115 @@ class MetaTrainer:
 
         self.ckpt_dir = Path(log_dir) / run_name / "checkpoints"
         self.ckpt_dir.mkdir(parents=True, exist_ok=True)
+
+        self._apply_thermal_cap_margin_for_eval()
+        self._apply_lower_sac_alpha_for_eval()
+
+    def _set_thermal_cap_margin_c(self, margin_c: float) -> None:
+        self.cfg.setdefault("safety", {})["thermal_cap_margin_c"] = float(margin_c)
+        setter = getattr(self.agent.safety, "set_thermal_cap_margin_c", None)
+        if callable(setter):
+            setter(float(margin_c))
+        else:
+            self.agent.safety.thermal_cap_margin_c = float(margin_c)
+
+    def _thermal_cap_margin_state_for_train(self) -> tuple[float, str, bool]:
+        if (
+            not self.thermal_cap_margin_schedule_enabled
+            or self.thermal_cap_margin_schedule_type != "adaptation_window"
+            or self.thermal_cap_margin_schedule_scope != "train_adaptation_only"
+        ):
+            return float(self.thermal_cap_margin_nominal_c), "disabled", False
+        if int(self.global_adaptation_control_steps) < int(self.thermal_cap_margin_warmup_steps):
+            return float(self.thermal_cap_margin_warmup_c), "warmup", True
+        return float(self.thermal_cap_margin_nominal_c), "nominal", False
+
+    def _apply_thermal_cap_margin_for_train(self) -> None:
+        margin, phase, active = self._thermal_cap_margin_state_for_train()
+        self._set_thermal_cap_margin_c(margin)
+        self._thermal_cap_margin_schedule_phase = str(phase)
+        self._thermal_cap_margin_schedule_active = bool(active)
+
+    def _apply_thermal_cap_margin_for_eval(self) -> None:
+        self._set_thermal_cap_margin_c(float(self.thermal_cap_margin_eval_c))
+        self._thermal_cap_margin_schedule_phase = "eval"
+        self._thermal_cap_margin_schedule_active = False
+
+    @contextmanager
+    def eval_thermal_cap_margin(self) -> Iterator[None]:
+        prev_margin = float(self.agent.safety.thermal_cap_margin_c)
+        prev_cfg_margin = float(self.cfg.get("safety", {}).get("thermal_cap_margin_c", prev_margin))
+        prev_phase = str(self._thermal_cap_margin_schedule_phase)
+        prev_active = bool(self._thermal_cap_margin_schedule_active)
+        self._apply_thermal_cap_margin_for_eval()
+        try:
+            yield
+        finally:
+            self._set_thermal_cap_margin_c(prev_margin)
+            self.cfg.setdefault("safety", {})["thermal_cap_margin_c"] = prev_cfg_margin
+            self._thermal_cap_margin_schedule_phase = prev_phase
+            self._thermal_cap_margin_schedule_active = prev_active
+
+    def thermal_cap_margin_schedule_metrics(self) -> Dict[str, float | str | bool]:
+        return {
+            "thermal_cap_margin_c": float(self.agent.safety.thermal_cap_margin_c),
+            "thermal_cap_margin_schedule_active": bool(self._thermal_cap_margin_schedule_active),
+            "thermal_cap_margin_schedule_phase": str(self._thermal_cap_margin_schedule_phase),
+            "global_adaptation_control_steps": int(self.global_adaptation_control_steps),
+            "warmup_control_steps": int(self.thermal_cap_margin_warmup_steps),
+            "eval_thermal_cap_margin_c": float(self.thermal_cap_margin_eval_c),
+        }
+
+    def _set_lower_sac_alpha(self, alpha: float | None) -> None:
+        setter = getattr(self.agent.lower, "set_alpha_override", None)
+        if callable(setter):
+            setter(alpha)
+        if alpha is not None:
+            self.cfg.setdefault("lower_sac", {})["alpha"] = float(alpha)
+
+    def _lower_sac_alpha_state_for_train(self) -> tuple[float | None, str, bool]:
+        if (
+            not self.lower_sac_alpha_schedule_enabled
+            or self.lower_sac_alpha_schedule_type != "adaptation_window"
+            or self.lower_sac_alpha_schedule_scope != "train_adaptation_only"
+        ):
+            return None, "disabled", False
+        if int(self.global_adaptation_control_steps) < int(self.lower_sac_alpha_warmup_steps):
+            return float(self.lower_sac_alpha_warmup), "warmup", True
+        return float(self.lower_sac_alpha_nominal), "nominal", False
+
+    def _apply_lower_sac_alpha_for_train(self) -> None:
+        alpha, phase, active = self._lower_sac_alpha_state_for_train()
+        self._set_lower_sac_alpha(alpha)
+        self._lower_sac_alpha_current = (
+            float(alpha)
+            if alpha is not None
+            else float(getattr(self.agent.lower, "alpha_start", self.cfg.get("lower_sac", {}).get("alpha", 0.10)))
+        )
+        self._lower_sac_alpha_schedule_phase = str(phase)
+        self._lower_sac_alpha_schedule_active = bool(active)
+
+    def _apply_lower_sac_alpha_for_eval(self) -> None:
+        if self.lower_sac_alpha_schedule_enabled:
+            self._set_lower_sac_alpha(float(self.lower_sac_alpha_eval))
+            self._lower_sac_alpha_current = float(self.lower_sac_alpha_eval)
+            self._lower_sac_alpha_schedule_phase = "eval"
+            self._lower_sac_alpha_schedule_active = False
+        else:
+            self._set_lower_sac_alpha(None)
+            self._lower_sac_alpha_current = float(
+                getattr(self.agent.lower, "alpha_start", self.cfg.get("lower_sac", {}).get("alpha", 0.10))
+            )
+            self._lower_sac_alpha_schedule_phase = "disabled"
+            self._lower_sac_alpha_schedule_active = False
+
+    def lower_sac_alpha_schedule_metrics(self) -> Dict[str, float | str | bool]:
+        return {
+            "lower_sac_alpha": float(self._lower_sac_alpha_current),
+            "alpha_schedule_active": bool(self._lower_sac_alpha_schedule_active),
+            "alpha_schedule_phase": str(self._lower_sac_alpha_schedule_phase),
+            "alpha_warmup_control_steps": int(self.lower_sac_alpha_warmup_steps),
+        }
 
     @staticmethod
     def _normalize_curriculum_phases(phases_raw) -> List[Dict]:
@@ -567,6 +715,12 @@ class MetaTrainer:
         reset_seed: int | None = None,
         update_context: bool | None = None,
     ) -> EpisodeStats:
+        if train:
+            self._apply_thermal_cap_margin_for_train()
+            self._apply_lower_sac_alpha_for_train()
+        else:
+            self._apply_thermal_cap_margin_for_eval()
+            self._apply_lower_sac_alpha_for_eval()
         obs, _ = env.reset(seed=reset_seed)
         self.agent.reset_rollout_state(clear_context=clear_context)
         if update_context is None:
@@ -659,6 +813,9 @@ class MetaTrainer:
 
         done = False
         while not done:
+            if train:
+                self._apply_thermal_cap_margin_for_train()
+                self._apply_lower_sac_alpha_for_train()
             z = self.agent.infer_z()
             temps_before = env.temps.copy().astype(np.float32)
 
@@ -673,6 +830,8 @@ class MetaTrainer:
             )
 
             next_obs, reward, terminated, truncated, info = env.step(action)
+            if train:
+                self.global_adaptation_control_steps += 1
             thermal_estimator_diag = self.agent.update_safety_estimator(
                 temps_before=temps_before,
                 info=info,
@@ -1674,6 +1833,8 @@ class MetaTrainer:
                 "iter_upper_update_step_delta": int(self.agent.upper.update_steps - iter_upper_steps_start),
                 "iter_lower_update_step_delta": int(self.agent.lower.update_steps - iter_lower_steps_start),
             }
+            row.update(self.thermal_cap_margin_schedule_metrics())
+            row.update(self.lower_sac_alpha_schedule_metrics())
             diagnostic_names = [
                 "cost_qos",
                 "cost_temp_anchor",
@@ -1778,10 +1939,12 @@ class MetaTrainer:
         tasks = self.task_sampler.sample(n_tasks)
         stats: List[EpisodeStats] = []
 
-        for task in tasks:
-            env = MultiTxUwSliptEnv(self.cfg, overrides=task.to_env_overrides())
-            for ep_idx in range(episodes_per_task):
-                stats.append(self._run_episode(env, train=False, clear_context=(ep_idx == 0)))
+        with self.eval_thermal_cap_margin():
+            eval_margin_c = float(self.agent.safety.thermal_cap_margin_c)
+            for task in tasks:
+                env = MultiTxUwSliptEnv(self.cfg, overrides=task.to_env_overrides())
+                for ep_idx in range(episodes_per_task):
+                    stats.append(self._run_episode(env, train=False, clear_context=(ep_idx == 0)))
 
         return {
             "reward": float(np.mean([s.reward for s in stats])),
@@ -1790,4 +1953,5 @@ class MetaTrainer:
             "cost": float(np.mean([s.cost for s in stats])),
             "violation_rate": float(np.mean([s.violations for s in stats])),
             "len": float(np.mean([s.length for s in stats])),
+            "eval_thermal_cap_margin_c": float(eval_margin_c),
         }

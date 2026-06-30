@@ -1023,6 +1023,74 @@ def set_compatibility_probe_metadata(cfg: Dict, *, changed_mechanisms: List[str]
     }
 
 
+def apply_oldbase_cap048_to050_schedule(cfg: Dict, *, warmup_control_steps: int) -> None:
+    apply_final_recover_full(cfg, gated=False)
+    safety_cfg = cfg.setdefault("safety", {})
+    safety_cfg["thermal_cap_margin_c"] = 0.50
+    safety_cfg["thermal_cap_margin_schedule"] = {
+        "enabled": True,
+        "schedule_type": "adaptation_window",
+        "warmup_margin_c": 0.48,
+        "nominal_margin_c": 0.50,
+        "warmup_control_steps": int(warmup_control_steps),
+        "apply_scope": "train_adaptation_only",
+        "eval_margin_c": 0.50,
+    }
+    pilot_meta = cfg.setdefault("pilot_metadata", {})
+    pilot_meta.update(
+        {
+            "pilot_only": True,
+            "formal_ranking_exclude": True,
+            "comparison_role": "thermal_cap_margin_adaptation_window_probe",
+            "thermal_cap_margin_schedule_enabled": True,
+            "schedule_type": "adaptation_window",
+            "warmup_margin_c": 0.48,
+            "nominal_margin_c": 0.50,
+            "warmup_control_steps": int(warmup_control_steps),
+            "apply_scope": "train_adaptation_only",
+            "eval_margin_c": 0.50,
+            "thermal_cap_margin_c": 0.50,
+        }
+    )
+
+
+def apply_oldbase_alpha010_to008_schedule(cfg: Dict, *, warmup_control_steps: int) -> None:
+    apply_final_recover_full(cfg, gated=False)
+    safety_cfg = cfg.setdefault("safety", {})
+    safety_cfg["thermal_cap_margin_c"] = 0.50
+    safety_cfg.pop("thermal_cap_margin_schedule", None)
+
+    lower_sac_cfg = cfg.setdefault("lower_sac", {})
+    lower_sac_cfg["alpha"] = 0.10
+    lower_sac_cfg["alpha_schedule"] = {
+        "enabled": True,
+        "schedule_type": "adaptation_window",
+        "warmup_alpha": 0.10,
+        "nominal_alpha": 0.08,
+        "warmup_control_steps": int(warmup_control_steps),
+        "apply_scope": "train_adaptation_only",
+        "eval_alpha": 0.08,
+    }
+
+    pilot_meta = cfg.setdefault("pilot_metadata", {})
+    pilot_meta.update(
+        {
+            "pilot_only": True,
+            "formal_ranking_exclude": True,
+            "comparison_role": "lower_sac_alpha_adaptation_window_probe",
+            "thermal_cap_margin_c": 0.50,
+            "thermal_cap_margin_schedule_enabled": False,
+            "lower_sac_alpha_schedule_enabled": True,
+            "alpha_schedule_type": "adaptation_window",
+            "alpha_warmup": 0.10,
+            "alpha_nominal": 0.08,
+            "alpha_warmup_control_steps": int(warmup_control_steps),
+            "alpha_apply_scope": "train_adaptation_only",
+            "alpha_eval": 0.08,
+        }
+    )
+
+
 def apply_ablation(cfg: Dict, ablation: str) -> None:
     ablation = str(ablation)
     if ablation == "full":
@@ -1046,6 +1114,18 @@ def apply_ablation(cfg: Dict, ablation: str) -> None:
         return
     if ablation == "full_final_ungated_recover":
         apply_final_recover_full(cfg, gated=False)
+        sync_site_bank_with_cfg(cfg)
+        return
+    if ablation == "oldbase_cap048_to050_s3200":
+        apply_oldbase_cap048_to050_schedule(cfg, warmup_control_steps=3200)
+        sync_site_bank_with_cfg(cfg)
+        return
+    if ablation == "oldbase_cap048_to050_s24000":
+        apply_oldbase_cap048_to050_schedule(cfg, warmup_control_steps=24000)
+        sync_site_bank_with_cfg(cfg)
+        return
+    if ablation == "oldbase_alpha010_to008_s24000":
+        apply_oldbase_alpha010_to008_schedule(cfg, warmup_control_steps=24000)
         sync_site_bank_with_cfg(cfg)
         return
     if ablation == "wo_meta":
@@ -2463,6 +2543,7 @@ def select_checkpoint(
                     "eh": float(metrics.get("eh", 0.0)),
                     "cost": float(metrics.get("cost", 0.0)),
                     "violation_rate": float(metrics.get("violation_rate", 0.0)),
+                    "eval_thermal_cap_margin_c": float(metrics.get("eval_thermal_cap_margin_c", float("nan"))),
                     "score": float(score),
                 }
             )
@@ -2940,154 +3021,155 @@ def collect_env_data(
 ) -> pd.DataFrame:
     rows: List[Dict[str, float]] = []
 
-    for task_id, task in enumerate(tasks):
-        env = MultiTxUwSliptEnv(cfg, overrides=task.to_env_overrides())
+    with trainer.eval_thermal_cap_margin():
+        for task_id, task in enumerate(tasks):
+            env = MultiTxUwSliptEnv(cfg, overrides=task.to_env_overrides())
 
-        for ep in range(episodes_per_task):
-            obs, _ = env.reset(seed=seed + task_id * 100 + ep)
-            trainer.agent.reset_episode_state()
-            done = False
-            step = 0
+            for ep in range(episodes_per_task):
+                obs, _ = env.reset(seed=seed + task_id * 100 + ep)
+                trainer.agent.reset_episode_state()
+                done = False
+                step = 0
 
-            while not done:
-                z = trainer.agent.infer_z()
-                temps_before = env.temps.copy().astype(np.float32)
+                while not done:
+                    z = trainer.agent.infer_z()
+                    temps_before = env.temps.copy().astype(np.float32)
 
-                action, aux = trainer.agent.act(
-                    obs=obs,
-                    temps=temps_before,
-                    amb_temp=env.amb_temp,
-                    gamma=env.gamma,
-                    delta=env.delta,
-                    z=z,
-                    eval_mode=True,
-                )
+                    action, aux = trainer.agent.act(
+                        obs=obs,
+                        temps=temps_before,
+                        amb_temp=env.amb_temp,
+                        gamma=env.gamma,
+                        delta=env.delta,
+                        z=z,
+                        eval_mode=True,
+                    )
 
-                next_obs, reward, terminated, truncated, info = env.step(action)
-                _update_runner_safety_estimator(trainer, temps_before, info)
-                done = bool(terminated or truncated)
-                currents_exec = np.asarray(info.get("currents_exec", action["currents_exec"]), dtype=np.float32)
-                current_total = float(info.get("current_total", float(np.sum(currents_exec))))
-                bus_current_max = float(info.get("bus_current_max", env.bus_current_max))
-                row = {
-                    "scenario": scenario,
-                    "variant": variant,
-                    "seed": float(seed),
-                    "task_id": float(task_id),
-                    "episode": float(ep),
-                    "step": float(step),
-                    "attenuation_c": float(env.attenuation_c),
-                    "misalign_std": float(env.misalign_std),
-                    "amb_temp": float(env.amb_temp),
-                    "gamma": float(env.gamma),
-                    "delta": float(env.delta),
-                    "site_id": int(getattr(env, "site_id", -1)),
-                    "task_source": str(getattr(env, "task_source", "global_fallback")),
-                    "alignment_version": str(getattr(env, "alignment_version", "system_model_v1")),
-                    "task_summary_version": str(getattr(env, "task_summary_version", "site_v2")),
-                    "pre_alignment": bool(getattr(env, "pre_alignment", False)),
-                    "physics_version": str(getattr(env, "physics_version", "")),
-                    "eh_model": str(info.get("eh_model", getattr(env, "eh_model", ""))),
-                    "thermal_model": str(info.get("thermal_model", getattr(env, "thermal_model", ""))),
-                    "safety_projection_version": str(getattr(env, "safety_projection_version", "")),
-                    "eh_calibration_hash": str(info.get("eh_calibration_hash", getattr(env, "eh_calibration_hash", ""))),
-                    "thermal_coupling_matrix_hash": str(
-                        info.get("thermal_coupling_matrix_hash", getattr(env, "thermal_coupling_matrix_hash", ""))
-                    ),
-                    "distance_tx0": float(env.distances[0]),
-                    "distance_tx1": float(env.distances[1]),
-                    "distance_tx2": float(env.distances[2]),
-                    "thermal_safe": float(env.thermal_safe),
-                    "thermal_cutoff": float(env.thermal_cutoff),
-                    "signal_ld_share": float(info["signal_ld_share"]),
-                    "led_tx_fraction": float(info["led_tx_fraction"]),
-                    "tx_enabled_fraction": float(info.get("tx_enabled_fraction", 1.0)),
-                    "signal_led": float(info["signal_led"]),
-                    "signal_ld": float(info["signal_ld"]),
-                    "snr": float(info["snr"]),
-                    "qos_rate": float(info["qos_rate"]),
-                    "eh_metric": float(info["eh_metric"]),
-                    "eh_input_eff": float(info.get("eh_input_eff", info["eh_metric"])),
-                    "eh_metric_linear_proxy": float(info.get("eh_metric_linear_proxy", info["eh_metric"])),
-                    "info_share": float(info["info_share"]),
-                    "eh_share": float(info["eh_share"]),
-                    "se": float(info["se"]),
-                    "eh": float(info["eh"]),
-                    "reward_id_term": float(info.get("reward_id_term", info.get("reward_se_term", info["se"]))),
-                    "reward_se_term": float(info.get("reward_se_term", info["se"])),
-                    "reward_eh_term": float(info.get("reward_eh_term", info["eh"])),
-                    "reward_margin_term": float(info.get("reward_margin_term", 0.0)),
-                    "reward_cost_penalty": float(info.get("reward_cost_penalty", info.get("penalty_cost_term", 0.0))),
-                    "reward_power_penalty": float(
-                        info.get("reward_power_penalty", info.get("penalty_power_term", 0.0))
-                    ),
-                    "penalty_cost_term": float(info.get("penalty_cost_term", 0.0)),
-                    "penalty_power_term": float(info.get("penalty_power_term", 0.0)),
-                    "penalty_smooth_term": float(info.get("penalty_smooth_term", 0.0)),
-                    "penalty_switch_term": float(info.get("penalty_switch_term", 0.0)),
-                    "mode_switch": float(info.get("mode_switch", 0.0)),
-                    "boost_switch": float(info.get("boost_switch", 0.0)),
-                    "mode_exec": float(info.get("mode_exec", action.get("mode_exec", 0))),
-                    "boost_combo_exec": float(info.get("boost_combo_exec", action.get("boost_combo_exec", 0))),
-                    "upper_idx_exec": float(info.get("upper_idx_exec", action.get("upper_idx_exec", 0))),
-                    "upper_idx_raw": float(aux.get("upper_idx_raw", action.get("upper_idx", 0))),
-                    "upper_idx_train": float(aux.get("upper_idx_train", info.get("upper_idx_exec", action.get("upper_idx_exec", 0)))),
-                    "upper_idx_safety_raw": float(aux.get("upper_idx_safety_raw", aux.get("upper_idx_raw", action.get("upper_idx", 0)))),
-                    "current_template_level_exec": float(
-                        aux.get("current_template_level_exec", info.get("mode_exec", action.get("mode_exec", 0)))
-                    ),
-                    "cost": float(info["cost"]),
-                    "cost_qos": float(info.get("cost_qos", 0.0)),
-                    "cost_temp_anchor": float(info.get("cost_temp_anchor", 0.0)),
-                    "cost_temp_boost1": float(info.get("cost_temp_boost1", 0.0)),
-                    "cost_temp_boost2": float(info.get("cost_temp_boost2", 0.0)),
-                    "thermal_violation": float(info["thermal_violation"]),
-                    "temp_mean_before": float(np.mean(temps_before)),
-                    "temp_mean_after": float(np.mean(info["temps"])),
-                    "temp_max_after": float(np.max(info["temps"])),
-                    "current_total": current_total,
-                    "bus_current_max": bus_current_max,
-                    "bus_utilization": float(current_total / max(bus_current_max, 1.0e-6)),
-                }
-                for tx_idx, current_val in enumerate(currents_exec.tolist()):
-                    row[f"current_tx{tx_idx}"] = float(current_val)
-                _add_eh_diagnostics(row, info)
-                _add_env_thermal_diagnostics(row, info)
-                _add_projection_diagnostics(row, aux, currents_exec)
-                _add_baseline_aux_diagnostics(row, aux)
-
-                trainer.agent.episode.add(
-                    {
-                        "obs": obs.astype(np.float32),
-                        "upper_idx_exec": float(info.get("upper_idx_exec", action.get("upper_idx_exec", 0))),
-                        "boost_combo_exec": float(info.get("boost_combo_exec", action.get("boost_combo_exec", 0))),
-                        "mode_exec": float(info.get("mode_exec", action.get("mode_exec", 0))),
-                        "act_exec": aux["act_exec"].astype(np.float32),
-                        "reward": float(reward),
-                        "reward_raw": float(reward),
-                        "reward_task": float(info.get("reward_task", reward)),
-                        "reward_benchmark": float(info.get("reward_benchmark", reward)),
-                        "reward_dual_penalized": float(info.get("reward_task", reward)),
-                        "cost": float(info["cost"]),
-                        "cost_vec": np.asarray(info.get("cost_vec", [float(info["cost"])]), dtype=np.float32),
-                        "task_params": build_context_task_summary_v2(
-                            {
-                                "attenuation_c": env.attenuation_c,
-                                "misalign_std": env.misalign_std,
-                                "amb_temp_env": env.amb_temp,
-                                "gamma": env.gamma,
-                                "delta": env.delta,
-                                "qos_min_rate": env.qos_min_rate,
-                                "distances": env.distances,
-                            }
+                    next_obs, reward, terminated, truncated, info = env.step(action)
+                    _update_runner_safety_estimator(trainer, temps_before, info)
+                    done = bool(terminated or truncated)
+                    currents_exec = np.asarray(info.get("currents_exec", action["currents_exec"]), dtype=np.float32)
+                    current_total = float(info.get("current_total", float(np.sum(currents_exec))))
+                    bus_current_max = float(info.get("bus_current_max", env.bus_current_max))
+                    row = {
+                        "scenario": scenario,
+                        "variant": variant,
+                        "seed": float(seed),
+                        "task_id": float(task_id),
+                        "episode": float(ep),
+                        "step": float(step),
+                        "attenuation_c": float(env.attenuation_c),
+                        "misalign_std": float(env.misalign_std),
+                        "amb_temp": float(env.amb_temp),
+                        "gamma": float(env.gamma),
+                        "delta": float(env.delta),
+                        "site_id": int(getattr(env, "site_id", -1)),
+                        "task_source": str(getattr(env, "task_source", "global_fallback")),
+                        "alignment_version": str(getattr(env, "alignment_version", "system_model_v1")),
+                        "task_summary_version": str(getattr(env, "task_summary_version", "site_v2")),
+                        "pre_alignment": bool(getattr(env, "pre_alignment", False)),
+                        "physics_version": str(getattr(env, "physics_version", "")),
+                        "eh_model": str(info.get("eh_model", getattr(env, "eh_model", ""))),
+                        "thermal_model": str(info.get("thermal_model", getattr(env, "thermal_model", ""))),
+                        "safety_projection_version": str(getattr(env, "safety_projection_version", "")),
+                        "eh_calibration_hash": str(info.get("eh_calibration_hash", getattr(env, "eh_calibration_hash", ""))),
+                        "thermal_coupling_matrix_hash": str(
+                            info.get("thermal_coupling_matrix_hash", getattr(env, "thermal_coupling_matrix_hash", ""))
                         ),
+                        "distance_tx0": float(env.distances[0]),
+                        "distance_tx1": float(env.distances[1]),
+                        "distance_tx2": float(env.distances[2]),
+                        "thermal_safe": float(env.thermal_safe),
+                        "thermal_cutoff": float(env.thermal_cutoff),
+                        "signal_ld_share": float(info["signal_ld_share"]),
+                        "led_tx_fraction": float(info["led_tx_fraction"]),
+                        "tx_enabled_fraction": float(info.get("tx_enabled_fraction", 1.0)),
+                        "signal_led": float(info["signal_led"]),
+                        "signal_ld": float(info["signal_ld"]),
+                        "snr": float(info["snr"]),
+                        "qos_rate": float(info["qos_rate"]),
+                        "eh_metric": float(info["eh_metric"]),
+                        "eh_input_eff": float(info.get("eh_input_eff", info["eh_metric"])),
+                        "eh_metric_linear_proxy": float(info.get("eh_metric_linear_proxy", info["eh_metric"])),
+                        "info_share": float(info["info_share"]),
+                        "eh_share": float(info["eh_share"]),
+                        "se": float(info["se"]),
+                        "eh": float(info["eh"]),
+                        "reward_id_term": float(info.get("reward_id_term", info.get("reward_se_term", info["se"]))),
+                        "reward_se_term": float(info.get("reward_se_term", info["se"])),
+                        "reward_eh_term": float(info.get("reward_eh_term", info["eh"])),
+                        "reward_margin_term": float(info.get("reward_margin_term", 0.0)),
+                        "reward_cost_penalty": float(info.get("reward_cost_penalty", info.get("penalty_cost_term", 0.0))),
+                        "reward_power_penalty": float(
+                            info.get("reward_power_penalty", info.get("penalty_power_term", 0.0))
+                        ),
+                        "penalty_cost_term": float(info.get("penalty_cost_term", 0.0)),
+                        "penalty_power_term": float(info.get("penalty_power_term", 0.0)),
+                        "penalty_smooth_term": float(info.get("penalty_smooth_term", 0.0)),
+                        "penalty_switch_term": float(info.get("penalty_switch_term", 0.0)),
+                        "mode_switch": float(info.get("mode_switch", 0.0)),
+                        "boost_switch": float(info.get("boost_switch", 0.0)),
+                        "mode_exec": float(info.get("mode_exec", action.get("mode_exec", 0))),
+                        "boost_combo_exec": float(info.get("boost_combo_exec", action.get("boost_combo_exec", 0))),
+                        "upper_idx_exec": float(info.get("upper_idx_exec", action.get("upper_idx_exec", 0))),
+                        "upper_idx_raw": float(aux.get("upper_idx_raw", action.get("upper_idx", 0))),
+                        "upper_idx_train": float(aux.get("upper_idx_train", info.get("upper_idx_exec", action.get("upper_idx_exec", 0)))),
+                        "upper_idx_safety_raw": float(aux.get("upper_idx_safety_raw", aux.get("upper_idx_raw", action.get("upper_idx", 0)))),
+                        "current_template_level_exec": float(
+                            aux.get("current_template_level_exec", info.get("mode_exec", action.get("mode_exec", 0)))
+                        ),
+                        "cost": float(info["cost"]),
+                        "cost_qos": float(info.get("cost_qos", 0.0)),
+                        "cost_temp_anchor": float(info.get("cost_temp_anchor", 0.0)),
+                        "cost_temp_boost1": float(info.get("cost_temp_boost1", 0.0)),
+                        "cost_temp_boost2": float(info.get("cost_temp_boost2", 0.0)),
+                        "thermal_violation": float(info["thermal_violation"]),
+                        "temp_mean_before": float(np.mean(temps_before)),
+                        "temp_mean_after": float(np.mean(info["temps"])),
+                        "temp_max_after": float(np.max(info["temps"])),
+                        "current_total": current_total,
+                        "bus_current_max": bus_current_max,
+                        "bus_utilization": float(current_total / max(bus_current_max, 1.0e-6)),
                     }
-                )
+                    for tx_idx, current_val in enumerate(currents_exec.tolist()):
+                        row[f"current_tx{tx_idx}"] = float(current_val)
+                    _add_eh_diagnostics(row, info)
+                    _add_env_thermal_diagnostics(row, info)
+                    _add_projection_diagnostics(row, aux, currents_exec)
+                    _add_baseline_aux_diagnostics(row, aux)
 
-                rows.append(row)
+                    trainer.agent.episode.add(
+                        {
+                            "obs": obs.astype(np.float32),
+                            "upper_idx_exec": float(info.get("upper_idx_exec", action.get("upper_idx_exec", 0))),
+                            "boost_combo_exec": float(info.get("boost_combo_exec", action.get("boost_combo_exec", 0))),
+                            "mode_exec": float(info.get("mode_exec", action.get("mode_exec", 0))),
+                            "act_exec": aux["act_exec"].astype(np.float32),
+                            "reward": float(reward),
+                            "reward_raw": float(reward),
+                            "reward_task": float(info.get("reward_task", reward)),
+                            "reward_benchmark": float(info.get("reward_benchmark", reward)),
+                            "reward_dual_penalized": float(info.get("reward_task", reward)),
+                            "cost": float(info["cost"]),
+                            "cost_vec": np.asarray(info.get("cost_vec", [float(info["cost"])]), dtype=np.float32),
+                            "task_params": build_context_task_summary_v2(
+                                {
+                                    "attenuation_c": env.attenuation_c,
+                                    "misalign_std": env.misalign_std,
+                                    "amb_temp_env": env.amb_temp,
+                                    "gamma": env.gamma,
+                                    "delta": env.delta,
+                                    "qos_min_rate": env.qos_min_rate,
+                                    "distances": env.distances,
+                                }
+                            ),
+                        }
+                    )
 
-                obs = next_obs
-                step += 1
+                    rows.append(row)
+
+                    obs = next_obs
+                    step += 1
 
     return pd.DataFrame(rows)
 
@@ -3099,10 +3181,12 @@ def evaluate_on_tasks(
     episodes_per_task: int,
 ) -> Dict[str, float]:
     stats = []
-    for task in tasks:
-        env = MultiTxUwSliptEnv(cfg, overrides=task.to_env_overrides())
-        for _ in range(episodes_per_task):
-            stats.append(trainer._run_episode(env, train=False))
+    with trainer.eval_thermal_cap_margin():
+        eval_margin_c = float(trainer.agent.safety.thermal_cap_margin_c)
+        for task in tasks:
+            env = MultiTxUwSliptEnv(cfg, overrides=task.to_env_overrides())
+            for _ in range(episodes_per_task):
+                stats.append(trainer._run_episode(env, train=False))
     reward_episode = float(np.mean([s.reward for s in stats]))
     reward_per_step = float(np.mean([s.reward / max(s.length, 1) for s in stats]))
 
@@ -3119,6 +3203,7 @@ def evaluate_on_tasks(
         "eh_metric_raw_nonlinear": float(np.mean([s.eh_metric_raw_nonlinear for s in stats])),
         "eh_saturation_fraction": float(np.mean([s.eh_saturation_fraction for s in stats])),
         "eh_near_zero_fraction": float(np.mean([s.eh_near_zero_fraction for s in stats])),
+        "eval_thermal_cap_margin_c": float(eval_margin_c),
     }
 
 
@@ -6194,6 +6279,20 @@ def run_one_scenario(
                     "projection_objective": str(pilot_meta.get("projection_objective", "")),
                     "smooth_relaxed_margin_c": pilot_meta.get("smooth_relaxed_margin_c"),
                     "thermal_cap_margin_c": pilot_meta.get("thermal_cap_margin_c"),
+                    "thermal_cap_margin_schedule_enabled": pilot_meta.get("thermal_cap_margin_schedule_enabled"),
+                    "schedule_type": pilot_meta.get("schedule_type"),
+                    "warmup_margin_c": pilot_meta.get("warmup_margin_c"),
+                    "nominal_margin_c": pilot_meta.get("nominal_margin_c"),
+                    "warmup_control_steps": pilot_meta.get("warmup_control_steps"),
+                    "apply_scope": pilot_meta.get("apply_scope"),
+                    "eval_margin_c": pilot_meta.get("eval_margin_c"),
+                    "lower_sac_alpha_schedule_enabled": pilot_meta.get("lower_sac_alpha_schedule_enabled"),
+                    "alpha_schedule_type": pilot_meta.get("alpha_schedule_type"),
+                    "alpha_warmup": pilot_meta.get("alpha_warmup"),
+                    "alpha_nominal": pilot_meta.get("alpha_nominal"),
+                    "alpha_warmup_control_steps": pilot_meta.get("alpha_warmup_control_steps"),
+                    "alpha_apply_scope": pilot_meta.get("alpha_apply_scope"),
+                    "alpha_eval": pilot_meta.get("alpha_eval"),
                     "formally_comparable": formally_comparable,
                     "formal_ranking_comparable": bool(is_formal_ranking_record(formal_record_probe)),
                     "eval_reward": float(ev.get("reward_per_step", ev["reward"])),
@@ -6204,6 +6303,7 @@ def run_one_scenario(
                     "eval_eh": float(ev["eh"]),
                     "eval_cost": float(ev["cost"]),
                     "eval_violation_rate": float(ev["violation_rate"]),
+                    "eval_thermal_cap_margin_c": float(ev.get("eval_thermal_cap_margin_c", float("nan"))),
                     "env_cost_mean": float(env_df["cost"].mean()) if not env_df.empty else 0.0,
                     "env_step_violation_fraction": float((env_df["thermal_violation"] > 0).mean())
                     if not env_df.empty
@@ -7385,6 +7485,9 @@ def parse_args() -> argparse.Namespace:
             "full_final_ungated_compat",
             "full_final_gated_recover",
             "full_final_ungated_recover",
+            "oldbase_cap048_to050_s3200",
+            "oldbase_cap048_to050_s24000",
+            "oldbase_alpha010_to008_s24000",
             "meta_ungated",
             "wo_meta",
             "wo_lagrangian",

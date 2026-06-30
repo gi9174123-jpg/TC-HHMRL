@@ -4,6 +4,7 @@ import copy
 
 import numpy as np
 import pandas as pd
+import pytest
 import torch
 
 from scripts.benchmark_constraint_scenarios import (
@@ -868,6 +869,103 @@ def test_full_final_recover_variants_restore_old_lightweight_selection_and_optim
 
     assert ungated["pilot_metadata"]["final_ungated_recover"] is True
     assert ungated["pilot_metadata"]["deprecated_gated_recover_alias"] is False
+
+
+@pytest.mark.parametrize(
+    ("ablation", "warmup_control_steps"),
+    [
+        ("oldbase_cap048_to050_s3200", 3200),
+        ("oldbase_cap048_to050_s24000", 24000),
+    ],
+)
+def test_oldbase_cap048_to050_adds_step_based_margin_schedule_only(
+    ablation, warmup_control_steps
+):
+    cfg = copy.deepcopy(load_cfg("configs/default.yaml"))
+    apply_ablation(cfg, ablation)
+
+    sched = cfg["safety"]["thermal_cap_margin_schedule"]
+    assert float(cfg["safety"]["thermal_cap_margin_c"]) == 0.50
+    assert sched["enabled"] is True
+    assert sched["schedule_type"] == "adaptation_window"
+    assert int(sched["warmup_control_steps"]) == warmup_control_steps
+    assert float(sched["warmup_margin_c"]) == 0.48
+    assert float(sched["nominal_margin_c"]) == 0.50
+    assert sched["apply_scope"] == "train_adaptation_only"
+    assert float(sched["eval_margin_c"]) == 0.50
+
+    assert cfg["safety"]["current_decoder"] == "per_source"
+    assert cfg["safety"]["projection_mode"] == "thermal_cap"
+    assert float(cfg["safety"]["allocation_logit_scale"]) == 2.0
+    assert cfg["adaptive_thermal"]["enabled"] is False
+    assert cfg["upper_safety_shield"]["enabled"] is False
+    assert cfg["residual_planner"]["enabled"] is False
+    assert cfg["execution_thermal_guard"]["enabled"] is False
+    assert cfg["meta"]["support_gate"]["enabled"] is False
+    assert cfg["meta"]["query_updates_enabled"] is True
+    assert cfg["meta"]["query_context_updates_enabled"] is True
+    assert cfg["meta"]["reset_optimizer_after_outer_update"] is False
+    assert cfg["meta"]["protocol_name"] == "final_no_rollback_recover"
+
+    meta = cfg["pilot_metadata"]
+    assert meta["pilot_only"] is True
+    assert meta["formal_ranking_exclude"] is True
+    assert meta["comparison_role"] == "thermal_cap_margin_adaptation_window_probe"
+    assert meta["schedule_type"] == "adaptation_window"
+    assert float(meta["warmup_margin_c"]) == 0.48
+    assert float(meta["nominal_margin_c"]) == 0.50
+    assert int(meta["warmup_control_steps"]) == warmup_control_steps
+    assert float(meta["eval_margin_c"]) == 0.50
+
+
+def test_oldbase_alpha010_to008_s24000_adds_alpha_schedule_only():
+    cfg = copy.deepcopy(load_cfg("configs/default.yaml"))
+    cfg.setdefault("safety", {})["thermal_cap_margin_schedule"] = {
+        "enabled": True,
+        "schedule_type": "adaptation_window",
+        "warmup_margin_c": 0.48,
+        "nominal_margin_c": 0.50,
+        "warmup_control_steps": 24000,
+    }
+
+    apply_ablation(cfg, "oldbase_alpha010_to008_s24000")
+
+    assert float(cfg["safety"]["thermal_cap_margin_c"]) == 0.50
+    assert not cfg["safety"].get("thermal_cap_margin_schedule", {}).get("enabled", False)
+
+    alpha_sched = cfg["lower_sac"]["alpha_schedule"]
+    assert float(cfg["lower_sac"]["alpha"]) == 0.10
+    assert alpha_sched["enabled"] is True
+    assert alpha_sched["schedule_type"] == "adaptation_window"
+    assert float(alpha_sched["warmup_alpha"]) == 0.10
+    assert float(alpha_sched["nominal_alpha"]) == 0.08
+    assert int(alpha_sched["warmup_control_steps"]) == 24000
+    assert alpha_sched["apply_scope"] == "train_adaptation_only"
+    assert float(alpha_sched["eval_alpha"]) == 0.08
+
+    assert cfg["safety"]["current_decoder"] == "per_source"
+    assert cfg["safety"]["projection_mode"] == "thermal_cap"
+    assert float(cfg["safety"]["allocation_logit_scale"]) == 2.0
+    assert cfg["adaptive_thermal"]["enabled"] is False
+    assert cfg["upper_safety_shield"]["enabled"] is False
+    assert cfg["residual_planner"]["enabled"] is False
+    assert cfg["execution_thermal_guard"]["enabled"] is False
+    assert cfg["meta"]["support_gate"]["enabled"] is False
+    assert cfg["meta"]["query_updates_enabled"] is True
+    assert cfg["meta"]["query_context_updates_enabled"] is True
+    assert cfg["meta"]["reset_optimizer_after_outer_update"] is False
+    assert cfg["meta"]["protocol_name"] == "final_no_rollback_recover"
+
+    meta = cfg["pilot_metadata"]
+    assert meta["pilot_only"] is True
+    assert meta["formal_ranking_exclude"] is True
+    assert meta["comparison_role"] == "lower_sac_alpha_adaptation_window_probe"
+    assert meta["thermal_cap_margin_schedule_enabled"] is False
+    assert meta["lower_sac_alpha_schedule_enabled"] is True
+    assert float(meta["alpha_warmup"]) == 0.10
+    assert float(meta["alpha_nominal"]) == 0.08
+    assert int(meta["alpha_warmup_control_steps"]) == 24000
+    assert float(meta["alpha_eval"]) == 0.08
 
 
 def test_full_compat_no_support_gate_probe_removes_gate_budget():

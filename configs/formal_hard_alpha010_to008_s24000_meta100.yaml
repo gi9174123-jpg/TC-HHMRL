@@ -1,0 +1,63 @@
+# Formal hard-stress candidate preset.
+#
+# Use this with the best oldbase no-rollback recover resolved_config as --cfg and
+# the benchmark ablation oldbase_alpha010_to008_s24000.
+
+base_config_source: logs/light_full_no_rollback_oldbase_20260629_110809/hard_stress/hard_stress_hybrid_full_final_ungated_recover_seed101/resolved_config.yaml
+
+benchmark:
+  scenarios:
+    - hard_stress
+  variants:
+    - hybrid
+  ablations:
+    - oldbase_alpha010_to008_s24000
+  seeds:
+    - 101
+    - 202
+    - 303
+    - 404
+    - 505
+    - 606
+    - 707
+    - 808
+    - 909
+    - 1001
+  meta_iters: 100
+  eval_tasks: 10
+  eval_eps: 3
+  env_tasks: 4
+  env_eps: 1
+  episode_len: 80
+
+required_invariants:
+  safety:
+    thermal_cap_margin_c: 0.50
+    thermal_cap_margin_schedule: null
+    current_decoder: per_source
+    projection_mode: thermal_cap
+    allocation_logit_scale: 2.0
+  lower_sac:
+    alpha_schedule:
+      enabled: true
+      schedule_type: adaptation_window
+      warmup_alpha: 0.10
+      nominal_alpha: 0.08
+      warmup_control_steps: 24000
+      apply_scope: train_adaptation_only
+      eval_alpha: 0.08
+  adaptive_thermal:
+    enabled: false
+  upper_safety_shield:
+    enabled: false
+  residual_planner:
+    enabled: false
+  execution_thermal_guard:
+    enabled: false
+  meta:
+    support_gate:
+      enabled: false
+    query_updates_enabled: true
+    query_context_updates_enabled: true
+    reset_optimizer_after_outer_update: false
+    protocol_name: final_no_rollback_recover

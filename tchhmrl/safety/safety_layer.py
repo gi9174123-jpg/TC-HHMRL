@@ -153,6 +153,10 @@ class SafetyLayer:
         self.execution_guard_remove_only_on_emergency = bool(exec_guard_cfg.get("remove_only_on_emergency", False))
         self.execution_guard_reproject_after_guard = bool(exec_guard_cfg.get("reproject_after_guard", True))
 
+    def set_thermal_cap_margin_c(self, margin_c: float) -> None:
+        """Update the active thermal-cap margin used by subsequent projections."""
+        self.thermal_cap_margin_c = float(margin_c)
+
     def state_dict(self) -> Dict:
         return {
             "thermal_estimator": self.thermal_estimator.state_dict(),

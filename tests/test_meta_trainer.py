@@ -6,6 +6,7 @@ import csv
 import numpy as np
 import torch
 
+from scripts.benchmark_constraint_scenarios import apply_ablation
 from scripts.meta_adaptation_diagnostics import run_meta_adaptation_diagnostics
 from tchhmrl.agents.hierarchical_agent import HierarchicalAgent
 from tchhmrl.envs.uw_slipt_env import MultiTxUwSliptEnv
@@ -559,6 +560,98 @@ def test_meta_trainer_no_dual_and_no_context_smoke(tmp_path):
 
     assert rows
     assert float(rows[0]["lambda_qos"]) == 0.0
+
+
+def test_thermal_cap_margin_schedule_uses_control_steps_and_eval_margin(tmp_path):
+    cfg = load_cfg("configs/default.yaml")
+    apply_ablation(cfg, "oldbase_cap048_to050_s3200")
+    cfg["experiment"]["log_dir"] = str(tmp_path)
+    cfg["experiment"]["run_name"] = "margin_schedule"
+    cfg["experiment"]["seed"] = 17
+    cfg["experiment"]["device"] = "cpu"
+    cfg["env"]["episode_len"] = 4
+    cfg["agent"]["hidden_dim"] = 32
+    cfg["agent"]["batch_size"] = 4
+    cfg["agent"]["warmup_steps"] = 4
+    cfg["agent"]["upper_warmup_steps"] = 2
+    cfg["buffer"]["replay_size"] = 128
+    cfg["buffer"]["context_max_len"] = 32
+    cfg["meta"]["meta_iters"] = 2
+    cfg["meta"]["n_tasks_per_iter"] = 1
+    cfg["meta"]["support_episodes"] = 1
+    cfg["meta"]["support_adaptation_episodes"] = 1
+    cfg["meta"]["query_episodes"] = 0
+    cfg["meta"]["checkpoint_selection"]["enabled"] = False
+    cfg["safety"]["thermal_cap_margin_schedule"]["warmup_control_steps"] = 5
+    cfg["context"]["gru_hidden"] = 16
+    cfg["upper_dqn"]["epsilon_decay_steps"] = 10
+
+    trainer = MetaTrainer(cfg)
+    csv_path = trainer.train(meta_iters=2)
+
+    with open(csv_path, newline="") as f:
+        rows = list(csv.DictReader(f))
+
+    assert len(rows) == 2
+    assert float(rows[0]["thermal_cap_margin_c"]) == 0.48
+    assert rows[0]["thermal_cap_margin_schedule_phase"] == "warmup"
+    assert rows[0]["thermal_cap_margin_schedule_active"] == "True"
+    assert int(float(rows[0]["global_adaptation_control_steps"])) == 4
+    assert int(float(rows[0]["warmup_control_steps"])) == 5
+    assert float(rows[1]["thermal_cap_margin_c"]) == 0.50
+    assert rows[1]["thermal_cap_margin_schedule_phase"] == "nominal"
+    assert rows[1]["thermal_cap_margin_schedule_active"] == "False"
+    assert int(float(rows[1]["global_adaptation_control_steps"])) == 8
+
+    ev = trainer.evaluate(n_tasks=1, episodes_per_task=1)
+    assert float(ev["eval_thermal_cap_margin_c"]) == 0.50
+
+
+def test_lower_sac_alpha_schedule_uses_control_steps(tmp_path):
+    cfg = load_cfg("configs/default.yaml")
+    apply_ablation(cfg, "oldbase_alpha010_to008_s24000")
+    cfg["experiment"]["log_dir"] = str(tmp_path)
+    cfg["experiment"]["run_name"] = "alpha_schedule"
+    cfg["experiment"]["seed"] = 18
+    cfg["experiment"]["device"] = "cpu"
+    cfg["env"]["episode_len"] = 4
+    cfg["agent"]["hidden_dim"] = 32
+    cfg["agent"]["batch_size"] = 4
+    cfg["agent"]["warmup_steps"] = 4
+    cfg["agent"]["upper_warmup_steps"] = 2
+    cfg["buffer"]["replay_size"] = 128
+    cfg["buffer"]["context_max_len"] = 32
+    cfg["meta"]["meta_iters"] = 2
+    cfg["meta"]["n_tasks_per_iter"] = 1
+    cfg["meta"]["support_episodes"] = 1
+    cfg["meta"]["support_adaptation_episodes"] = 1
+    cfg["meta"]["query_episodes"] = 0
+    cfg["meta"]["checkpoint_selection"]["enabled"] = False
+    cfg["lower_sac"]["alpha_schedule"]["warmup_control_steps"] = 5
+    cfg["context"]["gru_hidden"] = 16
+    cfg["upper_dqn"]["epsilon_decay_steps"] = 10
+
+    assert float(cfg["safety"]["thermal_cap_margin_c"]) == 0.50
+    assert not cfg["safety"].get("thermal_cap_margin_schedule", {}).get("enabled", False)
+
+    trainer = MetaTrainer(cfg)
+    csv_path = trainer.train(meta_iters=2)
+
+    with open(csv_path, newline="") as f:
+        rows = list(csv.DictReader(f))
+
+    assert len(rows) == 2
+    assert float(rows[0]["thermal_cap_margin_c"]) == 0.50
+    assert rows[0]["thermal_cap_margin_schedule_phase"] == "disabled"
+    assert float(rows[0]["lower_sac_alpha"]) == 0.10
+    assert rows[0]["alpha_schedule_phase"] == "warmup"
+    assert rows[0]["alpha_schedule_active"] == "True"
+    assert int(float(rows[0]["global_adaptation_control_steps"])) == 4
+    assert int(float(rows[0]["alpha_warmup_control_steps"])) == 5
+    assert float(rows[1]["lower_sac_alpha"]) == 0.08
+    assert rows[1]["alpha_schedule_phase"] == "nominal"
+    assert rows[1]["alpha_schedule_active"] == "False"
+    assert int(float(rows[1]["global_adaptation_control_steps"])) == 8
 
 
 def test_meta_adaptation_diagnostics_outputs_meta_vs_wo_meta_rows(tmp_path):
